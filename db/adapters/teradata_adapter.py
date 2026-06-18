@@ -28,6 +28,8 @@ except ImportError:
 class TeradataAdapter(SourceAdapter):
     """Thin wrapper around a teradatasql connection."""
 
+    source_type: str = "teradata"
+
     def __init__(self, conn):
         self._conn = conn
 

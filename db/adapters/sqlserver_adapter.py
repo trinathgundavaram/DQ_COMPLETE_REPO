@@ -43,6 +43,8 @@ except ImportError:
 class SqlServerAdapter(SourceAdapter):
     """Wraps a pyodbc connection to SQL Server."""
 
+    source_type: str = "sqlserver"
+
     def __init__(self, conn):
         self._conn = conn
         self._conn.autocommit = True  # source queries only; avoids open txn

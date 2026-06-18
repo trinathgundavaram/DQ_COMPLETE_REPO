@@ -20,7 +20,19 @@ class SourceAdapter(ABC):
         close()        — on cleanup
         ping()         — health check in ConnectionFactory.get()
         prepare(rule)  — file loading hook; no-op for DB adapters
+
+    Class attribute
+    ---------------
+    source_type : str
+        Lower-case string identifying the database dialect.
+        Used by core.check_types and core.rule_builder to emit
+        dialect-appropriate SQL.
+        Subclasses MUST set this as a class-level attribute.
+        Valid values: "teradata", "postgresql", "databricks",
+                      "sqlserver", "file"
     """
+
+    source_type: str = "unknown"   # subclasses override this
 
     @abstractmethod
     def cursor(self):

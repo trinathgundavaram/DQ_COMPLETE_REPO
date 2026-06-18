@@ -56,6 +56,12 @@ except ImportError:
 
 _FILE_EXTENSIONS = {".csv", ".xlsx", ".xls", ".tsv", ".parquet"}
 
+# Max file size in MB before raising an error (0 = no limit)
+_MAX_FILE_SIZE_MB = int(os.getenv("DQ_MAX_FILE_SIZE_MB", "500"))
+
+# Encoding for CSV/TSV files; adjust if source files use a different charset
+_FILE_ENCODING = os.getenv("DQ_FILE_ENCODING", "utf-8")
+
 
 class FileAdapter(SourceAdapter):
     """
@@ -70,6 +76,8 @@ class FileAdapter(SourceAdapter):
                        DataFrames from _df_registry into it.
     * _registry_lock : threading.Lock protecting _df_registry writes.
     """
+
+    source_type: str = "file"
 
     def __init__(self, base_path: str = ""):
         if not _DUCKDB_AVAILABLE or not _PANDAS_AVAILABLE:
@@ -205,14 +213,30 @@ def _read_file(full_path: str):
     """
     Read a file into a pandas DataFrame.
     Supports: .csv, .tsv, .xlsx, .xls, .parquet
+
+    Env vars
+    --------
+    DQ_MAX_FILE_SIZE_MB  Maximum file size in MB (default 500; 0 = no limit).
+    DQ_FILE_ENCODING     Character encoding for CSV/TSV files (default utf-8).
     """
-    ext = Path(full_path).suffix.lower()
+    p   = Path(full_path)
+    ext = p.suffix.lower()
+
+    # ── File size guard ───────────────────────────────────────────────────────
+    if _MAX_FILE_SIZE_MB > 0:
+        size_mb = p.stat().st_size / (1024 * 1024)
+        if size_mb > _MAX_FILE_SIZE_MB:
+            raise ValueError(
+                f"File '{full_path}' is {size_mb:.1f} MB which exceeds the "
+                f"DQ_MAX_FILE_SIZE_MB limit of {_MAX_FILE_SIZE_MB} MB. "
+                "Increase DQ_MAX_FILE_SIZE_MB or reduce the file size."
+            )
 
     if ext == ".csv":
-        return pd.read_csv(full_path)
+        return pd.read_csv(full_path, encoding=_FILE_ENCODING)
 
     if ext == ".tsv":
-        return pd.read_csv(full_path, sep="\t")
+        return pd.read_csv(full_path, sep="\t", encoding=_FILE_ENCODING)
 
     if ext in (".xlsx", ".xls"):
         try:

@@ -1,3 +1,4 @@
+# Python >= 3.8 required
 # ── Metadata store (always required) ─────────────────────────────────────────
 teradatasql>=17.20.0.0
 
@@ -18,3 +19,6 @@ pandas>=2.0.0
 openpyxl>=3.1.0       # .xlsx support
 xlrd>=2.0.0           # .xls (legacy Excel) support
 pyarrow>=14.0.0       # .parquet support (optional — only needed for Parquet files)
+
+# ── Resilience ───────────────────────────────────────────────────────────────
+tenacity>=8.2.0       # exponential-backoff retry for transient source-DB errors

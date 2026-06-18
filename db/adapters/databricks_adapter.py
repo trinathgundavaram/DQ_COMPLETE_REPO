@@ -45,6 +45,8 @@ except ImportError:
 class DatabricksAdapter(SourceAdapter):
     """Wraps a databricks-sql-connector connection."""
 
+    source_type: str = "databricks"
+
     def __init__(self, conn):
         self._conn = conn
 

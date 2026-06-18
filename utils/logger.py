@@ -1,11 +1,20 @@
+"""
+utils/logger.py
+---------------
+Structured run-log writer for dq_run_logs.
+
+Fix #6 (v2): VALUES are now fully parameterised with ? placeholders.
+No manual single-quote escaping — driver handles all escaping internally.
+"""
+
 import logging
 from config.env_config import get_meta_db
 
 logger = logging.getLogger(__name__)
 
-# Resolved once at import time from the active environment.
-# Callers may still override per-call if needed.
-_DEFAULT_META_DB = get_meta_db()
+# NOTE: meta_db is resolved lazily inside each call (not at import time)
+# so that DQ_ENV changes after import are respected and startup order
+# does not matter.
 
 
 def log_message(
@@ -17,36 +26,39 @@ def log_message(
     rule_code=None,
     error_code: str = None,
     error_detail: str = None,
-    meta_db: str = None,          # None → use env-resolved default (never DEV hardcode)
+    meta_db: str = None,
 ):
     """
     Insert a structured log entry into dq_run_logs.
-    Failures are printed to stderr but never re-raised.
+
+    Uses parameterised ? placeholders — no manual escaping needed.
+    Failures are logged to stderr but never re-raised.
     """
-    meta_db = meta_db or _DEFAULT_META_DB
+    meta_db = meta_db or get_meta_db()
 
-    safe_msg    = (message      or "").replace("'", "''")
-    safe_detail = (error_detail or "").replace("'", "''")
-    safe_code   = (error_code   or "").replace("'", "''")
-    safe_rcode  = (rule_code    or "").replace("'", "''")
-
-    rule_id_sql = str(rule_id) if rule_id is not None else "NULL"
-    rcode_sql   = f"'{safe_rcode}'" if rule_code is not None else "NULL"
+    # None → SQL NULL for nullable integer / varchar columns
+    rule_id_val   = rule_id if rule_id is not None else None
+    rule_code_val = rule_code or None
+    error_code_val   = error_code or None
+    error_detail_val = error_detail or None
 
     sql = f"""
         INSERT INTO {meta_db}.dq_run_logs
             (run_id, rule_id, rule_code, log_level, message,
              error_code, error_detail, created_at)
-        VALUES (
-            '{run_id}', {rule_id_sql}, {rcode_sql},
-            '{level}', '{safe_msg}',
-            '{safe_code}', '{safe_detail}',
-            CURRENT_TIMESTAMP
-        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     """
     try:
         cursor = td.cursor()
-        cursor.execute(sql)
+        cursor.execute(sql, [
+            run_id,
+            rule_id_val,
+            rule_code_val,
+            level,
+            message,
+            error_code_val,
+            error_detail_val,
+        ])
         td.commit()
         cursor.close()
     except Exception as exc:

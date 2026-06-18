@@ -36,6 +36,8 @@ except ImportError:
 class PostgresAdapter(SourceAdapter):
     """Wraps a psycopg2 connection."""
 
+    source_type: str = "postgresql"
+
     def __init__(self, conn):
         self._conn = conn
         # Use autocommit for read-only source queries; avoids open transactions.

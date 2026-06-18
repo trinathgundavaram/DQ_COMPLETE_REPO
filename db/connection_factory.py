@@ -64,6 +64,7 @@ Usage
 
 import logging
 import os
+from typing import Dict, Optional
 
 from db.adapters.base import SourceAdapter
 from db.adapters.teradata_adapter import TeradataAdapter
@@ -98,7 +99,7 @@ class ConnectionFactory:
     """
 
     def __init__(self):
-        self._conns: dict[str, SourceAdapter] = {}
+        self._conns: Dict[str, SourceAdapter] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -123,7 +124,7 @@ class ConnectionFactory:
                     name, exc, exc_info=True,
                 )
 
-    def get(self, name: str) -> SourceAdapter | None:
+    def get(self, name: str) -> Optional[SourceAdapter]:
         """
         Return the cached adapter for `name`.
 
@@ -156,7 +157,7 @@ class ConnectionFactory:
 
         return adapter
 
-    def new_connection(self, name: str) -> SourceAdapter | None:
+    def new_connection(self, name: str) -> Optional[SourceAdapter]:
         """
         Open and return a FRESH adapter (not cached).
 
@@ -185,6 +186,22 @@ class ConnectionFactory:
                 name, exc, exc_info=True,
             )
             return None
+
+    def close_all(self):
+        """
+        Close every open adapter and clear the pool.
+
+        Call this in a finally block or SIGTERM handler after run_engine()
+        finishes to prevent leaked connections to Teradata, Postgres, etc.
+        """
+        for name, adapter in list(self._conns.items()):
+            try:
+                adapter.close()
+                logger.debug("Connection '%s' closed.", name)
+            except Exception as exc:
+                logger.warning("Error closing connection '%s': %s", name, exc)
+        self._conns.clear()
+        logger.info("All connections closed.")
 
     def get_all(self) -> dict:
         return dict(self._conns)
