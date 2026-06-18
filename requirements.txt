@@ -1,0 +1,20 @@
+# ── Metadata store (always required) ─────────────────────────────────────────
+teradatasql>=17.20.0.0
+
+# ── Source system drivers (install only what you need) ───────────────────────
+
+# PostgreSQL / AWS Aurora (PostgreSQL-compatible)
+psycopg2-binary>=2.9.0
+
+# Databricks SQL Warehouses
+databricks-sql-connector>=3.0.0
+
+# Microsoft SQL Server (requires ODBC Driver for SQL Server on the host OS)
+pyodbc>=5.0.0
+
+# ── Flat-file sources (CSV, Excel, TSV, Parquet) ─────────────────────────────
+duckdb>=0.10.0
+pandas>=2.0.0
+openpyxl>=3.1.0       # .xlsx support
+xlrd>=2.0.0           # .xls (legacy Excel) support
+pyarrow>=14.0.0       # .parquet support (optional — only needed for Parquet files)
