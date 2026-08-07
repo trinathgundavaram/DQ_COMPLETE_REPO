@@ -177,7 +177,21 @@ def _write_snapshot(td_conn, rule: dict, meta_db: str, execute_query, bulk_inser
             FROM {meta_db}.dq_rule_versions WHERE rule_id = ?
         """, [rule.get("rule_id")])
         max_ver = int((rows[0].get("max_ver") if rows else 0) or 0)
-    except Exception:
+    except Exception as exc:
+        # COALESCE(MAX(...), 0) always returns exactly one row, so this can
+        # only fail on a genuine query error (connection drop, permissions,
+        # table issue) -- never on "no versions yet". Silently assuming
+        # max_ver=0 here would archive this snapshot as version_num=1/
+        # change_type=CREATED even when real versions already exist,
+        # corrupting the forensic audit trail this table exists for (see
+        # DESIGN.md) with no trace of why. Log it loudly before falling
+        # back so the corruption risk is at least visible in the logs.
+        logger.error(
+            "Could not determine current version_num for rule %s (rule_id=%s) — "
+            "defaulting to version 1. This may create a duplicate/incorrect "
+            "version_num if versions already exist: %s",
+            rule.get("rule_code"), rule.get("rule_id"), exc, exc_info=True,
+        )
         max_ver = 0
 
     next_ver    = max_ver + 1

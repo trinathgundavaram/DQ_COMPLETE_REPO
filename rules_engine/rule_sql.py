@@ -381,10 +381,11 @@ DIALECT_COMPATIBILITY = {
     "postgresql": {"postgres", "ansi"},
     "postgres":   {"postgres", "ansi"},   # alias
     "aurora":     {"postgres", "ansi"},   # Aurora PG-compatible
-    # S3 landed files are queried through DuckDB, which implements a
-    # Postgres-flavoured SQL surface — 'postgres'-dialect rules run
-    # unmodified against it.
+    # S3 landed files and local flat files (FileAdapter) are both queried
+    # through DuckDB, which implements a Postgres-flavoured SQL surface —
+    # 'postgres'-dialect rules run unmodified against either.
     "s3":         {"postgres", "ansi"},
+    "file":       {"postgres", "ansi"},   # FileAdapter (db/adapters.py) — also DuckDB
     "duckdb":     {"postgres", "ansi"},   # alias — internal adapter name
 }
 

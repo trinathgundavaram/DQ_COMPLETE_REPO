@@ -48,5 +48,5 @@ def validate_table_exists(
             error_detail=str(exc),
             meta_db=meta_db,
         )
-        logger.error("Table validation failed for rule %s: %s", rule.get("rule_code"), exc)
+        logger.error("Table validation failed for rule %s: %s", rule.get("rule_code"), exc, exc_info=True)
         return False

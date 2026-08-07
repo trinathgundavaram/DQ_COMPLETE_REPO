@@ -96,7 +96,7 @@ def run_stratified_sampling(cf, td, config: dict, run: dict, meta_db: str) -> di
     dict summary: {sample_run_id, candidates, selected, target_volume, by_stratum}
     """
     from rules_engine.executor import execute_query, bulk_insert
-    from rules_engine.rule_sql import build_filter
+    from rules_engine.rule_sql import build_filter, check_no_dml_ddl
     from sampling.anomaly import detect_candidate_pool_drift
 
     # sample_name is NOT NULL on dq_sampling_config — no project_name/
@@ -118,8 +118,30 @@ def run_stratified_sampling(cf, td, config: dict, run: dict, meta_db: str) -> di
     priority    = (config.get("priority_rank_sql") or "").strip()
     target_vol  = int(config.get("target_volume") or 100)
 
-    determ_mix = json.loads(config.get("determination_mix_json") or "{}")
-    func_mix   = json.loads(config.get("functional_area_mix_json") or "{}")
+    # exclusion_sql / priority_rank_sql are operator-authored SQL fragments
+    # from dq_sampling_config, embedded directly into the query built below
+    # -- the same trust level as dq_rules.rule_syntax, which gets this exact
+    # guard (see rules_engine/rule_sql.py::check_no_dml_ddl's module docstring
+    # for why a data-modifying CTE still parses as part of a read and would
+    # otherwise execute as a side effect the moment the query runs).
+    if exclusion:
+        check_no_dml_ddl(exclusion, config.get("sample_name"))
+    if priority:
+        check_no_dml_ddl(priority, config.get("sample_name"))
+
+    try:
+        determ_mix = json.loads(config.get("determination_mix_json") or "{}")
+        func_mix   = json.loads(config.get("functional_area_mix_json") or "{}")
+    except (json.JSONDecodeError, TypeError) as exc:
+        logger.error(
+            "Malformed mix JSON in dq_sampling_config for '%s' (config_id=%s): %s",
+            config.get("sample_name"), config.get("config_id"), exc, exc_info=True,
+        )
+        raise ValueError(
+            f"dq_sampling_config row '{config.get('sample_name')}' "
+            f"(config_id={config.get('config_id')}) has malformed "
+            f"determination_mix_json/functional_area_mix_json: {exc}"
+        ) from exc
 
     # ── Scope filter (this cycle's pull) — reuses the same generic
     #    filter-building machinery every rule uses, so BATCH/DATE/FULL

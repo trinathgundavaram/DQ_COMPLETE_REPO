@@ -65,10 +65,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Configurable constants (all env-overridable) ──────────────────────────────
-META_CONNECTION   = os.getenv("DQ_META_CONNECTION",   "teradata")  # fix #5
-MAX_WORKERS       = int(os.getenv("DQ_MAX_WORKERS",   "5"))        # fix #10
-STALE_RUN_HOURS   = int(os.getenv("DQ_STALE_RUN_HOURS", "4"))     # fix #4
-PREVALIDATE_ABORT = os.getenv("DQ_PREVALIDATE_ABORT", "false").lower() == "true"  # fix #17
+META_CONNECTION   = os.getenv("DQ_META_CONNECTION",   "teradata")
+MAX_WORKERS       = int(os.getenv("DQ_MAX_WORKERS",   "5"))
+STALE_RUN_HOURS   = int(os.getenv("DQ_STALE_RUN_HOURS", "4"))
+PREVALIDATE_ABORT = os.getenv("DQ_PREVALIDATE_ABORT", "false").lower() == "true"
 
 # ── Module-level state for SIGTERM handler ────────────────────────────────────
 # Fix: keyed by a unique per-invocation token (not shared scalars) so that
@@ -143,7 +143,7 @@ def run_engine(
     batch_id: str = None,
     start_date=None,
     end_date=None,
-    dry_run: bool = False,    # fix #16
+    dry_run: bool = False,
 ):
     """
     Main entry point for the Data Quality Engine.
@@ -166,7 +166,7 @@ def run_engine(
 
     cf = ConnectionFactory()
     cf.load()
-    td = cf.get(META_CONNECTION)   # fix #5: env-driven metadata connection name
+    td = cf.get(META_CONNECTION)   # env-driven metadata connection name
 
     # Register with SIGTERM handler so shutdown can clean up
     _register_active(token, cf=cf, td=td, meta_db=meta_db)
@@ -204,7 +204,7 @@ def run_engine(
 
     logger.info("Starting DQ run: %s", run_id)
 
-    # fix #4: clean up any stale RUNNING runs before starting
+    # Clean up any stale RUNNING runs before starting
     _cleanup_stale_runs(td, meta_db)
     _insert_run_control(td, run, meta_db)
 
@@ -218,8 +218,32 @@ def run_engine(
         logger.info("Rules loaded: %d", total_rules)
 
         if not rules:
+            # No active rules for this project/process is a legitimate but
+            # noteworthy outcome (e.g. onboarding before rules are seeded,
+            # or everything got deactivated) -- log it instead of finishing
+            # silently, and return the SAME dict shape every other exit
+            # path returns (callers -- CLI, Lambda, Glue, Airflow, cron --
+            # all call .get() on the result; a bare tuple here would raise
+            # AttributeError in every one of them).
+            logger.warning(
+                "No active rules found for project=%s process=%s -- run_id=%s "
+                "completed with zero rules evaluated.", project, process, run_id,
+            )
+            log_message(td, run_id, "WARN",
+                        f"No active rules found for project={project} process={process}.",
+                        meta_db=meta_db)
             _update_run_control(td, run_id, "COMPLETED", meta_db)
-            return run_id, "COMPLETED"
+            return {
+                "run_id":             run_id,
+                "status":             "COMPLETED",
+                "total_rules":        0,
+                "failed_rules":       0,
+                "data_issue_rules":   0,
+                "engine_issue_rules": 0,
+                "suppressed_rules":   0,
+                "issue_count":        0,
+                "results":            {},
+            }
 
         # Archive changed rule definitions before any execution begins
         try:
@@ -227,19 +251,31 @@ def run_engine(
         except Exception as exc:
             logger.warning("Rule versioning failed (non-fatal): %s", exc)
 
-        # fix #17: pre-validation pass
+        # Pre-validation pass
         invalid_codes = _pre_validate_rules(rules, cf, run, meta_db, td)
         if invalid_codes and PREVALIDATE_ABORT:
             msg = f"Pre-validation failed for {len(invalid_codes)} rule(s): {invalid_codes}"
             logger.error(msg)
             _update_run_control(td, run_id, "FAILED", meta_db)
             send_alert(f"DQ PRE-VALIDATION ABORTED\n\nRun: {run_id}\n\n{msg}", "ERROR")
-            return run_id, "FAILED"
+            # Same dict shape as every other return -- see the no-rules
+            # branch above for why a bare tuple here would break every caller.
+            return {
+                "run_id":             run_id,
+                "status":             "FAILED",
+                "total_rules":        total_rules,
+                "failed_rules":       len(invalid_codes),
+                "data_issue_rules":   0,
+                "engine_issue_rules": len(invalid_codes),
+                "suppressed_rules":   0,
+                "issue_count":        _count_issues(td, run_id, meta_db),
+                "results":            {code: "ERROR" for code in invalid_codes},
+            }
 
-        # fix #12: topological sort respecting depends_on_rule_id
+        # Topological sort respecting depends_on_rule_id
         ordered_rules = _topological_sort(rules)
 
-        # ── Parallel execution with dynamic dependency submission (fix #12) ───
+        # ── Parallel execution with dynamic dependency submission ─────────────
         completed_by_id: dict = {}   # rule_id  → status (written after each future)
         results:         dict = {}   # rule_code → status
 
@@ -316,10 +352,26 @@ def run_engine(
                     try:
                         code, rule_id_val, status = future.result()
                     except Exception as exc:
+                        # run_single() already wraps its own body in a broad
+                        # try/except, so this only fires for something that
+                        # escaped that -- rare, but exactly the kind of
+                        # unexpected failure that needs a full traceback and
+                        # a persisted record, not just a one-line log.
                         code        = rule.get("rule_code")
                         rule_id_val = rule.get("rule_id")
                         status      = "ERROR"
-                        logger.error("Unhandled exception for rule %s: %s", code, exc)
+                        logger.error("Unhandled exception for rule %s: %s", code, exc, exc_info=True)
+                        log_message(
+                            td, run_id, "ERROR",
+                            f"Unhandled exception for rule {code}",
+                            rule_id=rule_id_val, rule_code=code,
+                            error_code="UNHANDLED_EXCEPTION", error_detail=str(exc),
+                            meta_db=meta_db,
+                        )
+                        record_rule_execution(
+                            td, run, rule, rule.get("src_tbl_nm", ""),
+                            0, 0, 0, 0.0, 0.0, "ERROR", 0.0, meta_db,
+                        )
 
                     results[code]                = status
                     completed_by_id[rule_id_val] = status
@@ -364,6 +416,39 @@ def run_engine(
                             f = pool.submit(run_single, pending_rule)
                             active_futures[f] = pending_rule
                             submitted_ids.add(pid)
+
+        # Any rule never submitted has an unsatisfiable dependency -- its
+        # depends_on_rule_id points at a rule_id that never appeared in this
+        # run's active rule set (deactivated, deleted, wrong scope, or a
+        # stale/typo'd reference), so it can never become "ready". Left
+        # alone it would silently vanish from the run: no execution record,
+        # no issue, not counted anywhere. Surface it as a SKIP with a clear
+        # config-error issue instead.
+        for rule in ordered_rules:
+            rid = rule["rule_id"]
+            if rid in submitted_ids:
+                continue
+            dep = rule.get("depends_on_rule_id")
+            p_code = rule.get("rule_code")
+            msg = (
+                f"Rule {p_code} never ran: depends_on_rule_id={dep} does not "
+                f"reference an active rule in this run (deactivated, deleted, "
+                f"different scope, or invalid rule_id)."
+            )
+            logger.error(msg)
+            log_issue(td, run, rule, "UNRESOLVED_DEPENDENCY", msg, meta_db=meta_db)
+            log_message(
+                td, run_id, "ERROR", msg,
+                rule_id=rid, rule_code=p_code,
+                error_code="UNRESOLVED_DEPENDENCY", meta_db=meta_db,
+            )
+            record_rule_execution(
+                td, run, rule, rule.get("src_tbl_nm", ""),
+                0, 0, 0, 0.0, 100.0, "SKIP", 0.0, meta_db,
+            )
+            results[p_code]      = "SKIP"
+            completed_by_id[rid] = "SKIP"
+            failed_rules += 1
 
         # ── Data profiling (opt-in per table via dq_profile_config) ─────────
         try:
@@ -450,15 +535,41 @@ def run_engine(
         return summary
 
     except Exception as exc:
-        _update_run_control(td, run_id, "FAILED", meta_db)
-        log_message(td, run_id, "ERROR", "Engine-level failure",
-                    error_code="ENGINE_FAILURE", error_detail=str(exc), meta_db=meta_db)
-        send_alert(
-            f"DQ RUN FAILED\n\nRun ID: {run_id}\nProject: {project}\n"
-            f"Process: {process}\nRun Type: {run_type}\nMode: {run_mode}\n\nError:\n{exc}",
-            "ERROR",
-        )
+        # Always log the original failure first, and with a traceback --
+        # everything below this is best-effort cleanup, and none of it
+        # should be able to hide *why* the run actually failed.
         logger.error("Engine failure for run %s: %s", run_id, exc, exc_info=True)
+
+        # Each cleanup step below is independently guarded: if the run
+        # failed because the metadata connection itself is unhealthy,
+        # _update_run_control()/log_message()/send_alert() can each fail
+        # too -- without isolation, the first one to raise would replace
+        # this except block's re-raised exception with a confusing
+        # secondary one and skip the remaining steps (and the alert)
+        # entirely, silently.
+        try:
+            _update_run_control(td, run_id, "FAILED", meta_db)
+        except Exception as cleanup_exc:
+            logger.error("Could not mark run %s FAILED in dq_run_control: %s",
+                        run_id, cleanup_exc, exc_info=True)
+
+        try:
+            log_message(td, run_id, "ERROR", "Engine-level failure",
+                        error_code="ENGINE_FAILURE", error_detail=str(exc), meta_db=meta_db)
+        except Exception as cleanup_exc:
+            logger.error("Could not write engine-failure log message for run %s: %s",
+                        run_id, cleanup_exc, exc_info=True)
+
+        try:
+            send_alert(
+                f"DQ RUN FAILED\n\nRun ID: {run_id}\nProject: {project}\n"
+                f"Process: {process}\nRun Type: {run_type}\nMode: {run_mode}\n\nError:\n{exc}",
+                "ERROR",
+            )
+        except Exception as cleanup_exc:
+            logger.error("Could not send failure alert for run %s: %s",
+                        run_id, cleanup_exc, exc_info=True)
+
         raise
 
     finally:
@@ -467,7 +578,7 @@ def run_engine(
 
 
 # ---------------------------------------------------------------------------
-# Dry-run mode  (fix #16)
+# Dry-run mode
 # ---------------------------------------------------------------------------
 
 def _dry_run(cf, project, process, run_mode, batch_id, start_date, end_date, meta_db, td):
@@ -554,7 +665,7 @@ def _dry_run(cf, project, process, run_mode, batch_id, start_date, end_date, met
 
 
 # ---------------------------------------------------------------------------
-# Pre-validation pass  (fix #17)
+# Pre-validation pass
 # ---------------------------------------------------------------------------
 
 def _pre_validate_rules(rules: list, cf, run: dict, meta_db: str, td) -> list:
@@ -642,7 +753,7 @@ def _pre_validate_rules(rules: list, cf, run: dict, meta_db: str, td) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Rule ordering  (fix #11 + #12)
+# Rule ordering
 # ---------------------------------------------------------------------------
 
 def _topological_sort(rules: list) -> list:
@@ -662,8 +773,14 @@ def _topological_sort(rules: list) -> list:
         if rid in visited:
             return
         if ancestors and rid in ancestors:
+            # Break the cycle here to avoid infinite recursion. The rule
+            # itself is still scheduled: this call is a nested lookahead
+            # from an earlier, still-on-the-stack visit() for one of its
+            # own dependents, and that outer call adds it to `result` once
+            # this nested call returns.
             logger.warning(
-                "Dependency cycle detected at rule_id=%d (%s) — appending at end.",
+                "Dependency cycle detected at rule_id=%d (%s) — breaking cycle; "
+                "check depends_on_rule_id for a circular reference.",
                 rid, rule.get("rule_code"),
             )
             return
@@ -738,7 +855,7 @@ def _insert_run_control(td, run: dict, meta_db: str):
 def _load_rules(td, project: str, process: str, meta_db: str) -> list:
     """
     Load active rules for project/process, ordered by priority then rule_id.
-    fix #11: ORDER BY priority ASC ensures lower-priority-value rules run first.
+    ORDER BY priority ASC ensures lower-priority-value rules run first.
 
     dq_rules is keyed by scope_id, not raw project_name/process_name — the
     scope lookup is read-only (find_scope_id, not get_scope_id): a

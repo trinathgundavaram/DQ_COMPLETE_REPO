@@ -454,7 +454,7 @@ def execute_rule(rule: dict, db_conn, td_conn, run: dict, meta_db: str) -> str:
         table = rule.get("src_tbl_nm", "UNKNOWN")
         record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
                               0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
-        logger.error("Dialect mismatch — rule skipped: %s", exc)
+        logger.error("Dialect mismatch — rule skipped: %s", exc, exc_info=True)
         return "ERROR"
 
     # ── STEP -0.5: Write-statement guard — same defense-in-depth rationale
@@ -472,7 +472,7 @@ def execute_rule(rule: dict, db_conn, td_conn, run: dict, meta_db: str) -> str:
         table = rule.get("src_tbl_nm", "UNKNOWN")
         record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
                               0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
-        logger.error("Unsafe rule_syntax — rule skipped: %s", exc)
+        logger.error("Unsafe rule_syntax — rule skipped: %s", exc, exc_info=True)
         return "ERROR"
 
     # ── STEP 0: Source preparation ────────────────────────────────────────────
@@ -488,6 +488,8 @@ def execute_rule(rule: dict, db_conn, td_conn, run: dict, meta_db: str) -> str:
                         f"Source preparation failed for rule {rule.get('rule_code')}",
                         rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
                         error_code="SOURCE_PREP", error_detail=str(exc), meta_db=meta_db)
+            logger.error("Source preparation failed for rule %s: %s",
+                        rule.get("rule_code"), exc, exc_info=True)
             table = rule.get("src_tbl_nm", "UNKNOWN")
             record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
                                   0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
@@ -553,6 +555,8 @@ def _execute_schema_check(
                     f"COLUMN_EXISTS failed for rule {rule.get('rule_code')}",
                     rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
                     error_code="SCHEMA_ERROR", error_detail=str(exc), meta_db=meta_db)
+        logger.error("COLUMN_EXISTS catalog query failed for rule %s: %s",
+                     rule.get("rule_code"), exc, exc_info=True)
         record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
                               0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
         return "ERROR"
@@ -596,6 +600,8 @@ def _execute_table_check(
                     f"SQL validation failed for rule {rule.get('rule_code')}",
                     rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
                     error_code="SQL_SYNTAX", error_detail=str(exc), meta_db=meta_db)
+        logger.error("Invalid TABLE-check SQL for rule %s: %s",
+                     rule.get("rule_code"), exc, exc_info=True)
         record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
                               0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
         return "ERROR"
@@ -610,6 +616,8 @@ def _execute_table_check(
                     f"TABLE check failed for rule {rule.get('rule_code')}",
                     rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
                     error_code="DATA_RUNTIME", error_detail=str(exc), meta_db=meta_db)
+        logger.error("TABLE-level check query failed for rule %s: %s",
+                     rule.get("rule_code"), exc, exc_info=True)
         record_rule_execution(td_conn, run, rule, table, total, 0, total,
                               0.0, 100.0, "ERROR", round(time.time() - start, 4), meta_db)
         return "ERROR"
@@ -655,6 +663,8 @@ def _execute_row_check(
                     f"SQL validation failed for rule {rule.get('rule_code')}",
                     rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
                     error_code="SQL_SYNTAX", error_detail=str(exc), meta_db=meta_db)
+        logger.error("Invalid rule SQL syntax for rule %s: %s",
+                     rule.get("rule_code"), exc, exc_info=True)
         record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
                               0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
         return "ERROR"
@@ -670,6 +680,8 @@ def _execute_row_check(
                     f"Count query failed for rule {rule.get('rule_code')}",
                     rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
                     error_code="DATA_RUNTIME", error_detail=str(exc), meta_db=meta_db)
+        logger.error("Count query failed for rule %s: %s",
+                     rule.get("rule_code"), exc, exc_info=True)
         record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
                               0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
         return "ERROR"
@@ -684,6 +696,8 @@ def _execute_row_check(
                     f"Failed-count query failed for rule {rule.get('rule_code')}",
                     rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
                     error_code="DATA_RUNTIME", error_detail=str(exc), meta_db=meta_db)
+        logger.error("Failed-count query failed for rule %s: %s",
+                     rule.get("rule_code"), exc, exc_info=True)
         record_rule_execution(td_conn, run, rule, table, total, 0, total,
                               0.0, 100.0, "ERROR", round(time.time() - start, 4), meta_db)
         return "ERROR"
@@ -724,7 +738,7 @@ def _execute_row_check(
                       str(exc), meta_db=meta_db)
             logger.warning(
                 "Exception capture failed for rule %s (counts are still accurate): %s",
-                rule.get("rule_code"), exc,
+                rule.get("rule_code"), exc, exc_info=True,
             )
 
     return status

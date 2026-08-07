@@ -180,7 +180,8 @@ def _notify_engine_failure(td, run: dict, meta_db: str, engine_issue_rules: int)
             GROUP BY rule_code, status
             ORDER BY status, rule_code
         """, [run_id])
-    except Exception:
+    except Exception as exc:
+        logger.warning("Could not load ERROR/SKIP detail rows for run %s: %s", run_id, exc)
         details = []
     detail_lines = "\n".join(f"  {d['rule_code']} — {d['status']}" for d in details) or "  (see dq_rule_issues)"
 
@@ -345,7 +346,14 @@ def _cli():
     meta_db = get_meta_db()
     cf = ConnectionFactory()
     cf.load()
-    td = cf.get(os.getenv("DQ_META_CONNECTION", "teradata"))
+    conn_name = os.getenv("DQ_META_CONNECTION", "teradata")
+    td = cf.get(conn_name)
+    if td is None:
+        cf.close_all()
+        raise RuntimeError(
+            f"Metadata connection '{conn_name}' unavailable. "
+            "Check DQ_META_CONNECTION and its credentials."
+        )
     try:
         print(generate_report(td, meta_db, args.run_id, args.out_dir))
     finally:

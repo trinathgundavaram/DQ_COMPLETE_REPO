@@ -1,8 +1,5 @@
 import os
 
-# Read target environment from env var; default to DEV
-ENV = os.getenv("DQ_ENV", "DEV").upper()
-
 CONFIG = {
     "DEV": {
         "META_DB": "CMSUNIV_FILELAND_DEV_T",
@@ -24,11 +21,21 @@ CONFIG = {
 
 
 def get_config() -> dict:
-    if ENV not in CONFIG:
+    """
+    Read DQ_ENV fresh on every call (not cached at import time) -- same
+    lazy-env-read principle every adapter's build() and get_meta_db() below
+    already follow, so a process that sets/changes DQ_ENV after this module
+    is first imported (e.g. a long-lived cron_run_scheduler() process, or
+    any import that happens to occur before env vars are finalised) still
+    resolves the correct environment on every call rather than silently
+    pinning to whatever DQ_ENV happened to be set at import time.
+    """
+    env = os.getenv("DQ_ENV", "DEV").upper()
+    if env not in CONFIG:
         raise EnvironmentError(
-            f"Invalid DQ_ENV='{ENV}'. Must be one of: {list(CONFIG.keys())}"
+            f"Invalid DQ_ENV='{env}'. Must be one of: {list(CONFIG.keys())}"
         )
-    return CONFIG[ENV]
+    return CONFIG[env]
 
 
 def get_meta_db() -> str:

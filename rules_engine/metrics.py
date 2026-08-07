@@ -69,6 +69,15 @@ def calculate_metrics(td, run: dict, meta_db: str) -> dict:
     project  = run["project_name"]
     process  = run["process_name"]
     run_type = run["run_type"]
+    batch_id   = run.get("batch_id")   or ""
+    dataset_id = run.get("dataset_id") or ""
+    # Same bucket key _upsert_metrics() below MERGEs this run's numbers
+    # into -- needed so _get_baseline() can exclude exactly that bucket
+    # (see its docstring for why: dq_metrics_summary rows are rolling
+    # aggregates across many runs, not one row per run, so comparing
+    # "current" against a baseline that still includes current's own
+    # just-written bucket understates real deviations).
+    run_month = date(date.today().year, date.today().month, 1)
 
     current = _aggregate_current_run(td, run_id, meta_db)
     if current is None:
@@ -82,7 +91,7 @@ def calculate_metrics(td, run: dict, meta_db: str) -> dict:
 
     _upsert_metrics(td, run, current, meta_db)
 
-    baseline      = _get_baseline(td, scope_id, run_type, meta_db)
+    baseline      = _get_baseline(td, scope_id, run_type, batch_id, dataset_id, run_month, meta_db)
     deviation_pct = 0.0
     breached      = False
 
@@ -310,8 +319,20 @@ def _fallback_update(td, run: dict, current: dict, run_month: str, meta_db: str)
     logger.info("Fallback UPDATE applied for scope_id=%s/%s.", scope_id, run_type)
 
 
-def _get_baseline(td, scope_id: int, run_type: str, meta_db: str):
-    """Rolling average dq_score over the last BASELINE_LOOKBACK runs."""
+def _get_baseline(td, scope_id: int, run_type: str, batch_id: str,
+                   dataset_id: str, run_month, meta_db: str):
+    """
+    Rolling average dq_score over the last BASELINE_LOOKBACK buckets,
+    EXCLUDING the (batch_id, dataset_id, run_month) bucket this run just
+    wrote to via _upsert_metrics()'s MERGE.
+
+    dq_metrics_summary rows are rolling aggregates across every run that
+    has ever matched a given (scope_id, run_type, batch_id, dataset_id,
+    run_month) key -- not one row per individual engine run. Without this
+    exclusion, "baseline" would include the exact bucket this run's own
+    numbers were just merged into, silently pulling the average toward the
+    current value and understating how far off a genuinely bad run is.
+    """
     sql = f"""
         SELECT
             AVG(dq_score)         AS avg_dq_score,
@@ -324,10 +345,11 @@ def _get_baseline(td, scope_id: int, run_type: str, meta_db: str):
             FROM {meta_db}.dq_metrics_summary
             WHERE scope_id      = ?
               AND run_type     = ?
+              AND NOT (batch_id = ? AND dataset_id = ? AND run_month = CAST(? AS DATE))
             QUALIFY ROW_NUMBER() OVER (ORDER BY run_month DESC) <= {BASELINE_LOOKBACK}
         ) sub
     """
-    rows = execute_query(td, sql, [scope_id, run_type])
+    rows = execute_query(td, sql, [scope_id, run_type, batch_id, dataset_id, run_month])
     if not rows or rows[0].get("avg_dq_score") is None:
         return None
 
@@ -412,6 +434,12 @@ def detect_and_log(td_conn, run: dict, meta_db: str) -> List[dict]:
     process  = run.get("process_name", "")
     run_type = run.get("run_type", "")
     run_id   = run.get("run_id", "")
+    batch_id   = run.get("batch_id")   or ""
+    dataset_id = run.get("dataset_id") or ""
+    # Same bucket key calculate_metrics()'s _upsert_metrics() call just
+    # MERGEd this run's numbers into -- see _load_current_metrics()/
+    # _load_history() docstrings for why both need it.
+    run_month = date(date.today().year, date.today().month, 1)
 
     # Load detection config (most-specific match wins) — dq_anomaly_config
     # is a low-cardinality wildcard table, still matched on raw project/
@@ -425,15 +453,15 @@ def detect_and_log(td_conn, run: dict, meta_db: str) -> List[dict]:
     do_alert  = cfg["alert_on_anomaly"]
 
     # Load current run's metrics
-    current = _load_current_metrics(td_conn, scope_id, run_type,
-                                     run_id, meta_db, execute_query)
+    current = _load_current_metrics(td_conn, scope_id, run_type, batch_id,
+                                     dataset_id, run_month, meta_db, execute_query)
     if current is None:
         logger.debug("No metrics row found for run %s — skipping anomaly detection.", run_id)
         return []
 
-    # Load historical metrics (excluding current run)
-    history = _load_history(td_conn, scope_id, run_type,
-                            run_id, meta_db, execute_query)
+    # Load historical metrics, excluding the exact bucket "current" came from
+    history = _load_history(td_conn, scope_id, run_type, batch_id,
+                            dataset_id, run_month, meta_db, execute_query)
 
     if len(history) < min_hist:
         logger.info(
@@ -682,33 +710,52 @@ def _failed_rule_pct(row: Optional[dict]) -> Optional[float]:
 
 
 def _load_current_metrics(
-    td_conn, scope_id, run_type, run_id, meta_db, execute_query
+    td_conn, scope_id, run_type, batch_id, dataset_id, run_month, meta_db, execute_query
 ) -> Optional[dict]:
-    """Load the dq_metrics_summary row for the just-completed run."""
+    """
+    Load the exact dq_metrics_summary bucket this run's numbers were just
+    merged into.
+
+    Filtering by batch_id/dataset_id/run_month (not just scope_id/run_type
+    + "most recent created_at") matters under concurrent execution: two
+    different batches of the same run_type can both update dq_metrics_summary
+    around the same time, and picking "whichever row has the latest
+    created_at" can silently grab a DIFFERENT batch's bucket than the one
+    this run actually just wrote to.
+    """
     try:
         rows = execute_query(
             td_conn,
             f"""
             SELECT *
             FROM {meta_db}.dq_metrics_summary
-            WHERE scope_id  = ?
-              AND run_type  = ?
-            ORDER BY created_at DESC
+            WHERE scope_id    = ?
+              AND run_type    = ?
+              AND batch_id    = ?
+              AND dataset_id  = ?
+              AND run_month   = CAST(? AS DATE)
             """,
-            [scope_id, run_type],
+            [scope_id, run_type, batch_id, dataset_id, run_month],
         )
         return rows[0] if rows else None
     except Exception as exc:
-        logger.warning("Could not load current metrics for anomaly detection: %s", exc)
+        logger.warning("Could not load current metrics for anomaly detection: %s", exc, exc_info=True)
         return None
 
 
 def _load_history(
-    td_conn, scope_id, run_type, current_run_id, meta_db, execute_query
+    td_conn, scope_id, run_type, batch_id, dataset_id, run_month, meta_db, execute_query
 ) -> list:
     """
     Load historical dq_metrics_summary rows for the same scope/run_type,
-    excluding the current run's rows.
+    EXCLUDING the exact (batch_id, dataset_id, run_month) bucket this run's
+    numbers were just merged into.
+
+    dq_metrics_summary rows are rolling aggregates across every run that has
+    ever matched a given bucket key, not one row per individual run --
+    without this exclusion the "history" used to judge whether the current
+    run is anomalous would include the current run's own just-written
+    contribution, silently biasing the comparison toward "not anomalous".
 
     Returns up to 100 most recent rows (sufficient for statistical purposes).
     """
@@ -718,14 +765,15 @@ def _load_history(
             f"""
             SELECT dq_score, avg_failure_pct, total_rules, failed_rules
             FROM {meta_db}.dq_metrics_summary
-            WHERE scope_id  = ?
-              AND run_type  = ?
+            WHERE scope_id    = ?
+              AND run_type    = ?
+              AND NOT (batch_id = ? AND dataset_id = ? AND run_month = CAST(? AS DATE))
             ORDER BY created_at DESC
             """,
-            [scope_id, run_type],
+            [scope_id, run_type, batch_id, dataset_id, run_month],
         )[:100]
     except Exception as exc:
-        logger.warning("Could not load metrics history for anomaly detection: %s", exc)
+        logger.warning("Could not load metrics history for anomaly detection: %s", exc, exc_info=True)
         return []
 
 

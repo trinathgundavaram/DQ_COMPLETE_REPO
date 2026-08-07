@@ -256,16 +256,42 @@ def _run_cron_job(job: dict):
     logger.info("cron job: %s/%s complete — %s", job["project"], job["process"], result.get("status"))
 
     if job.get("sampling_config_name"):
-        # Fix: pass the same resolved date window used for the rules-engine
-        # run through explicitly, rather than reading job["_resolved_start_date"]
-        # / job["_resolved_end_date"], which were never set anywhere and
-        # silently caused sampling to always run unscoped (full table pull)
-        # instead of matching the just-completed run's date window.
-        _run_cron_sampling(
-            job, result,
-            start_date=str(start_date) if is_date_mode else None,
-            end_date=str(end_date) if is_date_mode else None,
-        )
+        # Pass the same resolved date window used for the rules-engine run
+        # through explicitly, rather than reading job["_resolved_start_date"]
+        # / job["_resolved_end_date"], which are never set anywhere and
+        # would silently cause sampling to always run unscoped (full table
+        # pull) instead of matching the just-completed run's date window.
+        #
+        # Isolated in its own try/except: the rules-engine run above already
+        # succeeded by this point, and a failure in this optional follow-on
+        # step (bad sampling config, source outage, etc.) must not look like
+        # an unhandled crash of the whole cron job with no context -- log it
+        # with the job identity and alert, same as every other failure path
+        # in this codebase, rather than letting it propagate to APScheduler's
+        # generic job-exception handler.
+        try:
+            _run_cron_sampling(
+                job, result,
+                start_date=str(start_date) if is_date_mode else None,
+                end_date=str(end_date) if is_date_mode else None,
+            )
+        except Exception as exc:
+            logger.error(
+                "Sampling follow-on failed for %s/%s (sampling_config_name=%s): %s",
+                job["project"], job["process"], job.get("sampling_config_name"),
+                exc, exc_info=True,
+            )
+            try:
+                from utils.alert import send_alert
+                send_alert(
+                    f"[SAMPLING] Follow-on sampling failed after a successful DQ run\n\n"
+                    f"Project: {job['project']}\nProcess: {job['process']}\n"
+                    f"Sampling config: {job.get('sampling_config_name')}\n"
+                    f"DQ run_id: {result.get('run_id')}\n\nError:\n{exc}",
+                    "ERROR",
+                )
+            except Exception as alert_exc:
+                logger.error("Could not send sampling-failure alert: %s", alert_exc, exc_info=True)
 
 
 def _run_cron_sampling(job: dict, engine_result: dict, start_date=None, end_date=None):

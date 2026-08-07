@@ -78,7 +78,9 @@ class SourceAdapter(ABC):
             cur.execute("SELECT 1")
             cur.close()
             return True
-        except Exception:
+        except Exception as exc:
+            logger.debug("%s.ping() failed (connection considered stale): %s",
+                        type(self).__name__, exc)
             return False
 
     def prepare(self, rule: dict) -> None:
@@ -345,15 +347,18 @@ class FileAdapter(SourceAdapter):
         if hasattr(self._local, "conn"):
             try:
                 self._local.conn.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("%s.close() error closing thread-local DuckDB connection: %s",
+                            type(self).__name__, exc)
             del self._local.conn
 
     def ping(self) -> bool:
         try:
             self._get_thread_conn().execute("SELECT 1")
             return True
-        except Exception:
+        except Exception as exc:
+            logger.debug("%s.ping() failed (connection considered stale): %s",
+                        type(self).__name__, exc)
             return False
 
     def prepare(self, rule: dict) -> None:
@@ -469,15 +474,18 @@ class S3Adapter(SourceAdapter):
         if hasattr(self._local, "conn"):
             try:
                 self._local.conn.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("%s.close() error closing thread-local DuckDB connection: %s",
+                            type(self).__name__, exc)
             del self._local.conn
 
     def ping(self) -> bool:
         try:
             self._get_thread_conn().execute("SELECT 1")
             return True
-        except Exception:
+        except Exception as exc:
+            logger.debug("%s.ping() failed (connection considered stale): %s",
+                        type(self).__name__, exc)
             return False
 
     def prepare(self, rule: dict) -> None:
