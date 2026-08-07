@@ -247,15 +247,6 @@ def _check_column_exists(db_conn, source_type: str, rule: dict) -> bool:
         )
         rows = execute_query(db_conn, sql, [sc, table, col])
 
-    elif st == "databricks":
-        # SHOW COLUMNS returns one row per column; filter by name
-        sql  = f"SHOW COLUMNS IN {db_nm + '.' if db_nm else ''}{table}"
-        cols = execute_query(db_conn, sql)
-        return any(
-            r.get("col_name", r.get("column_name", "")).lower() == col.lower()
-            for r in cols
-        )
-
     elif st in ("sqlserver", "mssql"):
         sc = schema or "dbo"
         sql = (

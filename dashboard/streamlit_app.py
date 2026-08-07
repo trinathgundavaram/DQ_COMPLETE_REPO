@@ -39,7 +39,7 @@ st.set_page_config(page_title="DQ Engine Dashboard", layout="wide")
 # Fix: @st.cache_resource caches at the PROCESS level, not per-session —
 # every concurrent Streamlit user/tab on this server shares the SAME
 # ConnectionFactory/connection object returned here. Most DB-API drivers
-# (teradatasql, psycopg2, pyodbc, databricks-sql-connector) don't guarantee
+# (teradatasql, psycopg2, pyodbc) don't guarantee
 # a single Connection is safe for concurrent cursor use from multiple
 # threads, and Streamlit runs concurrent sessions on separate threads — so
 # two users querying at the same moment could interleave/corrupt each

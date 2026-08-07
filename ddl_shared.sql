@@ -13,7 +13,7 @@
 --   sampling/ddl.sql      — dq_sampling_config, dq_sample_selections
 -- ============================================================
 -- NOTE: The metadata store is always Teradata.
--- Source systems (PostgreSQL, Databricks, SQL Server, file)
+-- Source systems (PostgreSQL, SQL Server, file)
 -- are configured via environment variables — see
 -- db/connection_factory.py and db/adapters.py for details.
 -- The dq_connections table below is a catalogue / reference;
@@ -119,8 +119,8 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_connections (
     connection_id    INTEGER NOT NULL,
     connection_name  VARCHAR(100) NOT NULL,    -- matches DQ_CONNECTION_NAMES entry
     source_type      VARCHAR(50) NOT NULL,     -- teradata | postgresql | s3
-                                               -- (databricks | sqlserver adapters exist
-                                               --  in code but are uncatalogued here)
+                                               -- (sqlserver adapter exists
+                                               --  in code but is uncatalogued here)
     host             VARCHAR(500),
     port             INTEGER,
     database_name    VARCHAR(200),

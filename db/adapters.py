@@ -18,9 +18,9 @@ Adapter interface (SourceAdapter ABC)
                               guard (a rule's declared sql_dialect vs. this).
 
 Sanctioned for this engine instance (Section 2 of DESIGN.md): teradata,
-postgresql, s3. Databricks and SQL Server adapters are included and fully
-functional, but are not catalogued/tested for the current use case — they
-exist to prove the interface is genuinely pluggable, not to be deployed yet.
+postgresql, s3. The SQL Server adapter is included and fully functional,
+but is not catalogued/tested for the current use case — it exists to
+prove the interface is genuinely pluggable, not to be deployed yet.
 
 Adding a new source
 --------------------
@@ -179,57 +179,6 @@ class PostgresAdapter(SourceAdapter):
             sslmode=os.getenv(f"{prefix}_SSLMODE", "prefer"),
         )
         return cls(conn)
-
-
-# =============================================================================
-# Databricks SQL Warehouses — databricks-sql-connector
-# =============================================================================
-
-try:
-    from databricks import sql as _databricks_sql
-    _DATABRICKS_AVAILABLE = True
-except ImportError:
-    _DATABRICKS_AVAILABLE = False
-    logger.warning("databricks-sql-connector not installed — Databricks connections unavailable.")
-
-
-class DatabricksAdapter(SourceAdapter):
-    """
-    Env vars (prefix DQ_<NAME>_): HOST, HTTP_PATH, TOKEN, CATALOG (optional),
-    SCHEMA (optional). Note: executemany() is unsupported by this driver —
-    not a problem here since bulk_insert() only ever targets the metadata
-    (Teradata) connection, never a Databricks source connection.
-    """
-
-    source_type: str = "databricks"
-
-    def __init__(self, conn):
-        self._conn = conn
-
-    def cursor(self):
-        return self._conn.cursor()
-
-    def commit(self):
-        pass   # Databricks SQL warehouses are read-committed; no explicit commit needed
-
-    def close(self):
-        self._conn.close()
-
-    @classmethod
-    def build(cls, name: str) -> "DatabricksAdapter":
-        if not _DATABRICKS_AVAILABLE:
-            raise ImportError("databricks-sql-connector is required. Install with: pip install databricks-sql-connector")
-        prefix = f"DQ_{name.upper()}"
-        kwargs = dict(
-            server_hostname=_require(f"{prefix}_HOST"),
-            http_path=_require(f"{prefix}_HTTP_PATH"),
-            access_token=_require(f"{prefix}_TOKEN"),
-        )
-        if os.getenv(f"{prefix}_CATALOG"):
-            kwargs["catalog"] = os.getenv(f"{prefix}_CATALOG")
-        if os.getenv(f"{prefix}_SCHEMA"):
-            kwargs["schema"] = os.getenv(f"{prefix}_SCHEMA")
-        return cls(_databricks_sql.connect(**kwargs))
 
 
 # =============================================================================

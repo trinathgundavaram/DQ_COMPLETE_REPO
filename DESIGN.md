@@ -25,7 +25,7 @@ recording when a rule can't run; empty-table handling via `require_rows`;
 AND/OR threshold logic; retry on transient source errors; lazily-read
 credentials; a CLI (`rules_engine/main.py`); rule versioning; suppression; statistical
 anomaly detection (z-score/IQR); and a pluggable connector layer
-(Teradata, Postgres/Aurora, Databricks, SQL Server, flat files via DuckDB).
+(Teradata, Postgres/Aurora, SQL Server, flat files via DuckDB).
 
 Verifying this took a full read of the schema DDL, the CLI, and every file
 under `rules_engine/`, `db/`, `utils/`, `config/`, plus a DuckDB-backed
@@ -67,7 +67,7 @@ sampling/                -- FRAMEWORK 2: the sampling framework (separate; see Â
   ddl.sql                  sampling-only tables: dq_sampling_config,
                           dq_sample_selections -- run ddl_shared.sql first
 db/                       -- shared: connector layer, used by all three folders above
-  adapters.py             SourceAdapter ABC + Teradata/Postgres/Databricks/SqlServer/File/S3
+  adapters.py             SourceAdapter ABC + Teradata/Postgres/SqlServer/File/S3
   connection_factory.py   builds + caches adapters from DQ_CONNECTION_NAMES env
 utils/                    -- shared: cross-cutting helpers, used by all three folders above
   db_helpers.py           table/db name resolution + dq_scope resolver
@@ -213,9 +213,9 @@ directly on the existing `FileAdapter` (per-thread DuckDB connections via
 - Falls back cleanly to the instance/task IAM role when no explicit
   access key is set.
 
-`Databricks`/`SQL Server` adapters live in the same `db/adapters.py` file
-(pluggable architecture intact) but are not in `dq_connections`' sanctioned
-`source_type` set for this instance -- adding a 4th source later is one new
+`SQL Server`'s adapter lives in the same `db/adapters.py` file
+(pluggable architecture intact) but is not in `dq_connections`' sanctioned
+`source_type` set for this instance -- adding a new source later is one new
 adapter class in that file + one factory entry, not an engine change.
 
 ### 3.4 Case-level disposition

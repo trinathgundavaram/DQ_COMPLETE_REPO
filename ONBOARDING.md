@@ -19,7 +19,7 @@ calls things.
   always Teradata").
 - Whatever driver your project's SOURCE data needs: `psycopg2-binary`
   (Postgres/Aurora), `duckdb` + `pandas` (flat files or S3), or one of
-  the uncatalogued-but-supported adapters (Databricks, SQL Server) --
+  the uncatalogued-but-supported adapter (SQL Server) --
   install only what you actually need, per `requirements.txt`'s comments.
 
 ```
@@ -50,7 +50,7 @@ Fill in, at minimum:
   a name for each source system your rules will query.
 - `DQ_TERADATA_*` -- your metadata store credentials.
 - One `DQ_<NAME>_*` block per additional source connection (see
-  `.env.example`'s commented-out Postgres/S3/file/Databricks/SQL Server
+  `.env.example`'s commented-out Postgres/S3/file/SQL Server
   examples -- copy whichever matches your source system and uncomment).
 
 Load `.env` however your process-manager expects (`python-dotenv`,

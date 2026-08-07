@@ -12,7 +12,6 @@ Supported types
     teradata    → TeradataAdapter   (teradatasql)
     postgresql  → PostgresAdapter   (psycopg2; also covers AWS Aurora PG)
     aurora      → PostgresAdapter   (alias for postgresql)
-    databricks  → DatabricksAdapter (databricks-sql-connector)
     sqlserver   → SqlServerAdapter  (pyodbc)
     file        → FileAdapter       (DuckDB + pandas, CSV/Excel/TSV/Parquet)
 
@@ -27,7 +26,7 @@ Env vars
 
 Example
 -------
-    DQ_CONNECTION_NAMES=teradata,claims_pg,datalake,erp_sql,raw_files
+    DQ_CONNECTION_NAMES=teradata,claims_pg,erp_sql,raw_files
 
     DQ_TERADATA_TYPE=teradata
     DQ_TERADATA_HOST=...
@@ -39,11 +38,6 @@ Example
     DQ_CLAIMS_PG_DATABASE=claims
     DQ_CLAIMS_PG_USER=...
     DQ_CLAIMS_PG_PASSWORD=...
-
-    DQ_DATALAKE_TYPE=databricks
-    DQ_DATALAKE_HOST=adb-1234.azuredatabricks.net
-    DQ_DATALAKE_HTTP_PATH=/sql/1.0/warehouses/abc
-    DQ_DATALAKE_TOKEN=dapi...
 
     DQ_ERP_SQL_TYPE=sqlserver
     DQ_ERP_SQL_HOST=erp-db.internal
@@ -68,7 +62,7 @@ import threading
 from typing import Dict, Optional
 
 from db.adapters import (
-    SourceAdapter, TeradataAdapter, PostgresAdapter, DatabricksAdapter,
+    SourceAdapter, TeradataAdapter, PostgresAdapter,
     SqlServerAdapter, FileAdapter, S3Adapter,
 )
 
@@ -82,10 +76,9 @@ _TYPE_MAP = {
     "postgres":   PostgresAdapter,   # alias
     "aurora":     PostgresAdapter,   # alias — Aurora PG-compatible
     "s3":         S3Adapter,         # DuckDB-over-S3 (Parquet/CSV, read directly)
-    # ── Adapter interface stays pluggable; these exist but are untested/
-    #    uncatalogued for this instance until a real use case needs them.
-    #    Adding a 4th source = one new adapter file + one new entry here.
-    "databricks": DatabricksAdapter,
+    # ── Adapter interface stays pluggable; this exists but is untested/
+    #    uncatalogued for this instance until a real use case needs it.
+    #    Adding a new source = one new adapter file + one new entry here.
     "sqlserver":  SqlServerAdapter,
     "mssql":      SqlServerAdapter,  # alias
     "file":       FileAdapter,

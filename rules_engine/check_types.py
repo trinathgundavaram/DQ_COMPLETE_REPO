@@ -24,7 +24,7 @@ SCHEMA  — metadata check (column existence).  Handled specially by executor;
 Cross-database compatibility
 -----------------------------
 All generators receive `source_type` and emit dialect-appropriate SQL.
-Supported source types: teradata, postgresql, aurora, databricks, sqlserver, file.
+Supported source types: teradata, postgresql, aurora, sqlserver, file.
 
 Adding a new check type
 -----------------------
@@ -68,8 +68,6 @@ def _freshness_threshold(max_age_hours: int, source_type: str) -> str:
         return f"CURRENT_TIMESTAMP - {max_age_hours} * INTERVAL '1' HOUR"
     if st in ("postgresql", "postgres", "aurora"):
         return f"CURRENT_TIMESTAMP - INTERVAL '{max_age_hours} hours'"
-    if st == "databricks":
-        return f"TIMESTAMPADD(HOUR, -{max_age_hours}, CURRENT_TIMESTAMP)"
     if st in ("sqlserver", "mssql"):
         return f"DATEADD(hour, -{max_age_hours}, GETDATE())"
     # DuckDB / file
@@ -178,8 +176,6 @@ def _regex_match(rule, table, alias, filter_sql, params, source_type):
         )
     if st in ("postgresql", "postgres", "aurora"):
         return f"NOT ({alias}.{col} ~* '{p}')"
-    if st == "databricks":
-        return f"NOT RLIKE(CAST({alias}.{col} AS STRING), '(?i){p}')"
     if st in ("sqlserver", "mssql"):
         # SQL Server has no native regex — emit LIKE with a note
         like_p = (pattern

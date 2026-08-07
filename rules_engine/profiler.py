@@ -37,11 +37,11 @@ top_values     — JSON array [{value, count}] of top-N values by frequency
 
 Cross-DB compatibility
 ----------------------
-Column discovery : SELECT * WHERE 1=0 + cursor.description (works on all 5 DBs)
+Column discovery : SELECT * WHERE 1=0 + cursor.description (works on every supported DB)
 Stats query      : ANSI SQL (null count, distinct, min, max via COUNT / MIN / MAX)
 Numeric stats    : CAST(col AS FLOAT); errors silently suppressed for text columns
 Top-N            : Teradata uses QUALIFY RANK(); SQL Server uses TOP N;
-                   PostgreSQL / Databricks / DuckDB use LIMIT N
+                   PostgreSQL / DuckDB use LIMIT N
 """
 
 import json
@@ -308,8 +308,8 @@ def _get_top_n(db_conn, source_type: str, table: str, col: str, n: int) -> list:
 
     st = (source_type or "").lower()
 
-    # CAST to VARCHAR for display; Databricks uses STRING
-    cast = f"CAST({col} AS STRING)" if st == "databricks" else f"CAST({col} AS VARCHAR(500))"
+    # CAST to VARCHAR for display
+    cast = f"CAST({col} AS VARCHAR(500))"
 
     if st == "teradata":
         # Teradata: use QUALIFY + RANK() to limit rows (subquery ORDER BY restriction)
@@ -332,7 +332,7 @@ def _get_top_n(db_conn, source_type: str, table: str, col: str, n: int) -> list:
             ORDER BY cnt DESC
         """
     else:
-        # PostgreSQL, Aurora, Databricks, DuckDB/file
+        # PostgreSQL, Aurora, DuckDB/file
         sql = f"""
             SELECT {cast} AS val, COUNT(*) AS cnt
             FROM {table}
@@ -354,7 +354,7 @@ def _get_top_n(db_conn, source_type: str, table: str, col: str, n: int) -> list:
 def _discover_columns(db_conn, table: str) -> List[str]:
     """
     Return column names by running SELECT * WHERE 1=0 + cursor.description.
-    Works identically across all 5 source types (Teradata, PG, Databricks,
+    Works identically across all supported source types (Teradata, PG,
     SQL Server, DuckDB).
     """
     try:

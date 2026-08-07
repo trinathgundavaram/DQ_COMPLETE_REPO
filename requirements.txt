@@ -7,9 +7,6 @@ teradatasql>=17.20.0.0
 # PostgreSQL / AWS Aurora (PostgreSQL-compatible)
 psycopg2-binary>=2.9.0
 
-# Databricks SQL Warehouses
-databricks-sql-connector>=3.0.0
-
 # Microsoft SQL Server (requires ODBC Driver for SQL Server on the host OS)
 pyodbc>=5.0.0
 
