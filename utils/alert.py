@@ -42,6 +42,10 @@ def send_alert(message: str, level: str = "INFO"):
     Configuration is read from env vars on every call (lazy) so that
     credentials rotated after process start are picked up automatically.
     Failures in individual channels are logged but never re-raised.
+
+    This is the global/fallback channel — used when no row in
+    dq_notification_routes matches. Prefer send_alert_to() for
+    audience-routed notifications (see core/reporting.py).
     """
     cfg = _load_config()
     level = (level or "INFO").upper()
@@ -62,6 +66,37 @@ def send_alert(message: str, level: str = "INFO"):
             logger.error("Email alert failed: %s", exc)
     else:
         logger.debug("Email credentials/recipients not configured — skipping email.")
+
+
+def send_alert_to(message: str, level: str, channel_type: str, destination: str):
+    """
+    Dispatch an alert to an EXPLICIT destination — used by core/reporting.py
+    for audience-routed notifications (dq_notification_routes rows), as
+    opposed to send_alert() which always uses the single global env-configured
+    channel.
+
+    Parameters
+    ----------
+    channel_type : "TEAMS" | "EMAIL"
+    destination   : webhook URL (TEAMS) or comma-separated email list (EMAIL)
+    """
+    level = (level or "INFO").upper()
+    channel_type = (channel_type or "").upper()
+    cfg = _load_config()
+
+    try:
+        if channel_type == "TEAMS":
+            _send_teams(message, level, destination)
+        elif channel_type == "EMAIL":
+            to_list = [e.strip() for e in destination.split(",") if e.strip()]
+            routed_cfg = dict(cfg)
+            routed_cfg["email_to"] = to_list
+            _send_email(message, level, routed_cfg)
+        else:
+            logger.error("Unknown channel_type '%s' in notification route — message dropped.",
+                         channel_type)
+    except Exception as exc:
+        logger.error("Routed alert to %s (%s) failed: %s", destination, channel_type, exc)
 
 
 # ---------------------------------------------------------------------------

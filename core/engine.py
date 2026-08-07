@@ -42,17 +42,17 @@ from core.executor import (
     record_rule_execution,
     validate_sql,
 )
-from core.query_builder import build_query
-from core.metrics import calculate_metrics
-from core.suppression import is_suppressed, record_suppressed_execution
-from core.rule_versioning import snapshot_changed_rules
+from core.rule_sql import build_query
+from core.metrics import calculate_metrics, detect_and_log as detect_anomalies
+from core.rule_lifecycle import is_suppressed, record_suppressed_execution, snapshot_changed_rules
 from core.profiler import profile_tables_for_run
-from core.anomaly_detector import detect_and_log as detect_anomalies
-from utils.id_builder import generate_run_id
-from utils.logger import log_message
+from utils.ids import generate_run_id
+from utils.metadata_writers import log_message
 from utils.alert import send_alert
+from core import reporting
 from utils.validation import validate_table_exists
-from utils.issue_logger import log_issue
+from utils.metadata_writers import log_issue
+from core.rule_sql import check_dialect, DialectMismatchError
 
 # ── Configurable log level (DQ_LOG_LEVEL overrides; default INFO) ─────────────
 _log_level = getattr(logging, os.getenv("DQ_LOG_LEVEL", "INFO").upper(), logging.INFO)
@@ -370,18 +370,48 @@ def run_engine(
         final_status = "COMPLETED" if failed_rules == 0 and issue_count == 0 else "COMPLETED_WITH_ISSUES"
 
         _update_run_control(td, run_id, final_status, meta_db)
-        _send_completion_alert(run, total_rules, failed_rules, issue_count, final_status)
 
-        logger.info("DQ run complete: %s | rules=%d failed=%d | %s",
-                    run_id, total_rules, failed_rules, final_status)
+        # Section 3.5: data findings (FAIL/WARN) and engine/rule failures
+        # (ERROR/SKIP) are ALWAYS split into separate notification audiences
+        # — never merged into one alert. See core/reporting.py.
+        data_issue_rules   = sum(1 for v in results.values() if v in ("FAIL", "WARN"))
+        engine_issue_rules = sum(1 for v in results.values() if v in ("ERROR", "SKIP"))
+        suppressed_rules   = sum(1 for v in results.values() if v == "SUPPRESSED")
+
+        try:
+            reporting.notify_run_completion(
+                td, run, meta_db, total_rules,
+                data_issue_rules, engine_issue_rules, suppressed_rules, final_status,
+            )
+        except Exception as exc:
+            logger.error("Notification routing failed (non-fatal): %s", exc, exc_info=True)
+
+        # Section 3.6: static, immutable per-run audit report — opt-in via
+        # env var so ad-hoc/local runs don't spam the report archive.
+        if os.getenv("DQ_AUTO_AUDIT_REPORT", "false").lower() == "true":
+            try:
+                from core.reporting import generate_report
+                out_dir = os.getenv("DQ_AUDIT_REPORT_DIR", "./dq_audit_reports")
+                report_path = generate_report(td, meta_db, run_id, out_dir)
+                logger.info("Audit report generated: %s", report_path)
+            except Exception as exc:
+                logger.error("Audit report generation failed (non-fatal): %s", exc, exc_info=True)
+
+        logger.info(
+            "DQ run complete: %s | rules=%d data_issues=%d engine_issues=%d suppressed=%d | %s",
+            run_id, total_rules, data_issue_rules, engine_issue_rules, suppressed_rules, final_status,
+        )
 
         summary = {
-            "run_id":       run_id,
-            "status":       final_status,
-            "total_rules":  total_rules,
-            "failed_rules": failed_rules,
-            "issue_count":  issue_count,
-            "results":      results,   # {rule_code: status} for every rule
+            "run_id":             run_id,
+            "status":             final_status,
+            "total_rules":        total_rules,
+            "failed_rules":       failed_rules,
+            "data_issue_rules":   data_issue_rules,
+            "engine_issue_rules": engine_issue_rules,
+            "suppressed_rules":   suppressed_rules,
+            "issue_count":        issue_count,
+            "results":            results,   # {rule_code: status} for every rule
         }
         return summary
 
@@ -444,7 +474,7 @@ def _dry_run(cf, project, process, run_mode, batch_id, start_date, end_date, met
         try:
             if hasattr(db_conn, "prepare"):
                 db_conn.prepare(rule)
-            from utils.table_resolver import resolve_table
+            from utils.db_helpers import resolve_table
             table  = resolve_table(rule)
             cursor = db_conn.cursor()
             cursor.execute(f"SELECT 1 FROM {table} WHERE 1=0")
@@ -505,11 +535,28 @@ def _pre_validate_rules(rules: list, cf, run: dict, meta_db: str, td) -> list:
                         error_code="PREVALIDATION", meta_db=meta_db)
             continue
 
+        source_type_val = getattr(db_conn, "source_type", "teradata")
+
+        # Fix (Section 4/8): dialect mismatch must fail BEFORE execution —
+        # checked first, distinct from generic SQL_SYNTAX issues so it is
+        # unambiguous in dq_rule_issues.
+        try:
+            check_dialect(rule, source_type_val)
+        except DialectMismatchError as exc:
+            invalid.append(code)
+            log_message(td, run["run_id"], "ERROR",
+                        f"Pre-validation dialect mismatch in rule {code}: {exc}",
+                        rule_id=rule.get("rule_id"), rule_code=code,
+                        error_code="DIALECT_MISMATCH", error_detail=str(exc),
+                        meta_db=meta_db)
+            log_issue(td, run, rule, "DIALECT_MISMATCH",
+                      f"Pre-validation failed: {exc}", str(exc), meta_db=meta_db)
+            continue
+
         try:
             if hasattr(db_conn, "prepare"):
                 db_conn.prepare(rule)
-            _q, _level = build_query(rule, run,
-                                     getattr(db_conn, "source_type", "teradata"))
+            _q, _level = build_query(rule, run, source_type_val)
             if _level != "SCHEMA":
                 validate_sql(db_conn, _q)
         except Exception as exc:
@@ -658,36 +705,3 @@ def _update_run_control(td, run_id: str, status: str, meta_db: str):
     """)
     logger.info("Run control updated: %s -> %s", run_id, status)
 
-
-def _send_completion_alert(run: dict, total_rules: int, failed_rules: int,
-                           issue_count: int, final_status: str):
-    run_id  = run["run_id"]
-    project = run["project_name"]
-    process = run["process_name"]
-
-    if failed_rules > 0 or issue_count > 0:
-        send_alert(
-            f"DQ RUN COMPLETED WITH ISSUES\n\n"
-            f"Run ID      : {run_id}\n"
-            f"Project     : {project}\n"
-            f"Process     : {process}\n"
-            f"Run Type    : {run['run_type']}\n"
-            f"Mode        : {run['run_mode']}\n\n"
-            f"Total Rules : {total_rules}\n"
-            f"Failed/Skip : {failed_rules}\n"
-            f"Issues      : {issue_count}\n\n"
-            f"Status: {final_status}",
-            "WARN",
-        )
-    else:
-        send_alert(
-            f"DQ RUN SUCCESS\n\n"
-            f"Run ID   : {run_id}\n"
-            f"Project  : {project}\n"
-            f"Process  : {process}\n"
-            f"Run Type : {run['run_type']}\n"
-            f"Mode     : {run['run_mode']}\n\n"
-            f"Total Rules: {total_rules}\n\n"
-            f"Status: COMPLETED",
-            "INFO",
-        )

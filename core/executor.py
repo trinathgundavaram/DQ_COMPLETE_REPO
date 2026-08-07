@@ -26,6 +26,11 @@ Check-type integration (v4):
           ROW    → original path (count + failed-count + exceptions)
           TABLE  → runs the full query; 0 rows = PASS, ≥1 = FAIL; total=1
           SCHEMA → calls _check_column_exists() against the DB catalog
+
+evaluate_rule() (PASS/FAIL/WARN decision) lives in this file too — it has
+exactly one caller (this module) so keeping it alongside execute_rule()
+means the "run the query, then judge the result" logic reads top to bottom
+in one place instead of two.
 """
 
 import os
@@ -33,13 +38,13 @@ import time
 import logging
 from datetime import datetime, date
 
-from core.query_builder import build_query, build_count_query
-from core.evaluator import evaluate_rule
-from utils.table_resolver import resolve_table
+from core.rule_sql import build_query, build_count_query
+from utils.db_helpers import resolve_table
 from utils.validation import validate_table_exists
-from utils.json_builder import build_json_pk, build_pk_string
-from utils.issue_logger import log_issue
-from utils.logger import log_message
+from utils.ids import build_json_pk, build_pk_string
+from utils.metadata_writers import log_issue
+from utils.metadata_writers import log_message
+from core.rule_sql import check_dialect, DialectMismatchError
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +280,81 @@ def _check_column_exists(db_conn, source_type: str, rule: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Pass/fail/warn decision
+# ---------------------------------------------------------------------------
+
+# Severity values (case-insensitive) that resolve a breach to WARN rather
+# than FAIL. Everything NOT in this set is fail-worthy, so a project can
+# invent any severity vocabulary it wants (e.g. "Compliance Flag",
+# "Timeliness") without touching this module — only the "this is just a
+# soft warning" set needs listing here.
+_SOFT_SEVERITIES = {"WARN", "WARNING", "INFO", "NOTICE"}
+
+
+def evaluate_rule(
+    total: int,
+    failed: int,
+    threshold_pct=None,             # float | None
+    threshold_count=None,           # int   | None
+    severity: str = "WARN",
+    require_rows: bool = False,     # True -> empty table is a breach
+    threshold_operator: str = "OR", # 'OR' | 'AND'
+) -> str:
+    """
+    Decide PASS / FAIL / WARN for one rule execution.
+
+    1. total == 0, require_rows=False -> PASS  (no data; not required)
+    2. total == 0, require_rows=True  -> FAIL/WARN  (data was expected)
+    3. failed == 0                     -> PASS
+    4. threshold_operator='OR'  (default) -> breach if pct OR count exceeded
+    5. threshold_operator='AND'            -> breach only if BOTH exceeded
+    6. No thresholds configured             -> any failure is a breach
+    7. Thresholds configured but not met     -> PASS
+    """
+    severity           = (severity           or "WARN").upper()
+    threshold_operator = (threshold_operator or "OR" ).upper()
+
+    if total == 0:
+        if require_rows:
+            outcome = "WARN" if severity in _SOFT_SEVERITIES else "FAIL"
+            logger.info("total=0 with require_rows=True -> %s.", outcome)
+            return outcome
+        logger.info("total=0 -- PASS (no data; require_rows=False).")
+        return "PASS"
+
+    if failed == 0:
+        return "PASS"
+
+    pct = (failed / total) * 100
+    count_breached = (threshold_count is not None) and (failed > threshold_count)
+    pct_breached   = (threshold_pct   is not None) and (pct   > threshold_pct)
+
+    if threshold_count is not None or threshold_pct is not None:
+        if threshold_operator == "AND":
+            both_set = (threshold_count is not None) and (threshold_pct is not None)
+            breached = (both_set and count_breached and pct_breached) if both_set \
+                       else (count_breached or pct_breached)
+        else:
+            breached = count_breached or pct_breached
+    else:
+        breached = True   # no thresholds configured -- any failure is a breach
+
+    if breached:
+        outcome = "WARN" if severity in _SOFT_SEVERITIES else "FAIL"
+        logger.info(
+            "Breach | pct=%.2f threshold_pct=%s count=%d threshold_count=%s operator=%s severity=%s -> %s",
+            pct, threshold_pct, failed, threshold_count, threshold_operator, severity, outcome,
+        )
+        return outcome
+
+    logger.info(
+        "No breach | pct=%.2f threshold_pct=%s count=%d threshold_count=%s operator=%s -> PASS",
+        pct, threshold_pct, failed, threshold_count, threshold_operator,
+    )
+    return "PASS"
+
+
+# ---------------------------------------------------------------------------
 # Rule execution record helpers  (fix #2)
 # ---------------------------------------------------------------------------
 
@@ -362,6 +442,25 @@ def execute_rule(rule: dict, db_conn, td_conn, run: dict, meta_db: str) -> str:
     """
     start       = time.time()
     source_type = getattr(db_conn, "source_type", "teradata")
+
+    # ── STEP -1: Dialect guard (Section 4/8) — fail fast, never mid-run ──────
+    # Defense-in-depth: core/engine.py::_pre_validate_rules already runs this
+    # same check before the run starts. This second check protects rules
+    # added/changed after pre-validation ran, or executed via a path that
+    # skips pre-validation (e.g. rule_tester.py single-rule harness).
+    try:
+        check_dialect(rule, source_type)
+    except DialectMismatchError as exc:
+        log_issue(td_conn, run, rule, "DIALECT_MISMATCH", str(exc), meta_db=meta_db)
+        log_message(td_conn, run["run_id"], "ERROR",
+                    f"Dialect mismatch for rule {rule.get('rule_code')}: {exc}",
+                    rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
+                    error_code="DIALECT_MISMATCH", error_detail=str(exc), meta_db=meta_db)
+        table = rule.get("src_tbl_nm", "UNKNOWN")
+        record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
+                              0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
+        logger.error("Dialect mismatch — rule skipped: %s", exc)
+        return "ERROR"
 
     # ── STEP 0: Source preparation ────────────────────────────────────────────
     # For FileAdapter: loads CSV/Excel into DuckDB (idempotent, thread-safe).

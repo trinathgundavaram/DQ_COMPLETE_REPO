@@ -6,7 +6,7 @@
 -- NOTE: The metadata store is always Teradata.
 -- Source systems (PostgreSQL, Databricks, SQL Server, file)
 -- are configured via environment variables — see
--- db/connection_factory.py and db/adapters/ for details.
+-- db/connection_factory.py and db/adapters.py for details.
 -- The dq_connections table below is a catalogue / reference;
 -- runtime credentials are read from env vars, NOT from this table.
 -- ============================================================
@@ -459,4 +459,172 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_anomaly_config ...
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_anomaly_log ...
 
 -- No changes to existing tables in v5.
+*/
+
+
+-- ============================================================
+-- v6: SQL-dialect enforcement, case-level disposition, config-driven
+--     stratified sampling, and notification routing. Every table below
+--     is project-agnostic and keyed by project_name/process_name like
+--     everything else in this schema — no project's vocabulary is
+--     baked into the schema; see config/seed/ for one project's config.
+-- ============================================================
+
+-- ── dq_rules: sql_dialect ─────────────────────────────────────────────────
+-- Every rule authored as raw negative-SQL (Section 4 of the design) MUST set
+-- this.  Legacy check_type-generated rules may leave it NULL — the check_type
+-- generators in core/check_types.py already emit dialect-correct SQL per
+-- source_type, so no dialect-mismatch risk exists for that path.
+--
+-- ALTER TABLE CMSUNIV_FILELAND_DEV_T.dq_rules ADD sql_dialect VARCHAR(10);
+--   Allowed values: 'teradata' | 'postgres' | 'ansi'
+--   'ansi'  = confirmed portable across every supported source_type — use
+--             ONLY for syntax with no dialect-specific date/window functions.
+--
+-- The engine (core/rule_sql.py) refuses to execute a rule whose
+-- sql_dialect is incompatible with its target connection's source_type,
+-- both at pre-validation time (core/engine.py::_pre_validate_rules) and
+-- immediately before execution (core/executor.py::execute_rule) as a
+-- defense-in-depth guard. A mismatch is logged to dq_rule_issues with
+-- issue_type='DIALECT_MISMATCH' and the rule is recorded as status='ERROR'
+-- in dq_rule_execution — it NEVER writes to dq_exceptions, and it NEVER
+-- looks like a clean PASS.
+
+-- ── dq_connections: constrain source_type to the 3 supported adapters ─────
+-- ALTER TABLE CMSUNIV_FILELAND_DEV_T.dq_connections
+--   ADD CONSTRAINT dq_connections_source_type_ck
+--   CHECK (source_type IN ('teradata', 'postgresql', 's3'));
+--
+-- NOTE: the connector layer (db/adapters.py) remains pluggable — Databricks
+-- and SQL Server adapters still exist in code — but only these three are
+-- catalogued/tested for this engine instance. Adding a 4th source later is
+-- a new adapter file + one new _TYPE_MAP entry; no engine-core change.
+
+
+-- Case-level disposition — layered ON TOP of an immutable dq_exceptions row.
+-- A finding is NEVER updated or deleted. Waiving/resolving/dismissing a case
+-- inserts a NEW disposition row; the most recent (effective_flag=1) row per
+-- exception_id is the current state. Joined at read time by the dashboard
+-- and the static audit report — dq_exceptions itself never changes.
+CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_case_dispositions (
+    disposition_id     BIGINT GENERATED ALWAYS AS IDENTITY,
+    exception_id        BIGINT NOT NULL,        -- FK -> dq_exceptions.exception_id
+    run_id               VARCHAR(200),
+    rule_id              INTEGER,
+    rule_code            VARCHAR(200),
+    project_name         VARCHAR(100),
+    process_name         VARCHAR(100),
+    primary_key_str      VARCHAR(500),           -- denormalised for fast lookup
+    disposition_type     VARCHAR(30),            -- WAIVED | RESOLVED | FALSE_POSITIVE |
+                                                  -- CORRECTED | UNDER_REVIEW | REOPENED
+    disposition_reason   VARCHAR(1000),
+    disposed_by          VARCHAR(100),
+    disposed_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    effective_flag       BYTEINT DEFAULT 1,      -- 1 = current state; superseded rows
+                                                  -- get a NEW row with effective_flag=1
+                                                  -- and the prior row's effective_flag
+                                                  -- is set to 0 in the SAME transaction
+                                                  -- (still never UPDATEs the finding itself)
+    created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+PRIMARY INDEX (exception_id);
+
+CREATE INDEX dq_case_dispositions_lookup_ix (exception_id, effective_flag)
+ON CMSUNIV_FILELAND_DEV_T.dq_case_dispositions;
+
+
+-- Notification routing — decouples "who gets told what" from rule logic.
+-- audience: ROAR | BUSINESS | ENGINEERING | QA
+-- finding_class: DATA_VIOLATION | ENGINE_FAILURE  (never both on one route —
+--   this table is exactly what prevents the two audiences from being
+--   collapsed onto the same channel).
+CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_notification_routes (
+    route_id          INTEGER NOT NULL,
+    project_name      VARCHAR(100),     -- NULL = applies to all projects
+    process_name      VARCHAR(100),     -- NULL = applies to all processes
+    finding_class     VARCHAR(20) NOT NULL,   -- DATA_VIOLATION | ENGINE_FAILURE
+    audience          VARCHAR(20) NOT NULL,   -- ROAR | BUSINESS | ENGINEERING | QA
+    channel_type      VARCHAR(20) NOT NULL,   -- EMAIL | TEAMS
+    destination       VARCHAR(1000) NOT NULL, -- webhook URL or comma-sep emails
+    business_correctable_only BYTEINT DEFAULT 0, -- 1 = only send rows where
+                                                  -- dq_rules.business_correctable = 1
+    active_flag       BYTEINT DEFAULT 1,
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+PRIMARY INDEX (route_id);
+
+CREATE INDEX dq_notification_routes_lookup_ix
+    (project_name, process_name, finding_class, audience)
+ON CMSUNIV_FILELAND_DEV_T.dq_notification_routes;
+
+-- dq_rules: business_correctable — is this finding type something the
+-- BUSINESS audience can act on directly (vs. purely a compliance/audit
+-- record for ROAR)?  Drives the notification split in Section 3.5.
+-- ALTER TABLE CMSUNIV_FILELAND_DEV_T.dq_rules ADD business_correctable BYTEINT DEFAULT 0;
+
+
+-- ── Config-driven stratified sampling ─────────────────────────────────
+-- Config: target mix %, exclusion rules, priority order — all JSON so a
+-- different project/process can define a completely different sampling
+-- scheme without touching core/stratified_sampling.py.
+CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_sampling_config (
+    config_id            INTEGER NOT NULL,
+    project_name         VARCHAR(100) NOT NULL,
+    process_name         VARCHAR(100) NOT NULL,
+    sample_name           VARCHAR(100) NOT NULL,   -- e.g. 'WEEKLY_CLINICAL_REVIEW_SAMPLE'
+    connection_name       VARCHAR(100) NOT NULL,   -- which dq_connections entry to pull from
+    universe_table         VARCHAR(200) NOT NULL,
+    key_columns             VARCHAR(500) NOT NULL,   -- entity key column(s), CSV
+    scope_column             VARCHAR(100),           -- e.g. 'pull_date' — scopes to the run's week
+    target_volume            INTEGER NOT NULL DEFAULT 150,
+    determination_column     VARCHAR(100),         -- e.g. 'request_disposition'
+    determination_mix_json   CLOB,                  -- {"Denied":0.80,"Withdrawn":0.10,...}
+    functional_area_column   VARCHAR(100),
+    functional_area_mix_json CLOB,                  -- {"Part B":0.13,"Behavioral Health":0.08,...}
+    exclusion_sql            CLOB,                   -- WHERE-fragment: rows matching are EXCLUDED
+    priority_rank_sql        CLOB,                   -- ORDER BY expression (lowest = highest priority)
+    schedule_cron            VARCHAR(50),            -- e.g. '0 8 * * FRI' — gates when this runs
+    active_flag              BYTEINT DEFAULT 1,
+    created_at                TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+PRIMARY INDEX (config_id);
+
+-- Immutable output: every candidate case considered, scored, and whether it
+-- was selected — not just the final 150. Retained 10y per Section 3.7;
+-- never updated after a run completes (a re-run writes a new sample_run_id).
+CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_sample_selections (
+    sample_row_id      BIGINT GENERATED ALWAYS AS IDENTITY,
+    sample_run_id       VARCHAR(200) NOT NULL,   -- one per sampling execution
+    config_id            INTEGER,
+    project_name         VARCHAR(100),
+    process_name         VARCHAR(100),
+    sample_cycle           DATE,                  -- the pull/period this sample was drawn from
+    case_key               VARCHAR(500),          -- entity key (matches key_columns)
+    determination_type     VARCHAR(100),
+    functional_area         VARCHAR(100),
+    priority_rank             INTEGER,             -- 1 = highest priority
+    excluded_flag              BYTEINT DEFAULT 0,
+    exclusion_reason            VARCHAR(500),
+    selected_flag                BYTEINT DEFAULT 0,  -- 1 = part of the final target-volume sample
+    strata_json                   CLOB,               -- snapshot of the row's stratification attrs
+    created_at                      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+PRIMARY INDEX (sample_run_id);
+
+CREATE INDEX dq_sample_selections_lookup_ix (project_name, process_name, sample_cycle, selected_flag)
+ON CMSUNIV_FILELAND_DEV_T.dq_sample_selections;
+
+
+/*  ── v5 → v6 (dialect enforcement, disposition, routing, sampling) ──────
+ALTER TABLE CMSUNIV_FILELAND_DEV_T.dq_rules ADD sql_dialect VARCHAR(10);
+ALTER TABLE CMSUNIV_FILELAND_DEV_T.dq_rules ADD business_correctable BYTEINT DEFAULT 0;
+ALTER TABLE CMSUNIV_FILELAND_DEV_T.dq_connections
+  ADD CONSTRAINT dq_connections_source_type_ck
+  CHECK (source_type IN ('teradata', 'postgresql', 's3'));
+
+-- New tables (see CREATE statements above):
+CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_case_dispositions ...
+CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_notification_routes ...
+CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_sampling_config ...
+CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_sample_selections ...
 */

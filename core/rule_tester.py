@@ -34,15 +34,15 @@ from db.connection_factory import ConnectionFactory
 from core.executor import (
     execute_query,
     validate_sql,
+    evaluate_rule,
     _count_total,
     _count_failed,
     _run_table_check,
     _fetch_failed_rows,
     _check_column_exists,
 )
-from core.query_builder import build_query, build_count_query
-from core.evaluator import evaluate_rule
-from utils.table_resolver import resolve_table
+from core.rule_sql import build_query, build_count_query
+from utils.db_helpers import resolve_table
 
 logging.basicConfig(
     level=logging.INFO,

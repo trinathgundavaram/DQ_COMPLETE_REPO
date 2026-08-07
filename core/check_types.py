@@ -39,7 +39,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-_ALIAS = "t"   # outer table alias used throughout query_builder.py
+_ALIAS = "t"   # outer table alias used throughout core/rule_sql.py
 
 # ─── Dimension constants ──────────────────────────────────────────────────────
 COMPLETENESS  = "COMPLETENESS"

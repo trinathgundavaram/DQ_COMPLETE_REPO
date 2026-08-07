@@ -26,7 +26,7 @@ Environment variables (set before running)
 
     Per source connection  (prefix = DQ_<NAME>_):
         DQ_<NAME>_TYPE, DQ_<NAME>_HOST, DQ_<NAME>_USER, DQ_<NAME>_PASSWORD, ...
-        See db/adapters/ for full list of per-driver env vars.
+        See db/adapters.py for full list of per-driver env vars.
 
 Exit codes
 ----------

@@ -66,21 +66,24 @@ import logging
 import os
 from typing import Dict, Optional
 
-from db.adapters.base import SourceAdapter
-from db.adapters.teradata_adapter import TeradataAdapter
-from db.adapters.postgres_adapter import PostgresAdapter
-from db.adapters.databricks_adapter import DatabricksAdapter
-from db.adapters.sqlserver_adapter import SqlServerAdapter
-from db.adapters.file_adapter import FileAdapter
+from db.adapters import (
+    SourceAdapter, TeradataAdapter, PostgresAdapter, DatabricksAdapter,
+    SqlServerAdapter, FileAdapter, S3Adapter,
+)
 
 logger = logging.getLogger(__name__)
 
 # Map DQ_<NAME>_TYPE values → adapter build classmethod
 _TYPE_MAP = {
+    # ── Sanctioned for this engine instance (Section 2): teradata, postgresql, s3 ──
     "teradata":   TeradataAdapter,
     "postgresql": PostgresAdapter,
     "postgres":   PostgresAdapter,   # alias
     "aurora":     PostgresAdapter,   # alias — Aurora PG-compatible
+    "s3":         S3Adapter,         # DuckDB-over-S3 (Parquet/CSV, read directly)
+    # ── Adapter interface stays pluggable; these exist but are untested/
+    #    uncatalogued for this instance until a real use case needs them.
+    #    Adding a 4th source = one new adapter file + one new entry here.
     "databricks": DatabricksAdapter,
     "sqlserver":  SqlServerAdapter,
     "mssql":      SqlServerAdapter,  # alias
@@ -139,8 +142,8 @@ class ConnectionFactory:
             logger.error("Connection '%s' not found in pool.", name)
             return None
 
-        # FileAdapter is always alive — skip ping overhead
-        if isinstance(adapter, FileAdapter):
+        # FileAdapter/S3Adapter are DuckDB-in-process — always alive, skip ping overhead
+        if isinstance(adapter, (FileAdapter, S3Adapter)):
             return adapter
 
         if not adapter.ping():
@@ -169,10 +172,12 @@ class ConnectionFactory:
         Returns None on failure.
         """
         adapter_cls = _TYPE_MAP.get(self._get_type(name))
-        if adapter_cls is FileAdapter:
-            # File sources share the singleton adapter; return the cached one.
+        if adapter_cls in (FileAdapter, S3Adapter):
+            # File/S3 sources share the singleton adapter (per-thread DuckDB
+            # connections inside it are already thread-safe); return the cached one.
             logger.debug(
-                "new_connection('%s'): returning cached FileAdapter (shared-safe).", name
+                "new_connection('%s'): returning cached %s (shared-safe).",
+                name, adapter_cls.__name__,
             )
             return self._conns.get(name)
 

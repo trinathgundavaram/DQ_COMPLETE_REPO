@@ -1,5 +1,5 @@
 import logging
-from utils.table_resolver import resolve_table
+from utils.db_helpers import resolve_table
 
 logger = logging.getLogger(__name__)
 
