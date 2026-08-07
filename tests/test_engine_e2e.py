@@ -536,3 +536,113 @@ def test_run_engine_end_to_end(monkeypatch):
     finally:
         _SharedDuckDBAdapter._shared_conn = None
         conn.close()
+
+
+def test_run_engine_dry_run_reports_failed_status(monkeypatch):
+    """
+    Regression test for the dry-run status bug: _dry_run()'s summary dict
+    used to have no "status" key at all, so every caller checking
+    `result.get("status") == "FAILED"` (main.py's exit code, the Lambda/
+    Glue/Airflow entrypoints) silently treated a dry run as successful no
+    matter how many rules failed validation. A rule pointing at a
+    source_system with no registered connection is the simplest way to
+    force a dry-run validation failure without depending on build_query()
+    internals.
+    """
+    conn = duckdb.connect(":memory:")
+    _create_schema(conn)
+
+    _SharedDuckDBAdapter._shared_conn = conn
+    monkeypatch.setitem(connection_factory._TYPE_MAP, "teradata", _SharedDuckDBAdapter)
+
+    monkeypatch.setenv("DQ_META_DB", META_DB)
+    monkeypatch.setenv("DQ_CONNECTION_NAMES", "teradata")
+    monkeypatch.setenv("DQ_TERADATA_TYPE", "teradata")
+    monkeypatch.setattr(engine, "META_CONNECTION", "teradata")
+    monkeypatch.setattr(engine, "MAX_WORKERS", 2)
+    monkeypatch.setattr(engine, "PREVALIDATE_ABORT", False)
+
+    try:
+        scope_id_seed = 1
+        # Dry run loads rules via find_scope_id() — a READ-ONLY lookup,
+        # unlike the real run path's get_scope_id() which creates the scope
+        # row on first use. The scope must already exist for dry run to see
+        # any rules at all, so it's inserted explicitly here.
+        conn.execute(f"""
+            INSERT INTO {META_DB}.dq_scope (scope_id, project_name, process_name)
+            VALUES (?, 'claims_audit', 'monthly_review')
+        """, [scope_id_seed])
+        conn.execute(f"""
+            INSERT INTO {META_DB}.dq_rules (
+                rule_id, rule_code, scope_id, src_tbl_nm, primary_key_columns,
+                check_type, check_column, priority, source_system,
+                severity, active_flag
+            ) VALUES
+                (1, 'NO_SUCH_CONNECTION', ?, 'claims', 'claim_id',
+                 'NOT_NULL', 'amount', 1, 'a_connection_that_does_not_exist',
+                 'HIGH', 1)
+        """, [scope_id_seed])
+
+        summary = engine.run_engine(
+            project="claims_audit",
+            process="monthly_review",
+            run_type="MONTHLY",
+            run_mode="FULL",
+            dry_run=True,
+        )
+
+        assert summary["status"] == "FAILED"
+        assert summary["total"] == 1
+        assert summary["passed"] == 0
+        assert summary["failed"] == 1
+        assert summary["failed_rules"][0][0] == "NO_SUCH_CONNECTION"
+
+    finally:
+        _SharedDuckDBAdapter._shared_conn = None
+        conn.close()
+
+
+def test_run_engine_dry_run_reports_completed_status(monkeypatch):
+    """Companion to the failure case above: a dry run where every rule
+    validates cleanly must report status == "COMPLETED", not just omit the
+    key. Reuses the same 3-rule fixture as the end-to-end test."""
+    conn = duckdb.connect(":memory:")
+    _create_schema(conn)
+
+    _SharedDuckDBAdapter._shared_conn = conn
+    monkeypatch.setitem(connection_factory._TYPE_MAP, "teradata", _SharedDuckDBAdapter)
+
+    monkeypatch.setenv("DQ_META_DB", META_DB)
+    monkeypatch.setenv("DQ_CONNECTION_NAMES", "teradata")
+    monkeypatch.setenv("DQ_TERADATA_TYPE", "teradata")
+    monkeypatch.setattr(engine, "META_CONNECTION", "teradata")
+    monkeypatch.setattr(engine, "MAX_WORKERS", 2)
+    monkeypatch.setattr(engine, "PREVALIDATE_ABORT", False)
+
+    try:
+        scope_id_seed = 1
+        # Dry run reads the scope via find_scope_id() (read-only), unlike a
+        # real run which creates it via get_scope_id() — insert it up front
+        # so _load_rules() actually finds the seeded rules below.
+        conn.execute(f"""
+            INSERT INTO {META_DB}.dq_scope (scope_id, project_name, process_name)
+            VALUES (?, 'claims_audit', 'monthly_review')
+        """, [scope_id_seed])
+        _seed_rules(conn, scope_id_seed)
+
+        summary = engine.run_engine(
+            project="claims_audit",
+            process="monthly_review",
+            run_type="MONTHLY",
+            run_mode="FULL",
+            dry_run=True,
+        )
+
+        assert summary["total"] == 3   # sanity check: rules were actually loaded
+        assert summary["status"] == "COMPLETED"
+        assert summary["failed"] == 0
+        assert summary["failed_rules"] == []
+
+    finally:
+        _SharedDuckDBAdapter._shared_conn = None
+        conn.close()

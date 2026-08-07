@@ -61,9 +61,13 @@ Examples:
                         help="project_name (matches dq_rules.project_name)")
     parser.add_argument("--process",   required=True,
                         help="process_name (matches dq_rules.process_name)")
+    # No choices= restriction: the engine treats run_type as an open string
+    # (see core/metrics.py::RUN_TYPE_DEVIATION_THRESHOLDS, which falls back
+    # to DEFAULT_DEVIATION_THRESHOLD_PCT for any unrecognized value), so the
+    # CLI should not artificially restrict which run types can be used.
     parser.add_argument("--run-type",  required=True, dest="run_type",
-                        choices=["DAILY", "WEEKLY", "MONTHLY", "ADHOC", "TEST"],
-                        help="Run cadence/type")
+                        help="Run cadence/type (e.g. DAILY, WEEKLY, MONTHLY, ADHOC, TEST, "
+                             "or any custom value understood by your metrics config)")
     parser.add_argument("--run-mode",  required=True, dest="run_mode",
                         choices=["FULL", "BATCH", "DATE"],
                         help="Scope of data to validate")

@@ -94,9 +94,15 @@ def profile_tables_for_run(
     if not targets:
         return
 
-    # Load all profile configs for this project/process in one query
+    # Load all profile configs for this project/process in one query.
+    # Fix: dq_profile_config rows may use NULL project_name/process_name as
+    # wildcards (see _load_profile_configs), so more than one active row can
+    # match the same table_name (e.g. a global default plus a project-
+    # specific override). Resolve to the most specific row per table_name —
+    # exact project+process > project-only wildcard > global wildcard —
+    # mirroring the same pattern used in core/reporting.py::_load_routes().
     cfg_rows = _load_profile_configs(td_conn, run, meta_db, execute_query)
-    cfg_by_table = {r.get("table_name"): r for r in cfg_rows}
+    cfg_by_table = _resolve_most_specific_configs(cfg_rows)
 
     profiled = 0
     for target in targets:
@@ -207,55 +213,74 @@ def _profile_column(
 ) -> Optional[dict]:
     """
     Compute statistics for one column.  Returns None if the stats query fails.
+
+    Perf fix: numeric columns previously required two full-table-scan
+    queries (basic stats, then a separate numeric-stats query). They're now
+    merged into a single query — AVG/STDDEV(CAST(col AS FLOAT)) fails for
+    non-numeric columns and aborts the whole statement (same failure
+    semantics the original two-query split already relied on), so on
+    failure we transparently fall back to the original basic-stats-only
+    query. Net effect: 1 scan instead of 2 for numeric columns, no change
+    in query count or behavior for non-numeric columns.
     """
     from core.executor import execute_query
 
-    # ── Query 1: basic stats (null, distinct, min, max) ──────────────────────
-    # MIN/MAX are fetched without CAST so the driver returns native Python types;
-    # we convert to str in Python.  This is the most portable approach.
+    stddev_fn = "STDEV" if source_type in ("sqlserver", "mssql") else "STDDEV_SAMP"
+
+    # ── Attempt 1: combined basic + numeric stats in one scan ────────────────
+    r = None
+    mean_val = stddev_val = None
     try:
-        basic_sql = f"""
+        combined_sql = f"""
             SELECT
-                COUNT(*)           AS total_rows,
-                COUNT({col})       AS non_null_count,
+                COUNT(*)              AS total_rows,
+                COUNT({col})          AS non_null_count,
                 COUNT(DISTINCT {col}) AS distinct_count,
-                MIN({col})         AS min_val,
-                MAX({col})         AS max_val
+                MIN({col})            AS min_val,
+                MAX({col})            AS max_val,
+                AVG(CAST({col} AS FLOAT))         AS mean_val,
+                {stddev_fn}(CAST({col} AS FLOAT)) AS stddev_val
             FROM {table}
         """
-        rows = execute_query(db_conn, basic_sql)
-        if not rows:
-            return None
-    except Exception as exc:
-        logger.debug("Basic stats failed for %s.%s: %s", table, col, exc)
-        return None
+        rows = execute_query(db_conn, combined_sql)
+        if rows:
+            r  = rows[0]
+            mv = r.get("mean_val")
+            sv = r.get("stddev_val")
+            mean_val   = float(mv) if mv is not None else None
+            stddev_val = float(sv) if sv is not None else None
+    except Exception:
+        r = None   # non-numeric column (CAST failed) or other error — fall back below
 
-    r            = rows[0]
+    # ── Fallback: basic stats only, no numeric CAST ───────────────────────────
+    # MIN/MAX are fetched without CAST so the driver returns native Python types;
+    # we convert to str in Python.  This is the most portable approach.
+    if r is None:
+        try:
+            basic_sql = f"""
+                SELECT
+                    COUNT(*)              AS total_rows,
+                    COUNT({col})          AS non_null_count,
+                    COUNT(DISTINCT {col}) AS distinct_count,
+                    MIN({col})            AS min_val,
+                    MAX({col})            AS max_val
+                FROM {table}
+            """
+            rows = execute_query(db_conn, basic_sql)
+            if not rows:
+                return None
+            r = rows[0]
+        except Exception as exc:
+            logger.debug("Basic stats failed for %s.%s: %s", table, col, exc)
+            return None
+        mean_val = stddev_val = None   # confirmed non-numeric — no numeric stats
+
     total        = int(r.get("total_rows") or 0)
     non_null     = int(r.get("non_null_count") or 0)
     null_count   = total - non_null
     distinct     = int(r.get("distinct_count") or 0)
 
-    # ── Query 2: numeric stats (CAST to FLOAT — silently skipped for text) ───
-    mean_val = stddev_val = None
-    stddev_fn = "STDEV" if source_type in ("sqlserver", "mssql") else "STDDEV_SAMP"
-    try:
-        num_sql = f"""
-            SELECT
-                AVG(CAST({col} AS FLOAT))      AS mean_val,
-                {stddev_fn}(CAST({col} AS FLOAT)) AS stddev_val
-            FROM {table}
-        """
-        num_rows = execute_query(db_conn, num_sql)
-        if num_rows:
-            mv = num_rows[0].get("mean_val")
-            sv = num_rows[0].get("stddev_val")
-            mean_val   = float(mv)   if mv is not None else None
-            stddev_val = float(sv)   if sv is not None else None
-    except Exception:
-        pass   # non-numeric column — expected and acceptable
-
-    # ── Query 3: top-N values by frequency (low-cardinality only) ────────────
+    # ── Top-N values by frequency (low-cardinality only) ──────────────────────
     top_values = []
     if 0 < distinct <= _TOP_N_CARDINALITY_LIMIT:
         try:
@@ -368,6 +393,24 @@ def _filter_columns(all_cols: List[str], cfg: dict) -> List[str]:
 # ---------------------------------------------------------------------------
 # Config loading and frequency control
 # ---------------------------------------------------------------------------
+
+def _resolve_most_specific_configs(cfg_rows: list) -> dict:
+    """
+    Collapse dq_profile_config rows to one per table_name, keeping the most
+    specific match when a global/project wildcard row and a more specific
+    row both target the same table (specificity = non-null project_name +
+    non-null process_name on that row, same scoring as _load_routes()).
+    """
+    def specificity(r):
+        return (r.get("project_name") is not None) + (r.get("process_name") is not None)
+
+    best: dict = {}
+    for r in cfg_rows:
+        tbl = r.get("table_name")
+        if tbl not in best or specificity(r) > specificity(best[tbl]):
+            best[tbl] = r
+    return best
+
 
 def _load_profile_configs(td_conn, run: dict, meta_db: str, execute_query) -> list:
     """

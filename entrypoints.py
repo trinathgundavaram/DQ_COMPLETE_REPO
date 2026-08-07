@@ -245,20 +245,30 @@ def _run_cron_job(job: dict):
 
     end_date = date.today()
     start_date = end_date - timedelta(days=int(job.get("lookback_days", 7)) - 1)
+    is_date_mode = job.get("run_mode", "DATE") == "DATE"
 
     result = run_engine(
         project=job["project"], process=job["process"], run_type=job["run_type"],
         run_mode=job.get("run_mode", "DATE"), batch_id=job.get("batch_id"),
-        start_date=str(start_date) if job.get("run_mode", "DATE") == "DATE" else None,
-        end_date=str(end_date) if job.get("run_mode", "DATE") == "DATE" else None,
+        start_date=str(start_date) if is_date_mode else None,
+        end_date=str(end_date) if is_date_mode else None,
     )
     logger.info("cron job: %s/%s complete — %s", job["project"], job["process"], result.get("status"))
 
     if job.get("sampling_config_name"):
-        _run_cron_sampling(job, result)
+        # Fix: pass the same resolved date window used for the rules-engine
+        # run through explicitly, rather than reading job["_resolved_start_date"]
+        # / job["_resolved_end_date"], which were never set anywhere and
+        # silently caused sampling to always run unscoped (full table pull)
+        # instead of matching the just-completed run's date window.
+        _run_cron_sampling(
+            job, result,
+            start_date=str(start_date) if is_date_mode else None,
+            end_date=str(end_date) if is_date_mode else None,
+        )
 
 
-def _run_cron_sampling(job: dict, engine_result: dict):
+def _run_cron_sampling(job: dict, engine_result: dict, start_date=None, end_date=None):
     """Fire the Sampling Framework as a follow-on step after a rules-engine
     cron job. This is the only place in entrypoints.py that touches both
     frameworks — it's deployment glue, not a dependency between them."""
@@ -281,7 +291,7 @@ def _run_cron_sampling(job: dict, engine_result: dict):
             return
         run_stratified_sampling(cf, td, rows[0], {
             "run_id": engine_result.get("run_id", "SAMPLING_RUN"),
-            "start_date": job.get("_resolved_start_date"), "end_date": job.get("_resolved_end_date"),
+            "start_date": start_date, "end_date": end_date,
         }, meta_db)
     finally:
         cf.close_all()

@@ -15,6 +15,7 @@ schema.
 """
 
 import json
+import uuid
 from datetime import datetime
 
 
@@ -29,11 +30,20 @@ def generate_run_id(
 ) -> str:
     """
     Format:
-      BATCH : {PROJECT}_{PROCESS}_{RUN_TYPE}_BATCH_{batch_id}_{YYYYMMDD_HHMMSS}
-      DATE  : {PROJECT}_{PROCESS}_{RUN_TYPE}_DATE_{start_date}_{end_date}_{YYYYMMDD_HHMMSS}
-      FULL  : {PROJECT}_{PROCESS}_{RUN_TYPE}_FULL_{YYYYMMDD_HHMMSS}
+      BATCH : {PROJECT}_{PROCESS}_{RUN_TYPE}_BATCH_{batch_id}_{YYYYMMDD_HHMMSS}_{rand6}
+      DATE  : {PROJECT}_{PROCESS}_{RUN_TYPE}_DATE_{start_date}_{end_date}_{YYYYMMDD_HHMMSS}_{rand6}
+      FULL  : {PROJECT}_{PROCESS}_{RUN_TYPE}_FULL_{YYYYMMDD_HHMMSS}_{rand6}
+
+    Fix: a second-granularity timestamp alone is not unique — two runs of
+    the same project/process/run_type/run_mode/dataset kicked off within the
+    same second (e.g. a retry, a fast-firing scheduler, or concurrent
+    invocations) produce the same run_id and collide in dq_run_control's
+    primary key. A short random suffix (6 hex chars, ~16M combinations)
+    guarantees uniqueness regardless of clock resolution, while the
+    timestamp is kept for human readability/sortability.
     """
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")   # seconds prevent same-minute collision
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    rand = uuid.uuid4().hex[:6]
 
     if run_mode == "BATCH" and batch_id:
         dataset = batch_id
@@ -42,7 +52,7 @@ def generate_run_id(
     else:
         dataset = "FULL"
 
-    return f"{project}_{process}_{run_type}_{run_mode}_{dataset}_{ts}"
+    return f"{project}_{process}_{run_type}_{run_mode}_{dataset}_{ts}_{rand}"
 
 
 def build_json_pk(rule: dict, row: dict) -> str:

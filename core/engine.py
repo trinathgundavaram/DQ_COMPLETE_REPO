@@ -30,6 +30,7 @@ syntax for every rule upfront and aborts on configurable DQ_PREVALIDATE_ABORT
 import logging
 import os
 import signal
+import threading
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 
@@ -70,28 +71,58 @@ STALE_RUN_HOURS   = int(os.getenv("DQ_STALE_RUN_HOURS", "4"))     # fix #4
 PREVALIDATE_ABORT = os.getenv("DQ_PREVALIDATE_ABORT", "false").lower() == "true"  # fix #17
 
 # ── Module-level state for SIGTERM handler ────────────────────────────────────
-_active_run_id: str = None
-_active_cf:     "ConnectionFactory" = None
-_active_td      = None
-_active_meta_db: str = None
+# Fix: keyed by a unique per-invocation token (not shared scalars) so that
+# multiple run_engine() calls active concurrently in the same process (e.g.
+# a warm Lambda container reused for overlapping invocations, or a service
+# fanning out several runs) each get their own cleanup entry instead of
+# clobbering one another. Entries are removed as soon as their run_engine()
+# call finishes (success, dry-run, or failure) so a SIGTERM arriving after a
+# run has already completed — e.g. an idle long-lived cron_run_scheduler()
+# process — cannot re-mark that already-finished run as ABORTED.
+_active_runs: dict = {}
+_active_runs_lock = threading.Lock()
+
+
+def _register_active(token, cf=None, td=None, meta_db=None, run_id=None):
+    with _active_runs_lock:
+        _active_runs[token] = {"cf": cf, "td": td, "meta_db": meta_db, "run_id": run_id}
+
+
+def _set_active_run_id(token, run_id):
+    with _active_runs_lock:
+        entry = _active_runs.get(token)
+        if entry is not None:
+            entry["run_id"] = run_id
+
+
+def _unregister_active(token):
+    with _active_runs_lock:
+        _active_runs.pop(token, None)
 
 
 def _sigterm_handler(signum, frame):
     """
-    Mark the active run as ABORTED and close all connections on SIGTERM/SIGINT.
-    Prevents runs being left in RUNNING state on container shutdown or k8s eviction.
+    Mark every currently-active run as ABORTED and close its connections on
+    SIGTERM/SIGINT. Iterates a snapshot of all registered runs so concurrent
+    run_engine() invocations in this process are all cleaned up correctly,
+    not just whichever one happened to register last.
     """
-    logger.warning("Signal %d received — marking run ABORTED and shutting down.", signum)
-    if _active_run_id and _active_td and _active_meta_db:
-        try:
-            _update_run_control(_active_td, _active_run_id, "ABORTED", _active_meta_db)
-        except Exception as exc:
-            logger.error("SIGTERM handler: failed to update run control: %s", exc)
-    if _active_cf:
-        try:
-            _active_cf.close_all()
-        except Exception as exc:
-            logger.error("SIGTERM handler: failed to close connections: %s", exc)
+    logger.warning("Signal %d received — marking active run(s) ABORTED and shutting down.", signum)
+    with _active_runs_lock:
+        snapshot = list(_active_runs.values())
+    for entry in snapshot:
+        run_id, td, meta_db, cf = (entry.get("run_id"), entry.get("td"),
+                                    entry.get("meta_db"), entry.get("cf"))
+        if run_id and td and meta_db:
+            try:
+                _update_run_control(td, run_id, "ABORTED", meta_db)
+            except Exception as exc:
+                logger.error("SIGTERM handler: failed to update run control for %s: %s", run_id, exc)
+        if cf:
+            try:
+                cf.close_all()
+            except Exception as exc:
+                logger.error("SIGTERM handler: failed to close connections: %s", exc)
     raise SystemExit(1)
 
 
@@ -128,7 +159,8 @@ def run_engine(
     end_date   : YYYY-MM-DD inclusive end   (DATE mode)
     dry_run    : when True, validate rules without writing any DB results
     """
-    global _active_run_id, _active_cf, _active_td, _active_meta_db
+    # Unique token for this run_engine() invocation — see _active_runs above.
+    token = object()
 
     meta_db = get_meta_db()
 
@@ -137,11 +169,10 @@ def run_engine(
     td = cf.get(META_CONNECTION)   # fix #5: env-driven metadata connection name
 
     # Register with SIGTERM handler so shutdown can clean up
-    _active_cf     = cf
-    _active_td     = td
-    _active_meta_db = meta_db
+    _register_active(token, cf=cf, td=td, meta_db=meta_db)
 
     if td is None:
+        _unregister_active(token)
         raise RuntimeError(
             f"Metadata connection '{META_CONNECTION}' unavailable. "
             "Check DQ_META_CONNECTION and its credentials."
@@ -152,10 +183,11 @@ def run_engine(
             return _dry_run(cf, project, process, run_mode, batch_id, start_date, end_date, meta_db, td)
         finally:
             cf.close_all()
+            _unregister_active(token)
 
     run_id     = generate_run_id(project, process, run_type, run_mode, batch_id, start_date, end_date)
     dataset_id = _build_dataset_id(run_mode, batch_id, start_date, end_date)
-    _active_run_id = run_id   # expose to SIGTERM handler
+    _set_active_run_id(token, run_id)   # expose to SIGTERM handler
 
     run = {
         "run_id":       run_id,
@@ -431,6 +463,7 @@ def run_engine(
 
     finally:
         cf.close_all()
+        _unregister_active(token)
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +533,17 @@ def _dry_run(cf, project, process, run_mode, batch_id, start_date, end_date, met
         logger.info("[DRY RUN] PASS %s", code)
         passed.append(code)
 
+    # Fix: dry-run must expose a "status" key so all execution wrappers
+    # (CLI exit code, Lambda HTTP status, Glue exit code, Airflow exception)
+    # can correctly detect validation failures. Any rule that failed
+    # validation (bad SQL, missing table, no connection) means the dry run
+    # itself did not pass — mirrors the "FAILED" status used elsewhere for
+    # non-viable runs, distinct from COMPLETED_WITH_ISSUES which is reserved
+    # for legitimate data-quality findings on a real run.
+    status = "FAILED" if failed_list else "COMPLETED"
+
     summary = {
+        "status":       status,
         "total":        len(rules),
         "passed":       len(passed),
         "failed":       len(failed_list),

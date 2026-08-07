@@ -64,6 +64,7 @@ Usage
 
 import logging
 import os
+import threading
 from typing import Dict, Optional
 
 from db.adapters import (
@@ -103,6 +104,16 @@ class ConnectionFactory:
 
     def __init__(self):
         self._conns: Dict[str, SourceAdapter] = {}
+        # Fix: get()'s stale-reconnect path is called concurrently from
+        # ThreadPoolExecutor worker threads during run_engine(). Without a
+        # lock, two threads that both observe the same connection as stale
+        # each independently rebuild and overwrite self._conns[name], and
+        # whichever adapter loses that race is silently orphaned (leaked —
+        # never explicitly closed). Per-name locks confine reconnects for
+        # different connections to run independently, while a small guard
+        # lock protects lazy creation of those per-name locks themselves.
+        self._locks: Dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -147,18 +158,37 @@ class ConnectionFactory:
             return adapter
 
         if not adapter.ping():
-            logger.warning("Connection '%s' is stale — reconnecting.", name)
-            try:
-                adapter = self._build(name)
-                self._conns[name] = adapter
-                logger.info("Connection '%s' reconnected.", name)
-            except Exception as exc:
-                logger.error(
-                    "Reconnect failed for '%s': %s", name, exc, exc_info=True
-                )
-                return None
+            with self._lock_for(name):
+                # Re-check under the lock: another thread may have already
+                # rebuilt this connection while we were waiting. Compare by
+                # identity (not a second ping()) to avoid a redundant round
+                # trip and to definitively tell "still the stale instance I
+                # observed" apart from "already replaced".
+                current = self._conns.get(name)
+                if current is not adapter:
+                    return current
+
+                logger.warning("Connection '%s' is stale — reconnecting.", name)
+                try:
+                    adapter = self._build(name)
+                    self._conns[name] = adapter
+                    logger.info("Connection '%s' reconnected.", name)
+                except Exception as exc:
+                    logger.error(
+                        "Reconnect failed for '%s': %s", name, exc, exc_info=True
+                    )
+                    return None
 
         return adapter
+
+    def _lock_for(self, name: str) -> threading.Lock:
+        """Lazily create/return the per-connection-name reconnect lock."""
+        with self._locks_guard:
+            lock = self._locks.get(name)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[name] = lock
+            return lock
 
     def new_connection(self, name: str) -> Optional[SourceAdapter]:
         """

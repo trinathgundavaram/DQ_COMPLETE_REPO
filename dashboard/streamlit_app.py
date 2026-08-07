@@ -21,6 +21,7 @@ Requires the same DQ_META_CONNECTION / DQ_<NAME>_* env vars as the engine.
 
 import os
 import sys
+import threading
 from datetime import date, timedelta
 
 import pandas as pd
@@ -35,6 +36,21 @@ from db.connection_factory import ConnectionFactory
 st.set_page_config(page_title="DQ Engine Dashboard", layout="wide")
 
 
+# Fix: @st.cache_resource caches at the PROCESS level, not per-session —
+# every concurrent Streamlit user/tab on this server shares the SAME
+# ConnectionFactory/connection object returned here. Most DB-API drivers
+# (teradatasql, psycopg2, pyodbc, databricks-sql-connector) don't guarantee
+# a single Connection is safe for concurrent cursor use from multiple
+# threads, and Streamlit runs concurrent sessions on separate threads — so
+# two users querying at the same moment could interleave/corrupt each
+# other's cursor state. Rather than give every session its own connection
+# (multiplies open connections against the source DB, which may have tight
+# connection limits), we keep the single shared/pooled connection and
+# serialize access to it with a lock — safe, and appropriate for a
+# lightweight analyst dashboard where a query is a quick metadata read.
+_query_lock = threading.Lock()
+
+
 @st.cache_resource
 def _get_metadata_conn():
     cf = ConnectionFactory()
@@ -44,7 +60,8 @@ def _get_metadata_conn():
 
 
 def _q(td, meta_db, sql, params=None):
-    return pd.DataFrame(execute_query(td, sql, params))
+    with _query_lock:
+        return pd.DataFrame(execute_query(td, sql, params))
 
 
 def main():
