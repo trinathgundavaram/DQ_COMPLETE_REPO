@@ -18,15 +18,16 @@ Environment variables (set before running)
     DQ_ENV                  DEV | QA | UAT | PROD  (default DEV)
     DQ_META_DB              Override metadata DB name  (optional)
     DQ_META_CONNECTION      Metadata connection name  (default "teradata")
-    DQ_CONNECTION_NAMES     Comma-separated source connection names
+    DQ_CONNECTIONS_FILE     Path to the connection catalogue  (default config/connections.yaml)
     DQ_LOG_LEVEL            DEBUG | INFO | WARNING | ERROR  (default INFO)
     DQ_MAX_WORKERS          Thread-pool size  (default 5)
     DQ_STALE_RUN_HOURS      Hours before a RUNNING run is considered stale  (default 4)
     DQ_PREVALIDATE_ABORT    true | false — abort run if pre-validation fails  (default false)
 
-    Per source connection  (prefix = DQ_<NAME>_):
-        DQ_<NAME>_TYPE, DQ_<NAME>_HOST, DQ_<NAME>_USER, DQ_<NAME>_PASSWORD, ...
-        See db/adapters.py for full list of per-driver env vars.
+    Connections are defined in config/connections.yaml (name, source_type,
+    host/port/etc.), not env vars. Only SECRETS come from env vars, per
+    connection name (prefix = DQ_<NAME>_): USER, PASSWORD, TOKEN, etc.
+    See config/connections.yaml and db/adapters.py for the full per-driver list.
 
 Exit codes
 ----------

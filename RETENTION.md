@@ -65,10 +65,11 @@ grows at the same rate as `dq_rule_execution`'s run_id cardinality.
 
 ### Config / reference tables (essentially static)
 
-`dq_connections`, `dq_check_catalog`, `dq_profile_config`,
-`dq_anomaly_config`, `dq_notification_routes`, `dq_sampling_config` --
-human-edited, low row count (tens to low hundreds of rows), never need a
-retention policy.
+`dq_check_catalog`, `dq_profile_config`, `dq_anomaly_config`,
+`dq_notification_routes`, `dq_sampling_config` -- human-edited, low row
+count (tens to low hundreds of rows), never need a retention policy.
+(Connection catalogue metadata lives in `config/connections.yaml`, not a
+table, so it isn't part of this list at all.)
 
 ## 2. Retention windows
 
@@ -200,9 +201,9 @@ For audit-of-record tables (§2), "retention" does not mean "delete after
 N years" -- it means "move to cheaper storage after N years, keep it
 retrievable." The pattern to follow is the one the runbook already
 establishes for the static audit report: land aged-out data in the same
-S3 archive bucket family referenced by the `um_archive`/`*_ARCHIVE`
-connection convention (`DQ_CONNECTION_NAMES` in
-HEALTHSPRING_UM_RUNBOOK.md §2), as Parquet, queryable later through the
+S3 archive bucket family referenced by the `um_archive` connection
+(`config/connections.yaml`, per HEALTHSPRING_UM_RUNBOOK.md §2), as
+Parquet, queryable later through the
 same `S3Adapter`/DuckDB-over-S3 path this repo already uses for source
 data (`db/adapters.py::S3Adapter`) -- so an old finding is never
 permanently unreachable, just no longer sitting in the hot Teradata

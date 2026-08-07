@@ -5,10 +5,11 @@ the generic engine purely via configuration — no engine code changes. They
 are the concrete proof of the genericness claim in Section 1/9.
 
 Load order:
-1. `01_setup.sql`   — dq_connections catalogue rows (credentials live in env
-   vars per the connection name, never in this table), dq_sampling_config
-   (COMO weekly sample), dq_notification_routes (ROAR/BUSINESS/ENGINEERING
-   routing), and dq_anomaly_config (auto-determined thresholds)
+1. `01_setup.sql`   — dq_scope rows, dq_sampling_config (COMO weekly
+   sample), dq_notification_routes (ROAR/BUSINESS/ENGINEERING routing), and
+   dq_anomaly_config (auto-determined thresholds). Connections (teradata,
+   um_refdata, um_archive) are configured separately in
+   config/connections.yaml, not here.
 2. `02_rules.sql`   — ~40 hand-maintained SQL rules covering every category
    in Section 3.2 of the requirements
 

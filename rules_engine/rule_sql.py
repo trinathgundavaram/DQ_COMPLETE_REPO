@@ -373,7 +373,7 @@ class DialectMismatchError(Exception):
 
 VALID_DIALECTS = {"teradata", "postgres", "ansi"}
 
-# source_type (from the adapter / dq_connections.source_type) -> set of
+# source_type (from the adapter / config/connections.yaml) -> set of
 # sql_dialect values that are safe to execute against it. 'ansi' is always
 # accepted everywhere by definition.
 DIALECT_COMPATIBILITY = {

@@ -3,7 +3,7 @@
 ## 1. Apply schema changes
 
 Run these three files, in order, on a fresh environment -- `ddl_shared.sql`
-first (dq_scope + dq_connections, which the other two depend on), then
+first (dq_scope, which the other two depend on), then
 `rules_engine/ddl.sql`, then `sampling/ddl.sql`. Then load, in order:
 
 ```
@@ -16,26 +16,28 @@ names with the real MHK ODAG1 field names — see
 `config/seed/00_healthspring_um_README.md` for the assumed schema and the
 SHRPA/provider-contract co-location dependency.
 
-## 2. Configure connections (env vars — never in `dq_connections`)
+## 2. Configure connections
+
+`config/connections.yaml` already has `teradata`, `um_refdata`, and
+`um_archive` entries for this project (host/port/database/region -- see
+that file). It's plain, non-secret config, safe to commit as-is; just
+replace the placeholder `host` values with your real ones.
+
+Credentials are env vars only -- never in `config/connections.yaml`:
 
 ```
-DQ_CONNECTION_NAMES=teradata,um_refdata,um_archive
 DQ_META_CONNECTION=teradata
 
-DQ_TERADATA_TYPE=teradata
-DQ_TERADATA_HOST=...
 DQ_TERADATA_USER=...
 DQ_TERADATA_PASSWORD=...
 
-DQ_UM_REFDATA_TYPE=postgresql
-DQ_UM_REFDATA_HOST=...
-DQ_UM_REFDATA_DATABASE=um_reference
 DQ_UM_REFDATA_USER=...
 DQ_UM_REFDATA_PASSWORD=...
 
-DQ_UM_ARCHIVE_TYPE=s3
-DQ_UM_ARCHIVE_REGION=us-east-1
-# Access key/secret optional — omit to use the instance/task IAM role
+# um_archive (S3) — access key/secret optional, omit to use the
+# instance/task IAM role
+# DQ_UM_ARCHIVE_ACCESS_KEY_ID=...
+# DQ_UM_ARCHIVE_SECRET_ACCESS_KEY=...
 ```
 
 ## 3. Notification channels

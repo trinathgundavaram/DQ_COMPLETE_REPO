@@ -4,7 +4,7 @@
 -- DB     : Teradata  (metadata store)
 -- ============================================================
 -- Run ddl_shared.sql FIRST — every table below references dq_scope
--- (project/process dimension) and/or dq_connections defined there.
+-- (project/process dimension) defined there.
 --
 -- Design rationale (why scope_id was introduced, why certain columns are
 -- frozen execution-time snapshots instead of live joins, etc.) lives in

@@ -1,4 +1,7 @@
 # Python >= 3.8 required
+# ── Config (always required) ──────────────────────────────────────────────
+PyYAML>=6.0             # config/connections.yaml parsing (config/connections.py)
+
 # ── Metadata store (always required) ─────────────────────────────────────────
 teradatasql>=17.20.0.0
 

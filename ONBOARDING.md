@@ -34,41 +34,38 @@ Fresh metadata schema -- run these three files, in this order, against
 your Teradata metadata database:
 
 ```
-ddl_shared.sql        -- FIRST: dq_scope + dq_connections (both frameworks depend on these)
+ddl_shared.sql        -- FIRST: dq_scope (both frameworks depend on this)
 rules_engine/ddl.sql   -- rules-engine tables (skip if you only need sampling)
 sampling/ddl.sql       -- sampling tables (skip if you only need the rules engine)
 ```
 
 ## 2. Configure connections
 
+Connection **metadata** (what connections exist, source_type, host, port,
+database, ...) lives in `config/connections.yaml` -- it's plain, non-secret
+config, safe to commit. Edit it (or point `DQ_CONNECTIONS_FILE` at your own
+copy) and add an entry per source system your rules will query.
+
+At minimum, add a `teradata` entry (the metadata store). See that file's
+comments for the field shape per `source_type` (teradata, postgresql, s3,
+sqlserver, file) -- `config/connections.py::load_connections()` validates
+it at startup and fails fast with a specific message on anything malformed
+(missing required field, unknown source_type, duplicate name).
+
+Connection **credentials** (user, password, token, access keys) are never
+put in that file -- they stay in environment variables:
+
 ```
 cp .env.example .env
 ```
 
-Fill in, at minimum:
-- `DQ_CONNECTION_NAMES` -- include `teradata` (the metadata store) plus
-  a name for each source system your rules will query.
-- `DQ_TERADATA_*` -- your metadata store credentials.
-- One `DQ_<NAME>_*` block per additional source connection (see
-  `.env.example`'s commented-out Postgres/S3/file/SQL Server
-  examples -- copy whichever matches your source system and uncomment).
-
-Load `.env` however your process-manager expects (`python-dotenv`,
-a systemd `EnvironmentFile`, your container platform's secrets
-mechanism, etc.) -- this repo doesn't load `.env` itself; it reads
-`os.environ` directly (see `config/env_config.py`,
-`db/connection_factory.py`).
-
-Register each source connection's metadata (optional but recommended --
-`dq_connections` is a reference/documentation table, not read at
-runtime; credentials always come from env vars, never this table):
-
-```sql
-INSERT INTO <your_meta_db>.dq_connections
-    (connection_id, connection_name, source_type, database_name, description, active_flag)
-VALUES
-    (1, 'teradata', 'teradata', '<your_meta_db>', 'Metadata store + primary source', 1);
-```
+Fill in one `DQ_<NAME>_*` block per connection, matching the `name` you
+gave it in `config/connections.yaml` (see `.env.example`'s commented-out
+Postgres/S3/SQL Server examples -- copy whichever matches your source
+system and uncomment). Load `.env` however your process-manager expects
+(`python-dotenv`, a systemd `EnvironmentFile`, your container platform's
+secrets mechanism, etc.) -- this repo doesn't load `.env` itself; it reads
+`os.environ` directly (see `config/env_config.py`, `db/adapters.py`).
 
 ## 3. Create a scope for your project/process
 

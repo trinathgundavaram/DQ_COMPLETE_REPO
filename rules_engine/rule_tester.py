@@ -142,7 +142,7 @@ def test_rule(
     if db_conn is None:
         raise RuntimeError(
             f"Source connection '{source_system}' unavailable. "
-            "Check DQ_CONNECTION_NAMES and credentials."
+            "Check config/connections.yaml and its DQ_<NAME>_* secrets."
         )
 
     # ── Source preparation (FileAdapter) ──────────────────────────────────────

@@ -3,9 +3,13 @@ db/connection_factory.py
 -------------------------
 Multi-source connection factory.
 
-Manages a pool of named source adapters.  Each named connection in
-DQ_CONNECTION_NAMES gets a DQ_<NAME>_TYPE env var that tells the factory
-which adapter to build.
+Builds and caches a pool of named source adapters from config/connections.yaml
+(the connection catalogue -- see config/connections.py for its schema and
+validation rules). Each entry there declares a connection's `name` and
+`source_type`, plus whatever non-secret settings that adapter needs (host,
+port, database, region, ...). Credentials are never read from that file --
+every adapter's build() classmethod (db/adapters.py) reads them from
+DQ_<NAME>_* environment variables at connect time instead.
 
 Supported types
 ---------------
@@ -14,53 +18,43 @@ Supported types
     aurora      → PostgresAdapter   (alias for postgresql)
     sqlserver   → SqlServerAdapter  (pyodbc)
     file        → FileAdapter       (DuckDB + pandas, CSV/Excel/TSV/Parquet)
+    s3          → S3Adapter         (DuckDB-over-S3, Parquet/CSV)
 
-Env vars
---------
-    DQ_CONNECTION_NAMES          comma-separated list of connection names
-                                 e.g. "teradata,claims_pg,datalake"
+Example config/connections.yaml
+--------------------------------
+    connections:
+      - name: teradata
+        source_type: teradata
+        host: your-teradata-host.example.com
 
-    Per connection  (prefix = DQ_<NAME>_):
-        DQ_<NAME>_TYPE           one of the types listed above
-        + driver-specific vars   see each adapter module for details
+      - name: claims_pg
+        source_type: postgresql
+        host: claims-aurora.cluster-xyz.us-east-1.rds.amazonaws.com
+        database: claims
 
-Example
--------
-    DQ_CONNECTION_NAMES=teradata,claims_pg,erp_sql,raw_files
+      - name: raw_files
+        source_type: file
+        base_path: /data/inputs/
 
-    DQ_TERADATA_TYPE=teradata
-    DQ_TERADATA_HOST=...
+Matching secrets (env vars, prefix DQ_<NAME>_ — never in the YAML file):
     DQ_TERADATA_USER=...
     DQ_TERADATA_PASSWORD=...
-
-    DQ_CLAIMS_PG_TYPE=postgresql
-    DQ_CLAIMS_PG_HOST=claims-aurora.cluster-xyz.us-east-1.rds.amazonaws.com
-    DQ_CLAIMS_PG_DATABASE=claims
     DQ_CLAIMS_PG_USER=...
     DQ_CLAIMS_PG_PASSWORD=...
-
-    DQ_ERP_SQL_TYPE=sqlserver
-    DQ_ERP_SQL_HOST=erp-db.internal
-    DQ_ERP_SQL_DATABASE=ERP
-    DQ_ERP_SQL_USER=...
-    DQ_ERP_SQL_PASSWORD=...
-
-    DQ_RAW_FILES_TYPE=file
-    DQ_RAW_FILES_BASE_PATH=/data/inputs/
 
 Usage
 -----
     cf = ConnectionFactory()
-    cf.load()                             # open / initialise all connections
+    cf.load()                             # open / initialise all active connections
     td = cf.get("teradata")               # cached; auto-reconnects if stale
     td_fresh = cf.new_connection("teradata")  # fresh per-thread copy
 """
 
 import logging
-import os
 import threading
 from typing import Dict, Optional
 
+from config.connections import ConnectionConfigError, load_connections
 from db.adapters import (
     SourceAdapter, TeradataAdapter, PostgresAdapter,
     SqlServerAdapter, FileAdapter, S3Adapter,
@@ -68,7 +62,7 @@ from db.adapters import (
 
 logger = logging.getLogger(__name__)
 
-# Map DQ_<NAME>_TYPE values → adapter build classmethod
+# Map source_type values (config/connections.yaml) → adapter build classmethod
 _TYPE_MAP = {
     # ── Sanctioned for this engine instance (Section 2): teradata, postgresql, s3 ──
     "teradata":   TeradataAdapter,
@@ -97,7 +91,8 @@ class ConnectionFactory:
 
     def __init__(self):
         self._conns: Dict[str, SourceAdapter] = {}
-        # Fix: get()'s stale-reconnect path is called concurrently from
+        self._entries: Dict[str, dict] = {}   # name -> config/connections.yaml entry
+        # get()'s stale-reconnect path is called concurrently from
         # ThreadPoolExecutor worker threads during run_engine(). Without a
         # lock, two threads that both observe the same connection as stale
         # each independently rebuild and overwrite self._conns[name], and
@@ -114,17 +109,23 @@ class ConnectionFactory:
 
     def load(self):
         """
-        Initialise all connections listed in DQ_CONNECTION_NAMES.
-        Failed connections are logged but do not abort the load.
-        """
-        names_raw = os.getenv("DQ_CONNECTION_NAMES", "teradata")
-        names = [n.strip() for n in names_raw.split(",") if n.strip()]
+        Load config/connections.yaml (DQ_CONNECTIONS_FILE override) and
+        initialise every active connection in it.
 
-        for name in names:
+        A malformed connections file is a deployment/config error, not a
+        transient one -- ConnectionConfigError is NOT caught here and
+        propagates to the caller, so the process fails fast at startup
+        with a specific, actionable message instead of silently starting
+        with zero usable connections. An individual connection failing to
+        connect (bad host, wrong credentials, network issue) is different
+        -- that's logged and skipped so the other connections still load.
+        """
+        self._entries = load_connections()
+
+        for name, entry in self._entries.items():
             try:
-                self._conns[name] = self._build(name)
-                src_type = self._get_type(name)
-                logger.info("Connection '%s' (%s) established.", name, src_type)
+                self._conns[name] = self._build(name, entry)
+                logger.info("Connection '%s' (%s) established.", name, entry["source_type"])
             except Exception as exc:
                 logger.error(
                     "Failed to initialise connection '%s': %s",
@@ -163,7 +164,8 @@ class ConnectionFactory:
 
                 logger.warning("Connection '%s' is stale — reconnecting.", name)
                 try:
-                    adapter = self._build(name)
+                    entry = self._entries.get(name, {})
+                    adapter = self._build(name, entry)
                     self._conns[name] = adapter
                     logger.info("Connection '%s' reconnected.", name)
                 except Exception as exc:
@@ -192,9 +194,14 @@ class ConnectionFactory:
 
         FileAdapters are shared-safe (thread-local DuckDB connections) and
         should be obtained via get() rather than new_connection().
-        Returns None on failure.
+        Returns None on failure (including "no such connection in config").
         """
-        adapter_cls = _TYPE_MAP.get(self._get_type(name))
+        entry = self._entries.get(name)
+        if entry is None:
+            logger.error("new_connection('%s'): no such connection in config/connections.yaml.", name)
+            return None
+
+        adapter_cls = _TYPE_MAP.get(entry["source_type"])
         if adapter_cls in (FileAdapter, S3Adapter):
             # File/S3 sources share the singleton adapter (per-thread DuckDB
             # connections inside it are already thread-safe); return the cached one.
@@ -205,7 +212,7 @@ class ConnectionFactory:
             return self._conns.get(name)
 
         try:
-            adapter = self._build(name)
+            adapter = self._build(name, entry)
             logger.debug("Fresh connection created for '%s'.", name)
             return adapter
         except Exception as exc:
@@ -238,9 +245,9 @@ class ConnectionFactory:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build(self, name: str) -> SourceAdapter:
-        """Dispatch to the correct adapter builder based on DQ_<NAME>_TYPE."""
-        src_type = self._get_type(name)
+    def _build(self, name: str, entry: dict) -> SourceAdapter:
+        """Dispatch to the correct adapter builder based on the entry's source_type."""
+        src_type = entry["source_type"]
         adapter_cls = _TYPE_MAP.get(src_type)
 
         if adapter_cls is None:
@@ -250,11 +257,4 @@ class ConnectionFactory:
                 f"Supported types: {supported}"
             )
 
-        return adapter_cls.build(name)
-
-    @staticmethod
-    def _get_type(name: str) -> str:
-        """
-        Read DQ_<NAME>_TYPE, defaulting to 'teradata' for backward compatibility.
-        """
-        return os.getenv(f"DQ_{name.upper()}_TYPE", "teradata").lower()
+        return adapter_cls.build(name, entry)

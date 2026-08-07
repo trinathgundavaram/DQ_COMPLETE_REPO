@@ -1,15 +1,15 @@
 -- ============================================================
--- HealthSpring UM — connections, stratified sample config,
+-- HealthSpring UM — scope, stratified sample config,
 -- notification routing, and auto-determined thresholds.
 --
--- Load this file BEFORE 02_rules.sql. Credentials are NEVER stored here —
--- see the DQ_<NAME>_* env vars documented next to each connection row.
+-- Load this file BEFORE 02_rules.sql. Connections (config/connections.yaml)
+-- must be set up separately — see that file and its DQ_<NAME>_* secrets.
 -- ============================================================
 
 -- ── Scope (project/process dimension) ───────────────────────────────────
 -- dq_rules and dq_sampling_config below reference these by scope_id
 -- instead of each repeating its own project_name/process_name pair — see
--- ddl_shared.sql v7. HealthSpring UM uses two distinct scopes: the rule-engine
+-- ddl_shared.sql's header. HealthSpring UM uses two distinct scopes: the rule-engine
 -- process (UNIVERSE_VALIDATION) and the sampling process
 -- (COMO_WEEKLY_SAMPLE) are tracked separately since they run on different
 -- cadences and are two different "processes" within the same project.
@@ -21,33 +21,11 @@ VALUES ('HEALTHSPRING_UM', 'COMO_WEEKLY_SAMPLE');
 
 
 -- ── Connections ──────────────────────────────────────────────────────────
--- connection_name must match DQ_CONNECTION_NAMES and dq_rules.source_system.
-
--- Primary source: the ODAG1-format UM universe extract, pulled from MHK.
--- Env: DQ_TERADATA_TYPE=teradata, DQ_TERADATA_HOST/USER/PASSWORD/LOGMECH
-INSERT INTO CMSUNIV_FILELAND_T.dq_connections
-    (connection_id, connection_name, source_type, host, port, database_name, description, active_flag)
-VALUES
-    (1, 'teradata', 'teradata', NULL, NULL, 'CMSUNIV_FILELAND_T',
-     'HealthSpring UM ODAG1 universe extract (weekly pull from MHK)', 1);
-
--- Reference data: SHRPA clinical-review flags + provider contract status.
--- Landed in RDS Postgres by an upstream ETL.
--- Env: DQ_UM_REFDATA_TYPE=postgresql, DQ_UM_REFDATA_HOST/DATABASE/USER/PASSWORD
-INSERT INTO CMSUNIV_FILELAND_T.dq_connections
-    (connection_id, connection_name, source_type, host, port, database_name, description, active_flag)
-VALUES
-    (2, 'um_refdata', 'postgresql', NULL, 5432, 'um_reference',
-     'SHRPA + provider-contract reference tables (RDS Postgres)', 1);
-
--- 10-year immutable archive of weekly universe pulls (Section 3.7) —
--- Parquet partitioned by pull_date, read directly via DuckDB/httpfs.
--- Env: DQ_UM_ARCHIVE_TYPE=s3, DQ_UM_ARCHIVE_REGION, (+ IAM role or keys)
-INSERT INTO CMSUNIV_FILELAND_T.dq_connections
-    (connection_id, connection_name, source_type, host, port, database_name, description, active_flag)
-VALUES
-    (3, 'um_archive', 's3', NULL, NULL, 's3://healthspring-dq-archive/um_universe/',
-     '10-year immutable archive of weekly universe pulls (Parquet, partitioned by pull_date)', 1);
+-- Connections (teradata, um_refdata, um_archive) are defined in
+-- config/connections.yaml, not here — see that file for source_type/host/
+-- port/database, and DQ_<NAME>_* env vars for their credentials. This
+-- setup file only needs connection_name values (below) to match the
+-- `name` field of each entry in config/connections.yaml.
 
 
 -- ── COMO weekly stratified sample (Section 3.4) ─────────────────────────

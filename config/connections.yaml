@@ -1,0 +1,82 @@
+# ============================================================
+# Connection catalogue
+# ============================================================
+# Replaces the old dq_connections DB table -- this file is the single
+# source of truth for WHAT connections exist and WHERE they point
+# (source_type, host, port, database, ...). It is safe to commit: nothing
+# in this file is a secret.
+#
+# Credentials are NEVER put in this file. Every connection's user,
+# password, token, and access keys are read from DQ_<NAME>_* environment
+# variables at connect time (see db/adapters.py) -- rotate a credential by
+# rotating the env var / secret, never by editing this file.
+#
+# `name` becomes:
+#   - the DQ_<NAME>_* env var prefix for that connection's secrets
+#   - the value rules/sampling configs use in source_system /
+#     connection_name to select this connection
+#
+# Set DQ_CONNECTIONS_FILE to point at a different path/file per
+# environment (e.g. a QA-specific copy) without any code change.
+#
+# The engine fails fast at startup on a malformed file -- see
+# config/connections.py for exactly what's validated.
+# ============================================================
+
+connections:
+
+  # --- Teradata (metadata store — required; also usable as a rule source) ---
+  # Secrets: DQ_TERADATA_USER, DQ_TERADATA_PASSWORD
+  - name: teradata
+    source_type: teradata
+    host: your-teradata-host.example.com
+    logmech: LDAP                      # optional — default LDAP
+    description: "Metadata store + HealthSpring UM ODAG1 universe extract (weekly pull from MHK)"
+    active: true
+
+  # --- PostgreSQL / AWS Aurora (PostgreSQL-compatible) -----------------------
+  # SHRPA clinical-review flags + provider contract status, landed in RDS
+  # Postgres by an upstream ETL.
+  # Secrets: DQ_UM_REFDATA_USER, DQ_UM_REFDATA_PASSWORD
+  - name: um_refdata
+    source_type: postgresql
+    host: claims-aurora.cluster-xyz.us-east-1.rds.amazonaws.com
+    port: 5432
+    database: um_reference
+    sslmode: prefer                    # optional — default prefer
+    description: "SHRPA + provider-contract reference tables (RDS Postgres)"
+    active: true
+
+  # --- S3 landed files (Parquet/CSV) — DuckDB-over-S3 ------------------------
+  # 10-year immutable archive of weekly universe pulls (Section 3.7),
+  # Parquet partitioned by pull_date, read directly via DuckDB/httpfs.
+  # Secrets (all optional — omit to use the instance/task IAM role):
+  #   DQ_UM_ARCHIVE_ACCESS_KEY_ID, DQ_UM_ARCHIVE_SECRET_ACCESS_KEY,
+  #   DQ_UM_ARCHIVE_SESSION_TOKEN
+  - name: um_archive
+    source_type: s3
+    region: us-east-1
+    description: "10-year immutable archive of weekly universe pulls (s3://healthspring-dq-archive/um_universe/, Parquet, partitioned by pull_date)"
+    active: true
+
+  # --- Example: local CSV/Excel/TSV/Parquet files — disabled by default -----
+  # - name: raw_files
+  #   source_type: file
+  #   base_path: /data/inputs/
+  #   description: "Local flat-file drop for ad-hoc source data"
+  #   active: false
+
+  # --- Example: Microsoft SQL Server — disabled by default -------------------
+  # Requires the ODBC Driver for SQL Server installed on the host.
+  # Secrets: DQ_ERP_SQL_USER, DQ_ERP_SQL_PASSWORD (omit both + set
+  # trusted_connection: yes for Windows Auth instead).
+  # - name: erp_sql
+  #   source_type: sqlserver
+  #   host: erp-db.internal
+  #   port: 1433
+  #   database: ERP
+  #   driver: "ODBC Driver 18 for SQL Server"
+  #   trust_cert: "yes"
+  #   trusted_connection: "no"
+  #   description: "ERP system of record"
+  #   active: false

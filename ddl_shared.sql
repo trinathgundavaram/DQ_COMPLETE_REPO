@@ -4,20 +4,19 @@
 -- DB     : Teradata  (metadata store)
 -- ============================================================
 -- Run this file FIRST, before rules_engine/ddl.sql and/or sampling/ddl.sql.
--- It creates the tables both frameworks depend on: dq_scope (the
--- project/process dimension every other table joins to) and dq_connections
--- (the source-connection catalogue db/connection_factory.py reads
--- alongside DQ_* env vars). Everything else in this repo's schema is
--- framework-specific and lives in its own folder:
+-- It creates dq_scope (the project/process dimension every other table
+-- joins to) — the one table both frameworks depend on. Everything else in
+-- this repo's schema is framework-specific and lives in its own folder:
 --   rules_engine/ddl.sql  — dq_rules through dq_notification_routes
 --   sampling/ddl.sql      — dq_sampling_config, dq_sample_selections
 -- ============================================================
 -- NOTE: The metadata store is always Teradata.
--- Source systems (PostgreSQL, SQL Server, file)
--- are configured via environment variables — see
--- db/connection_factory.py and db/adapters.py for details.
--- The dq_connections table below is a catalogue / reference;
--- runtime credentials are read from env vars, NOT from this table.
+-- Source systems (PostgreSQL, SQL Server, file, S3) are configured in
+-- config/connections.yaml (source_type, host, port, ...) plus DQ_<NAME>_*
+-- environment variables for credentials only — see config/connections.py
+-- and db/adapters.py for details. There is deliberately no dq_connections
+-- table: connection metadata is non-secret, deployment-time configuration
+-- that belongs in a version-controlled file, not a database row.
 -- ============================================================
 --
 -- Design notes on the schema shape below:
@@ -87,8 +86,9 @@
 -- rules_engine.executor/rules_engine.rule_sql as a plain library — see
 -- sampling/engine.py's module docstring — but rules_engine/ has zero
 -- awareness sampling/ exists). The two are independently deployable;
--- dq_scope, dq_connections, and the connector layer in db/ are the only
--- things they share.
+-- dq_scope and the connector layer in db/ (config-driven via
+-- config/connections.yaml, not a database table) are the only things
+-- they share.
 -- ============================================================
 
 -- ── dq_scope: project/process dimension — SHARED ───────────────────────────
@@ -108,26 +108,3 @@ PRIMARY INDEX (scope_id);
 
 CREATE UNIQUE INDEX dq_scope_lookup_uix (project_name, process_name)
 ON CMSUNIV_FILELAND_DEV_T.dq_scope;
-
-
--- ── dq_connections: connection catalogue — SHARED ──────────────────────────
--- Reference only — credentials are read from DQ_<NAME>_* env vars at
--- runtime, NOT from this table (see db/connection_factory.py,
--- db/adapters.py). Both the rules engine and the sampling framework pull
--- their source data through these same connection entries.
-CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_connections (
-    connection_id    INTEGER NOT NULL,
-    connection_name  VARCHAR(100) NOT NULL,    -- matches DQ_CONNECTION_NAMES entry
-    source_type      VARCHAR(50) NOT NULL,     -- teradata | postgresql | s3
-                                               -- (sqlserver adapter exists
-                                               --  in code but is uncatalogued here)
-    host             VARCHAR(500),
-    port             INTEGER,
-    database_name    VARCHAR(200),
-    description      VARCHAR(500),
-    active_flag      BYTEINT DEFAULT 1,
-    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT dq_connections_source_type_ck
-        CHECK (source_type IN ('teradata', 'postgresql', 's3'))
-)
-PRIMARY INDEX (connection_name);

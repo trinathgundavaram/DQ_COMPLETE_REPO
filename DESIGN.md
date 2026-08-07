@@ -68,7 +68,7 @@ sampling/                -- FRAMEWORK 2: the sampling framework (separate; see ย
                           dq_sample_selections -- run ddl_shared.sql first
 db/                       -- shared: connector layer, used by all three folders above
   adapters.py             SourceAdapter ABC + Teradata/Postgres/SqlServer/File/S3
-  connection_factory.py   builds + caches adapters from DQ_CONNECTION_NAMES env
+  connection_factory.py   builds + caches adapters from config/connections.yaml
 utils/                    -- shared: cross-cutting helpers, used by all three folders above
   db_helpers.py           table/db name resolution + dq_scope resolver
   metadata_writers.py     dq_run_logs / dq_rule_issues writers
@@ -81,12 +81,11 @@ entrypoints.py            shared: Lambda handler, Glue main, Airflow operator, c
                           same function rules_engine/main.py's CLI calls); the cron
                           runner can optionally chain sampling.engine as a follow-on
                           step (see ยง3.6) -- the only place both frameworks meet
-ddl_shared.sql            the two tables both frameworks depend on -- dq_scope
-                          (project/process dimension) and dq_connections (source
-                          catalogue) -- plus the design rationale for the schema
-                          (why scope_id exists, which columns are frozen
-                          execution-time snapshots, etc). Run this file FIRST,
-                          before rules_engine/ddl.sql and/or sampling/ddl.sql.
+ddl_shared.sql            the one table both frameworks depend on -- dq_scope
+                          (project/process dimension) -- plus the design rationale
+                          for the schema (why scope_id exists, which columns are
+                          frozen execution-time snapshots, etc). Run this file
+                          FIRST, before rules_engine/ddl.sql and/or sampling/ddl.sql.
 RETENTION.md              partitioning/archival strategy for high-growth tables --
                           operational guidance, not code this repo runs itself
 ONBOARDING.md             generic step-by-step walkthrough: empty schema -> first
@@ -214,9 +213,9 @@ directly on the existing `FileAdapter` (per-thread DuckDB connections via
   access key is set.
 
 `SQL Server`'s adapter lives in the same `db/adapters.py` file
-(pluggable architecture intact) but is not in `dq_connections`' sanctioned
-`source_type` set for this instance -- adding a new source later is one new
-adapter class in that file + one factory entry, not an engine change.
+(pluggable architecture intact) but has no entry in `config/connections.yaml`
+for this instance -- adding a new source later is one new adapter class in
+that file + one factory entry + one YAML entry, not an engine change.
 
 ### 3.4 Case-level disposition
 
@@ -457,7 +456,7 @@ and `sampling/ddl.sql` for full DDL
 |---|---|---|
 | `sql_dialect` column | `dq_rules` | fail-fast dialect enforcement |
 | `business_correctable` column | `dq_rules` | audience routing |
-| `source_type` CHECK constraint | `dq_connections` | scope to 3 sanctioned adapters |
+| `source_type` validation | `config/connections.py` (`load_connections`) | scope to sanctioned adapter types, fail fast on unknown |
 | New table | `dq_exception_dispositions` (v6 name: `dq_case_dispositions`) | additive-only disposition, immutable exceptions |
 | New table | `dq_notification_routes` | audience routing by finding_class |
 | New table | `dq_sampling_config` | stratified-sampling config |
@@ -532,15 +531,16 @@ columns.
 
 ## 7. Genericness test
 
-To onboard an unrelated second use case: insert rows into `dq_connections`
-(new `source_type` from the sanctioned 3, or a 4th adapter class in
+To onboard an unrelated second use case: add an entry to
+`config/connections.yaml` (existing `source_type`, or a new adapter class in
 `db/adapters.py`), insert rows into `dq_rules` (raw SQL + `sql_dialect` +
 `check_type` tag, or check_type-generated), optionally a
 `dq_sampling_config` row if it needs ranked sampling, and
 `dq_notification_routes` rows for its own audiences. Zero files under
 `rules_engine/` or `utils/` need to change, and `db/adapters.py` only changes if a
-4th connector type is needed. This is the same mechanism HealthSpring UM
-itself is configured through (`config/seed/`) -- it isn't a special case.
+new connector type is needed. This is the same mechanism HealthSpring UM
+itself is configured through (`config/seed/` + `config/connections.yaml`) --
+it isn't a special case.
 
 ## 8. Documented follow-ups (not guessed at)
 

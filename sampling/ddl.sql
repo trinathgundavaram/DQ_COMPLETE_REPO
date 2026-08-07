@@ -23,7 +23,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_sampling_config (
     config_id            INTEGER NOT NULL,
     scope_id              BIGINT NOT NULL,        -- FK -> dq_scope
     sample_name           VARCHAR(100) NOT NULL,   -- e.g. 'WEEKLY_CLINICAL_REVIEW_SAMPLE'
-    connection_name       VARCHAR(100) NOT NULL,   -- which dq_connections entry to pull from
+    connection_name       VARCHAR(100) NOT NULL,   -- which config/connections.yaml entry to pull from
     universe_table         VARCHAR(200) NOT NULL,
     key_columns             VARCHAR(500) NOT NULL,   -- entity key column(s), CSV
     scope_column             VARCHAR(100),           -- e.g. 'pull_date' — scopes to the run's week

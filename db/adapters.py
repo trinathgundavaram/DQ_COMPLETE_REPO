@@ -22,16 +22,26 @@ postgresql, s3. The SQL Server adapter is included and fully functional,
 but is not catalogued/tested for the current use case — it exists to
 prove the interface is genuinely pluggable, not to be deployed yet.
 
+Config vs. secrets
+-------------------
+Every `build()` classmethod below takes two things: `name` (the
+connection's name, e.g. "teradata") and `config` (that connection's
+entry from config/connections.yaml, parsed and validated by
+config/connections.py -- host, port, database, region, etc.).
+
+Credentials are handled completely separately and are NEVER read from
+`config`: every build() reads them from DQ_<NAME>_* environment variables
+via `_require()`/`os.getenv()` at CALL time (never at import), so
+credential rotation takes effect on the next connect without a process
+restart, and no secret ever needs to be written to a file that could end
+up in source control.
+
 Adding a new source
 --------------------
 Add one class implementing SourceAdapter to this file (import its driver
 lazily, same pattern as every class below) and one line in
 _TYPE_MAP in connection_factory.py. Nothing else changes — that's the
 actual test of "pluggable."
-
-Every `build()` classmethod reads its env vars at CALL time (never at
-import), so credential rotation takes effect on the next connect without a
-process restart.
 """
 
 import logging
@@ -44,9 +54,24 @@ logger = logging.getLogger(__name__)
 
 
 def _require(key: str) -> str:
+    """Read a required SECRET from an env var. Raises if unset/empty."""
     val = os.getenv(key)
     if not val:
         raise EnvironmentError(f"Required env var '{key}' is not set.")
+    return val
+
+
+def _require_config(config: dict, key: str, name: str):
+    """Read a required NON-SECRET field from a connections.yaml entry.
+    Raises if missing/empty -- fails fast with a message pointing at the
+    config file rather than surfacing a confusing KeyError/TypeError once
+    it reaches the driver's connect() call."""
+    val = config.get(key)
+    if val in (None, ""):
+        raise ValueError(
+            f"Connection '{name}' (source_type={config.get('source_type')!r}) is "
+            f"missing required field '{key}' in config/connections.yaml."
+        )
     return val
 
 
@@ -101,7 +126,8 @@ except ImportError:
 
 class TeradataAdapter(SourceAdapter):
     """
-    Env vars (prefix DQ_<NAME>_): HOST, USER, PASSWORD, LOGMECH (default LDAP).
+    Non-secret config (config/connections.yaml): host, logmech (default LDAP).
+    Secrets (env, prefix DQ_<NAME>_): USER, PASSWORD.
     """
 
     source_type: str = "teradata"
@@ -119,15 +145,15 @@ class TeradataAdapter(SourceAdapter):
         self._conn.close()
 
     @classmethod
-    def build(cls, name: str) -> "TeradataAdapter":
+    def build(cls, name: str, config: dict) -> "TeradataAdapter":
         if not _TERADATA_AVAILABLE:
             raise ImportError("teradatasql is required. Install with: pip install teradatasql")
         prefix = f"DQ_{name.upper()}"
         conn = teradatasql.connect(
-            host=_require(f"{prefix}_HOST"),
+            host=_require_config(config, "host", name),
             user=_require(f"{prefix}_USER"),
             password=_require(f"{prefix}_PASSWORD"),
-            logmech=os.getenv(f"{prefix}_LOGMECH", "LDAP"),
+            logmech=config.get("logmech", "LDAP"),
         )
         return cls(conn)
 
@@ -146,8 +172,9 @@ except ImportError:
 
 class PostgresAdapter(SourceAdapter):
     """
-    Env vars (prefix DQ_<NAME>_): HOST, PORT (5432), DATABASE, USER,
-    PASSWORD, SSLMODE (prefer). Same connection shape for Aurora PG.
+    Non-secret config (config/connections.yaml): host, port (default 5432),
+    database, sslmode (default prefer). Same connection shape for Aurora PG.
+    Secrets (env, prefix DQ_<NAME>_): USER, PASSWORD.
     """
 
     source_type: str = "postgresql"
@@ -166,17 +193,17 @@ class PostgresAdapter(SourceAdapter):
         self._conn.close()
 
     @classmethod
-    def build(cls, name: str) -> "PostgresAdapter":
+    def build(cls, name: str, config: dict) -> "PostgresAdapter":
         if not _POSTGRES_AVAILABLE:
             raise ImportError("psycopg2-binary is required. Install with: pip install psycopg2-binary")
         prefix = f"DQ_{name.upper()}"
         conn = psycopg2.connect(
-            host=_require(f"{prefix}_HOST"),
-            port=int(os.getenv(f"{prefix}_PORT", "5432")),
-            dbname=_require(f"{prefix}_DATABASE"),
+            host=_require_config(config, "host", name),
+            port=int(config.get("port", 5432)),
+            dbname=_require_config(config, "database", name),
             user=_require(f"{prefix}_USER"),
             password=_require(f"{prefix}_PASSWORD"),
-            sslmode=os.getenv(f"{prefix}_SSLMODE", "prefer"),
+            sslmode=config.get("sslmode", "prefer"),
         )
         return cls(conn)
 
@@ -196,10 +223,12 @@ except ImportError:
 class SqlServerAdapter(SourceAdapter):
     """
     Requires the Microsoft ODBC Driver for SQL Server on the host.
-    Env vars (prefix DQ_<NAME>_): HOST, PORT (1433), DATABASE, USER,
-    PASSWORD, DRIVER (default "ODBC Driver 18 for SQL Server"),
-    TRUST_CERT (yes), TRUSTED_CONNECTION (no — set "yes" for Windows Auth,
-    which then omits USER/PASSWORD).
+    Non-secret config (config/connections.yaml): host, port (default 1433),
+    database, driver (default "ODBC Driver 18 for SQL Server"), trust_cert
+    (default "yes"), trusted_connection (default "no" — set "yes" for
+    Windows Auth, which then omits USER/PASSWORD entirely).
+    Secrets (env, prefix DQ_<NAME>_): USER, PASSWORD (skipped when
+    trusted_connection is "yes").
     """
 
     source_type: str = "sqlserver"
@@ -218,17 +247,17 @@ class SqlServerAdapter(SourceAdapter):
         self._conn.close()
 
     @classmethod
-    def build(cls, name: str) -> "SqlServerAdapter":
+    def build(cls, name: str, config: dict) -> "SqlServerAdapter":
         if not _SQLSERVER_AVAILABLE:
             raise ImportError("pyodbc is required. Install with: pip install pyodbc")
         prefix   = f"DQ_{name.upper()}"
-        host     = _require(f"{prefix}_HOST")
-        port     = os.getenv(f"{prefix}_PORT", "1433")
-        database = _require(f"{prefix}_DATABASE")
-        driver   = os.getenv(f"{prefix}_DRIVER", "ODBC Driver 18 for SQL Server")
-        trust    = os.getenv(f"{prefix}_TRUST_CERT", "yes")
+        host     = _require_config(config, "host", name)
+        port     = config.get("port", 1433)
+        database = _require_config(config, "database", name)
+        driver   = config.get("driver", "ODBC Driver 18 for SQL Server")
+        trust    = config.get("trust_cert", "yes")
 
-        if os.getenv(f"{prefix}_TRUSTED_CONNECTION", "no").lower() == "yes":
+        if str(config.get("trusted_connection", "no")).lower() == "yes":
             conn_str = (f"DRIVER={{{driver}}};SERVER={host},{port};DATABASE={database};"
                        f"Trusted_Connection=yes;TrustServerCertificate={trust};")
         else:
@@ -270,6 +299,10 @@ class FileAdapter(SourceAdapter):
     shared registry, then registered as a DuckDB view in each thread's own
     connection (threading.local()) — DuckDB connections aren't safe to
     share across threads.
+
+    Non-secret config (config/connections.yaml): base_path (optional —
+    rules can also supply src_db_name directly). No secrets — local/mounted
+    files have no credentials to read from env.
 
     Rule conventions: src_tbl_nm = filename (e.g. "claims.csv"), src_db_name
     = base directory (may contain {ENV}), source_system = this connection's
@@ -334,8 +367,8 @@ class FileAdapter(SourceAdapter):
             self._local.registered = registered
 
     @classmethod
-    def build(cls, name: str) -> "FileAdapter":
-        return cls(base_path=os.getenv(f"DQ_{name.upper()}_BASE_PATH", ""))
+    def build(cls, name: str, config: dict) -> "FileAdapter":
+        return cls(base_path=config.get("base_path", ""))
 
     def _get_thread_conn(self):
         if not hasattr(self._local, "conn"):
@@ -400,17 +433,19 @@ class S3Adapter(SourceAdapter):
     "pull_date=*/*.parquet" globs for reading dated snapshots), source_system
     = this connection's name.
 
-    Env vars (prefix DQ_<NAME>_): REGION, ACCESS_KEY_ID (optional — omit to
-    use the instance/task IAM role), SECRET_ACCESS_KEY, SESSION_TOKEN
-    (optional), ENDPOINT (optional — S3-compatible endpoint override).
+    Non-secret config (config/connections.yaml): region, endpoint (optional
+    — S3-compatible endpoint override).
+    Secrets (env, prefix DQ_<NAME>_, all optional — omit to use the
+    instance/task IAM role): ACCESS_KEY_ID, SECRET_ACCESS_KEY, SESSION_TOKEN.
     """
 
     source_type: str = "s3"
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, config: dict):
         if not _DUCKDB_AVAILABLE:
             raise ImportError("duckdb is required for S3 source connections. Install with: pip install duckdb")
         self._name = name
+        self._config = config
         self._local = threading.local()
 
     def cursor(self):
@@ -454,14 +489,14 @@ class S3Adapter(SourceAdapter):
         logger.info("S3 view prepared: %s -> %s (connection '%s')", view_name, uri, self._name)
 
     @classmethod
-    def build(cls, name: str) -> "S3Adapter":
-        prefix = f"DQ_{name.upper()}"
-        if not (os.getenv(f"{prefix}_REGION") or os.getenv("AWS_DEFAULT_REGION")):
+    def build(cls, name: str, config: dict) -> "S3Adapter":
+        if not (config.get("region") or os.getenv("AWS_DEFAULT_REGION")):
             logger.warning(
-                "Neither %s_REGION nor AWS_DEFAULT_REGION is set for '%s' — "
-                "DuckDB httpfs will use its own default region resolution.", prefix, name,
+                "Neither 'region' in config/connections.yaml nor AWS_DEFAULT_REGION "
+                "is set for '%s' — DuckDB httpfs will use its own default region "
+                "resolution.", name,
             )
-        return cls(name)
+        return cls(name, config)
 
     def _get_thread_conn(self):
         if not hasattr(self._local, "conn"):
@@ -476,7 +511,7 @@ class S3Adapter(SourceAdapter):
     def _configure_credentials(self, conn) -> None:
         prefix = f"DQ_{self._name.upper()}"
 
-        region = os.getenv(f"{prefix}_REGION") or os.getenv("AWS_DEFAULT_REGION")
+        region = self._config.get("region") or os.getenv("AWS_DEFAULT_REGION")
         if region:
             conn.execute(f"SET s3_region='{_escape(region)}'")
 
@@ -492,7 +527,7 @@ class S3Adapter(SourceAdapter):
         if session_token:
             conn.execute(f"SET s3_session_token='{_escape(session_token)}'")
 
-        endpoint = os.getenv(f"{prefix}_ENDPOINT")
+        endpoint = self._config.get("endpoint")
         if endpoint:
             conn.execute(f"SET s3_endpoint='{_escape(endpoint)}'")
             conn.execute("SET s3_url_style='path'")
