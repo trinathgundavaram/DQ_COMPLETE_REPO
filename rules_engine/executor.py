@@ -3,24 +3,24 @@ rules_engine/executor.py
 ----------------
 Single-rule execution engine.
 
-Fix #1  (v2): True failed-record count — a separate COUNT(*) subquery on the
-rule SQL gives the real failure count even when exception rows are capped by
-MAX_EXCEPTIONS.  failed_records / failure_pct are now always accurate.
+A separate COUNT(*) subquery on the rule SQL gives the true failure count
+even when exception rows are capped by MAX_EXCEPTIONS — failed_records /
+failure_pct are always accurate.
 
-Fix #2  (v2): SKIP status is recorded in dq_rule_execution (zero counts,
-status='SKIP') so skipped rules are visible in metrics and the DQ score
-denominator is correct.
+SKIP status is recorded in dq_rule_execution (zero counts, status='SKIP')
+so skipped rules are visible in metrics and the DQ score denominator is
+correct.
 
-Fix #6  (v2): execute_query / execute_dml accept an optional `params`
-argument for parameterised ? placeholders — no f-string value injection.
+execute_query / execute_dml accept an optional `params` argument for
+parameterised ? placeholders — no f-string value injection.
 
-Fix #9  (v2): Source queries (count + rule) are wrapped in a tenacity retry
-decorator with exponential back-off.  Retry count is controlled by
-DQ_QUERY_MAX_RETRIES (default 3).  Metadata writes are NOT retried to
+Source queries (count + rule) are wrapped in a tenacity retry decorator
+with exponential back-off. Retry count is controlled by
+DQ_QUERY_MAX_RETRIES (default 3). Metadata writes are NOT retried, to
 prevent duplicate inserts.
 
-Check-type integration (v4):
-    execute_rule() now:
+Check-type integration:
+    execute_rule():
       - passes db_conn.source_type to build_query()
       - branches on the returned 'level':
           ROW    → original path (count + failed-count + exceptions)
@@ -151,8 +151,8 @@ def _count_failed(db_conn, rule_query: str) -> int:
     """
     Return the TRUE count of failed rows by running COUNT(*) on the rule query.
 
-    Fix #1: This is called separately from _fetch_failed_rows so the recorded
-    failed_records is always accurate, even when exception capture is capped.
+    Called separately from _fetch_failed_rows so the recorded failed_records
+    is always accurate, even when exception capture is capped.
     """
     sql  = f"SELECT COUNT(*) AS cnt FROM ({rule_query}) dq_failed_sub"
     rows = execute_query(db_conn, sql)
@@ -501,7 +501,7 @@ def execute_rule(rule: dict, db_conn, td_conn, run: dict, meta_db: str) -> str:
 
     # ── STEP 1: Table validation ──────────────────────────────────────────────
     if not validate_table_exists(db_conn, td_conn, rule, run, log_issue, log_message, meta_db):
-        # Fix #2: write a SKIP row so metrics counts every rule
+        # Write a SKIP row so metrics counts every rule
         table = rule.get("src_tbl_nm", "UNKNOWN")
         record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
                               0.0, 100.0, "SKIP", round(time.time() - start, 4), meta_db)

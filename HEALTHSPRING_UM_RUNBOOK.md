@@ -4,9 +4,7 @@
 
 Run these three files, in order, on a fresh environment -- `ddl_shared.sql`
 first (dq_scope + dq_connections, which the other two depend on), then
-`rules_engine/ddl.sql`, then `sampling/ddl.sql` -- or apply the `v5 → v6`
-ALTER block (bottom of `ddl_shared.sql`) on an existing one. Then load,
-in order:
+`rules_engine/ddl.sql`, then `sampling/ddl.sql`. Then load, in order:
 
 ```
 config/seed/01_setup.sql

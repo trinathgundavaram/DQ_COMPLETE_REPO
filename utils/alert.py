@@ -3,14 +3,14 @@ utils/alert.py
 --------------
 Alert dispatcher — Microsoft Teams (Adaptive Cards) and Office365 SMTP.
 
-Fix #7 (v2): All configuration is read lazily inside send_alert() rather
-than at module import time.  Credentials are never stored as module-level
-strings; they're read from env vars on each call so rotation takes effect
-immediately without a process restart.
+All configuration is read lazily inside send_alert() rather than at module
+import time. Credentials are never stored as module-level strings; they're
+read from env vars on each call so rotation takes effect immediately
+without a process restart.
 
-Fix #8 (v2): Teams payload migrated from deprecated MessageCard format to
-Adaptive Cards (application/vnd.microsoft.card.adaptive), which is the
-current Microsoft-recommended format for Teams incoming webhooks.
+Teams payloads use the Adaptive Cards format
+(application/vnd.microsoft.card.adaptive), the current
+Microsoft-recommended format for Teams incoming webhooks.
 """
 
 import json

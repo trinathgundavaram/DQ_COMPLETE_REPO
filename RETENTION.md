@@ -134,11 +134,9 @@ instantaneous regardless of how many rows are in it.
 table-creation time** (Teradata does not support adding a `PARTITION BY`
 clause to an existing table in place -- it requires a rebuild: create the
 new partitioned table under a temporary name, `INSERT ... SELECT` the
-existing data across, rename, drop the old one, matching the same
-"backup, then rebuild" caution `migrations/v6_to_v7.sql` already
-documents for the column drops in that migration). This is why the
+existing data across, rename, then drop the old one). This is why the
 recommendation below is phrased as DDL to apply on the *next* schema
-migration or a planned maintenance window, not a live ALTER.
+change or a planned maintenance window, not a live ALTER.
 
 | Table                | Partition column | Suggested grain |
 |------------------------|--------------------|--------------------|

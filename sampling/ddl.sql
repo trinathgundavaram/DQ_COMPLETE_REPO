@@ -1,5 +1,5 @@
 -- ============================================================
--- Data Quality Framework DDL — SAMPLING FRAMEWORK (sampling/)  (v7)
+-- Data Quality Framework DDL — SAMPLING FRAMEWORK (sampling/)
 -- Schema : CMSUNIV_FILELAND_DEV_T  (DEV)
 -- DB     : Teradata  (metadata store)
 -- ============================================================
@@ -21,7 +21,7 @@
 -- scheme without touching sampling/engine.py.
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_sampling_config (
     config_id            INTEGER NOT NULL,
-    scope_id              BIGINT NOT NULL,        -- v7: FK -> dq_scope
+    scope_id              BIGINT NOT NULL,        -- FK -> dq_scope
     sample_name           VARCHAR(100) NOT NULL,   -- e.g. 'WEEKLY_CLINICAL_REVIEW_SAMPLE'
     connection_name       VARCHAR(100) NOT NULL,   -- which dq_connections entry to pull from
     universe_table         VARCHAR(200) NOT NULL,
@@ -43,7 +43,7 @@ PRIMARY INDEX (config_id);
 -- Immutable output: every candidate case considered, scored, and whether it
 -- was selected — not just the final 150. Retained 10y per Section 3.7;
 -- never updated after a run completes (a re-run writes a new sample_run_id).
--- v7: project_name/process_name dropped — derivable via config_id ->
+-- project_name/process_name dropped — derivable via config_id ->
 -- dq_sampling_config.scope_id.
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_sample_selections (
     sample_row_id      BIGINT GENERATED ALWAYS AS IDENTITY,

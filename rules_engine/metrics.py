@@ -9,9 +9,9 @@ module just wrote: it reads the same dq_metrics_summary rows one function
 later in the same engine.py call sequence.
 
 calculate_metrics()  — aggregate this run's dq_rule_execution rows, upsert
-    into dq_metrics_summary (fix #3, v2: MERGE race — a duplicate-key error
-    from two concurrent runs falls back to a pure UPDATE so totals still
-    accumulate correctly), and compare against a rolling baseline.
+    into dq_metrics_summary (a duplicate-key error from two concurrent runs
+    falls back to a pure UPDATE so totals still accumulate correctly), and
+    compare against a rolling baseline.
 
 detect_and_log()  — statistical anomaly detection (z-score / IQR) on the
     metrics history calculate_metrics() just extended. A z-score of 4.2 is
@@ -183,7 +183,7 @@ def _upsert_metrics(td, run: dict, current: dict, meta_db: str):
     """
     Merge current run stats into dq_metrics_summary.
 
-    Fix #3: On unique-index violation (concurrent run race), fall back to
+    On unique-index violation (concurrent run race), falls back to
     UPDATE-only so both runs accumulate correctly.
     """
     today     = date.today()
@@ -258,7 +258,7 @@ def _upsert_metrics(td, run: dict, current: dict, meta_db: str):
         logger.info("dq_metrics_summary upserted for scope_id=%s/%s.", scope_id, run_type)
 
     except Exception as merge_err:
-        # Fix #3: unique-index violation — another concurrent run inserted first.
+        # Unique-index violation — another concurrent run inserted first.
         # Teradata error 2801 = "Duplicate unique prime key" / similar unique errors.
         err_str = str(merge_err).lower()
         if any(k in err_str for k in ("unique", "duplicate", "2801", "primary index")):

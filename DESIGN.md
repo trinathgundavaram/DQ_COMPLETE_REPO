@@ -83,12 +83,10 @@ entrypoints.py            shared: Lambda handler, Glue main, Airflow operator, c
                           step (see §3.6) -- the only place both frameworks meet
 ddl_shared.sql            the two tables both frameworks depend on -- dq_scope
                           (project/process dimension) and dq_connections (source
-                          catalogue) -- plus the full v1->v7 change rationale and
-                          illustrative version-history ALTER blocks. Run this file
-                          FIRST, before rules_engine/ddl.sql and/or sampling/ddl.sql.
-migrations/v6_to_v7.sql   runnable schema-normalization migration (see §6.5) --
-                          a real ALTER/backfill/DROP script, not illustrative
-                          comments like ddl_shared.sql's earlier v1->v2 .. v5->v6 blocks
+                          catalogue) -- plus the design rationale for the schema
+                          (why scope_id exists, which columns are frozen
+                          execution-time snapshots, etc). Run this file FIRST,
+                          before rules_engine/ddl.sql and/or sampling/ddl.sql.
 RETENTION.md              partitioning/archival strategy for high-growth tables --
                           operational guidance, not code this repo runs itself
 ONBOARDING.md             generic step-by-step walkthrough: empty schema -> first

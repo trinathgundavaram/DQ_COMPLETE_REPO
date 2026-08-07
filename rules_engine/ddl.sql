@@ -1,16 +1,15 @@
 -- ============================================================
--- Data Quality Framework DDL — RULES ENGINE (rules_engine/)  (v7)
+-- Data Quality Framework DDL — RULES ENGINE (rules_engine/)
 -- Schema : CMSUNIV_FILELAND_DEV_T  (DEV)
 -- DB     : Teradata  (metadata store)
 -- ============================================================
 -- Run ddl_shared.sql FIRST — every table below references dq_scope
 -- (project/process dimension) and/or dq_connections defined there.
 --
--- Full v1-v7 change rationale (why scope_id was introduced, which columns
--- were trimmed and why, which frozen-snapshot columns were deliberately
--- NOT touched, etc.) lives in ddl_shared.sql's header — this file only
--- holds the CURRENT-state CREATE TABLE statements for the rules engine's
--- own tables: dq_rules through dq_notification_routes.
+-- Design rationale (why scope_id was introduced, why certain columns are
+-- frozen execution-time snapshots instead of live joins, etc.) lives in
+-- ddl_shared.sql's header — this file holds the CREATE TABLE statements
+-- for the rules engine's own tables: dq_rules through dq_notification_routes.
 -- ============================================================
 
 -- ============================================================
@@ -21,7 +20,7 @@
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_rules (
     rule_id              INTEGER NOT NULL,
     rule_code            VARCHAR(200) NOT NULL,
-    scope_id             BIGINT NOT NULL,                  -- v7: FK -> dq_scope
+    scope_id             BIGINT NOT NULL,                  -- FK -> dq_scope
     src_tbl_nm           VARCHAR(200) NOT NULL,
     src_db_name          VARCHAR(200),
     src_schema           VARCHAR(100),
@@ -32,42 +31,36 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_rules (
     source_system        VARCHAR(50),
     filter_column        VARCHAR(100),
     filter_type          VARCHAR(20),
-    filter_sql           CLOB,                            -- v2: verbatim WHERE clause
+    filter_sql           CLOB,                            -- verbatim WHERE clause
     primary_key_columns  VARCHAR(500),
     severity             VARCHAR(20),
     threshold_pct        FLOAT,
     threshold_count      INTEGER,
-    threshold_operator   CHAR(3) DEFAULT 'OR',            -- v2: 'OR' | 'AND'
-    require_rows         BYTEINT DEFAULT 0,               -- v2: 1 = fail on empty table
-    priority             INTEGER DEFAULT 100,             -- v2: lower = runs first
-    depends_on_rule_id   INTEGER,                         -- v2: skip if parent fails
+    threshold_operator   CHAR(3) DEFAULT 'OR',            -- 'OR' | 'AND'
+    require_rows         BYTEINT DEFAULT 0,               -- 1 = fail on empty table
+    priority             INTEGER DEFAULT 100,             -- lower = runs first
+    depends_on_rule_id   INTEGER,                         -- skip if parent fails
     rule_group           VARCHAR(100),
     table_group          VARCHAR(100),
     active_flag          BYTEINT,
     created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at           TIMESTAMP,                           -- v3: audit trail for rule edits
-    check_type           VARCHAR(50),                         -- v4: built-in check type code
-    check_column         VARCHAR(500),                        -- v4: column(s) the check applies to
-    check_params         CLOB,                                -- v4: JSON dict of check-type params
-    sql_dialect          VARCHAR(10),                         -- v6: 'teradata'|'postgres'|'ansi'
-    business_correctable BYTEINT DEFAULT 0                    -- v6: drives notification routing
+    updated_at           TIMESTAMP,                           -- audit trail for rule edits
+    check_type           VARCHAR(50),                         -- built-in check type code
+    check_column         VARCHAR(500),                        -- column(s) the check applies to
+    check_params         CLOB,                                -- JSON dict of check-type params
+    sql_dialect          VARCHAR(10),                         -- 'teradata'|'postgres'|'ansi'
+    business_correctable BYTEINT DEFAULT 0                    -- drives notification routing
 )
 PRIMARY INDEX (rule_id);
 
 CREATE INDEX dq_rules_scope_ix (scope_id, active_flag)
 ON CMSUNIV_FILELAND_DEV_T.dq_rules;
 
--- v6: constrain source_type to the 3 supported adapters (Teradata/
--- Postgres/S3 for this instance — Databricks/SqlServer adapters remain in
--- code, just not catalogued here). See db/adapters.py.
--- ALTER TABLE ... ADD CONSTRAINT dq_connections_source_type_ck
---   CHECK (source_type IN ('teradata', 'postgresql', 's3'));
-
 
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_run_control (
     run_id        VARCHAR(200) NOT NULL,
     run_seq_id    BIGINT GENERATED ALWAYS AS IDENTITY,
-    scope_id      BIGINT NOT NULL,                        -- v7: FK -> dq_scope
+    scope_id      BIGINT NOT NULL,                        -- FK -> dq_scope
     run_type      VARCHAR(50),
     run_mode      VARCHAR(20),
     batch_id      VARCHAR(100),
@@ -87,13 +80,13 @@ ON CMSUNIV_FILELAND_DEV_T.dq_run_control;
 
 
 
--- v7: run_type/run_mode/batch_id/dataset_id/dates/project/process are all
+-- run_type/run_mode/batch_id/dataset_id/dates/project/process are all
 -- fixed once at run start and available via a JOIN to dq_run_control on
 -- run_id — repeating them on every rule-execution row was pure
 -- duplication (a run typically has dozens to hundreds of rules). Kept:
 -- rule_code, table_name, severity — frozen snapshots of what a MUTABLE
--- dq_rules row said at execution time (see the v7 note at the top of
--- this file for why that one stays).
+-- dq_rules row said at execution time (see ddl_shared.sql's header for
+-- why that one stays).
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_rule_execution (
     run_id          VARCHAR(200),
     rule_id         INTEGER,
@@ -115,7 +108,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_rule_execution (
 PRIMARY INDEX (run_id, rule_id);
 
 
--- v7: same reasoning as dq_rule_execution above — project/process/run_type/
+-- same reasoning as dq_rule_execution above — project/process/run_type/
 -- run_mode/batch_id/dataset_id dropped, derivable via run_id -> dq_run_control.
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_exceptions (
     exception_id     BIGINT GENERATED ALWAYS AS IDENTITY,
@@ -131,7 +124,7 @@ PRIMARY INDEX (exception_id);
 
 
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_metrics_summary (
-    scope_id         BIGINT,                  -- v7: FK -> dq_scope
+    scope_id         BIGINT,                  -- FK -> dq_scope
     run_type         VARCHAR(50),
     batch_id         VARCHAR(100),
     dataset_id       VARCHAR(200),
@@ -148,23 +141,23 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_metrics_summary (
 )
 PRIMARY INDEX (scope_id, run_type, run_month);
 
--- v2: UNIQUE INDEX prevents double-INSERT when two runs MERGE concurrently
+-- UNIQUE INDEX prevents double-INSERT when two runs MERGE concurrently
 CREATE UNIQUE INDEX dq_metrics_summary_uix
     (scope_id, run_type, batch_id, dataset_id, run_month)
 ON CMSUNIV_FILELAND_DEV_T.dq_metrics_summary;
 
--- v3: Secondary index on dq_exceptions for fast lookup by run_id / rule_id
+-- Secondary index on dq_exceptions for fast lookup by run_id / rule_id
 --     (PI is exception_id/identity — run-based queries would be full-table scans)
 CREATE INDEX dq_exceptions_run_rule_ix (run_id, rule_id)
 ON CMSUNIV_FILELAND_DEV_T.dq_exceptions;
 
--- v3: Secondary index on dq_rule_execution for dashboard status filtering
+-- Secondary index on dq_rule_execution for dashboard status filtering
 --     (e.g. WHERE run_id = ? AND status = 'FAIL')
 CREATE INDEX dq_rule_execution_status_ix (run_id, status)
 ON CMSUNIV_FILELAND_DEV_T.dq_rule_execution;
 
 
--- ── v4: Built-in check type reference table ──────────────────────────────────
+-- ── Built-in check type reference table ────────────────────────────────────
 -- Populated once via INSERT statements generated by rules_engine/check_types.py.
 -- Acts as a catalogue / documentation table — not queried at runtime.
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_check_catalog (
@@ -219,7 +212,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_run_logs (
 PRIMARY INDEX (run_id);
 
 
--- v7: project_name/process_name dropped — derivable via run_id -> dq_run_control.
+-- project_name/process_name dropped — derivable via run_id -> dq_run_control.
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_rule_issues (
     issue_id      BIGINT GENERATED ALWAYS AS IDENTITY,
     run_id        VARCHAR(200),
@@ -234,7 +227,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_rule_issues (
 PRIMARY INDEX (run_id);
 
 
--- ── v5: Rule suppression, versioning, profiling, anomaly detection ──────────
+-- ── Rule suppression, versioning, profiling, anomaly detection ─────────────
 
 -- Temporarily suppress a known-failing rule without touching its definition.
 -- A suppression is active when lifted_at IS NULL AND (expires_at IS NULL OR > NOW).
@@ -285,7 +278,7 @@ ON CMSUNIV_FILELAND_DEV_T.dq_rule_versions;
 
 
 -- Per-column statistical profile snapshots.
--- v7: project_name/process_name dropped — derivable via run_id -> dq_run_control.
+-- project_name/process_name dropped — derivable via run_id -> dq_run_control.
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_column_profile (
     profile_id      BIGINT GENERATED ALWAYS AS IDENTITY,
     run_id          VARCHAR(200),
@@ -314,8 +307,8 @@ ON CMSUNIV_FILELAND_DEV_T.dq_column_profile;
 -- Controls which tables are profiled and with what settings (opt-in).
 -- Match rules: project_name + process_name + table_name.
 -- NULL in project_name or process_name = wildcard (matches any).
--- Deliberately NOT normalized to scope_id — see the v7 note at the top of
--- this file (low-cardinality wildcard config table).
+-- Deliberately NOT normalized to scope_id — see ddl_shared.sql's header
+-- (low-cardinality wildcard config table).
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_profile_config (
     config_id       INTEGER NOT NULL,
     project_name    VARCHAR(100),       -- NULL = all projects
@@ -337,8 +330,8 @@ ON CMSUNIV_FILELAND_DEV_T.dq_profile_config;
 
 -- Controls anomaly-detection sensitivity per project / process / run_type.
 -- NULL fields act as wildcards; most-specific matching row wins.
--- Deliberately NOT normalized to scope_id — see the v7 note at the top of
--- this file (low-cardinality wildcard config table).
+-- Deliberately NOT normalized to scope_id — see ddl_shared.sql's header
+-- (low-cardinality wildcard config table).
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_anomaly_config (
     config_id           INTEGER NOT NULL,
     project_name        VARCHAR(100),   -- NULL = global default
@@ -355,7 +348,7 @@ PRIMARY INDEX (config_id);
 
 
 -- Log of detected anomalies — one row per metric per run.
--- v7: project_name/process_name/run_type dropped — derivable via run_id ->
+-- project_name/process_name/run_type dropped — derivable via run_id ->
 -- dq_run_control.
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_anomaly_log (
     anomaly_id          BIGINT GENERATED ALWAYS AS IDENTITY,
@@ -379,10 +372,10 @@ ON CMSUNIV_FILELAND_DEV_T.dq_anomaly_log;
 
 
 -- ============================================================
--- v6: SQL-dialect enforcement, case-level disposition, config-driven
---     stratified sampling, and notification routing. Every table below
---     is project-agnostic — no project's vocabulary is baked into the
---     schema; see config/seed/ for one project's config.
+-- SQL-dialect enforcement, case-level disposition, config-driven
+-- stratified sampling, and notification routing. Every table below
+-- is project-agnostic — no project's vocabulary is baked into the
+-- schema; see config/seed/ for one project's config.
 -- ============================================================
 
 -- ── dq_rules: sql_dialect ─────────────────────────────────────────────────
@@ -409,14 +402,13 @@ ON CMSUNIV_FILELAND_DEV_T.dq_anomaly_log;
 -- exception_id is the current state. Joined at read time by the dashboard
 -- and the static audit report — dq_exceptions itself never changes.
 --
--- v7: renamed from dq_case_dispositions and trimmed of run_id, rule_id,
--- rule_code, project_name, process_name, primary_key_str — every one of
--- those already lives on dq_exceptions.exception_id, which is itself
--- immutable, so there's no point-in-time-snapshot reason to repeat them
--- here (unlike dq_rule_execution/dq_exceptions denormalizing FROM the
--- MUTABLE dq_rules — this table denormalized from an already-immutable
--- row, which is pure duplication). Join to dq_exceptions for everything
--- else.
+-- Trimmed of run_id, rule_id, rule_code, project_name, process_name,
+-- primary_key_str — every one of those already lives on
+-- dq_exceptions.exception_id, which is itself immutable, so there's no
+-- point-in-time-snapshot reason to repeat them here (unlike
+-- dq_rule_execution/dq_exceptions denormalizing FROM the MUTABLE dq_rules
+-- — this table denormalizes from an already-immutable row, which is pure
+-- duplication). Join to dq_exceptions for everything else.
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_exception_dispositions (
     disposition_id      BIGINT GENERATED ALWAYS AS IDENTITY,
     exception_id         BIGINT NOT NULL,        -- FK -> dq_exceptions.exception_id
@@ -445,8 +437,8 @@ ON CMSUNIV_FILELAND_DEV_T.dq_exception_dispositions;
 -- finding_class: DATA_VIOLATION | ENGINE_FAILURE  (never both on one route —
 --   this table is exactly what prevents the two audiences from being
 --   collapsed onto the same channel).
--- Deliberately NOT normalized to scope_id — see the v7 note at the top of
--- this file (low-cardinality wildcard config table).
+-- Deliberately NOT normalized to scope_id — see ddl_shared.sql's header
+-- (low-cardinality wildcard config table).
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_notification_routes (
     route_id          INTEGER NOT NULL,
     project_name      VARCHAR(100),     -- NULL = applies to all projects

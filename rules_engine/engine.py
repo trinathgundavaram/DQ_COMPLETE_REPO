@@ -3,27 +3,27 @@ rules_engine/engine.py
 --------------
 Main DQ execution engine.
 
-Fix #4  (v2): On startup, mark any run older than DQ_STALE_RUN_HOURS that is
-still RUNNING as ABORTED (covers crashes / SIGKILL mid-run).
+On startup, any run older than DQ_STALE_RUN_HOURS that is still RUNNING is
+marked ABORTED (covers crashes / SIGKILL mid-run).
 
-Fix #5  (v2): Metadata connection name is read from DQ_META_CONNECTION env var
-(default "teradata") — no more hardcoded string literal.
+Metadata connection name is read from DQ_META_CONNECTION env var (default
+"teradata").
 
-Fix #10 (v2): Thread-pool size read from DQ_MAX_WORKERS (default 5).
+Thread-pool size is read from DQ_MAX_WORKERS (default 5).
 
-Fix #11 (v2): Rules loaded with ORDER BY priority ASC, rule_id ASC — lower
-priority value runs first.
+Rules are loaded with ORDER BY priority ASC, rule_id ASC — lower priority
+value runs first.
 
-Fix #12 (v2): Rule dependency graph — depends_on_rule_id column.  After a
-parent completes, dependent rules are submitted dynamically.  If the parent
-FAILS / ERRORS / SKIPs, all dependents are auto-skipped without running.
-Uses concurrent.futures.wait(FIRST_COMPLETED) for dynamic future submission.
+Rule dependency graph via depends_on_rule_id: after a parent completes,
+dependent rules are submitted dynamically. If the parent FAILS / ERRORS /
+SKIPs, all dependents are auto-skipped without running. Uses
+concurrent.futures.wait(FIRST_COMPLETED) for dynamic future submission.
 
-Fix #16 (v2): dry_run=True mode — validates all rule SQL and table existence
-but writes nothing to the database.
+dry_run=True validates all rule SQL and table existence but writes nothing
+to the database.
 
-Fix #17 (v2): Pre-validation pass before parallel execution — validates SQL
-syntax for every rule upfront and aborts on configurable DQ_PREVALIDATE_ABORT
+A pre-validation pass runs before parallel execution, validating SQL syntax
+for every rule upfront and aborting on configurable DQ_PREVALIDATE_ABORT
 (default False = log errors but continue).
 """
 
@@ -698,7 +698,7 @@ def _build_dataset_id(run_mode: str, batch_id, start_date, end_date) -> str:
 
 def _cleanup_stale_runs(td, meta_db: str):
     """
-    Fix #4: Mark any run still RUNNING after STALE_RUN_HOURS as ABORTED.
+    Mark any run still RUNNING after STALE_RUN_HOURS as ABORTED.
     Protects against crashes / SIGKILL leaving phantom RUNNING rows.
     """
     try:

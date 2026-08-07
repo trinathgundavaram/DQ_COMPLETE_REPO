@@ -39,11 +39,6 @@ rules_engine/ddl.sql   -- rules-engine tables (skip if you only need sampling)
 sampling/ddl.sql       -- sampling tables (skip if you only need the rules engine)
 ```
 
-Upgrading an existing pre-v7 deployment instead: run
-`migrations/v6_to_v7.sql` (phase by phase, with the backups it
-recommends -- see that file's header) rather than the three DDL files
-directly.
-
 ## 2. Configure connections
 
 ```
