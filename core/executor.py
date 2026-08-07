@@ -44,7 +44,7 @@ from utils.validation import validate_table_exists
 from utils.ids import build_json_pk, build_pk_string
 from utils.metadata_writers import log_issue
 from utils.metadata_writers import log_message
-from core.rule_sql import check_dialect, DialectMismatchError
+from core.rule_sql import check_dialect, DialectMismatchError, check_no_dml_ddl, UnsafeRuleSQLError
 
 logger = logging.getLogger(__name__)
 
@@ -382,29 +382,24 @@ def record_rule_execution(
     run_date  = now.date()
     run_month = date(run_date.year, run_date.month, 1)
 
+    # project_name/process_name/run_type/run_mode/batch_id/dataset_id/
+    # start_date/end_date are NOT stored here — they're fixed once at run
+    # start and available via a JOIN to dq_run_control on run_id. rule_code/
+    # severity ARE stored: they're a frozen snapshot of what the (mutable)
+    # dq_rules row said at execution time, not derivable after the fact.
     sql = f"""
         INSERT INTO {meta_db}.dq_rule_execution (
-            run_id, rule_id, rule_code, project_name, process_name,
-            table_name, run_type, run_mode, batch_id, dataset_id,
-            start_date, end_date,
+            run_id, rule_id, rule_code, table_name,
             total_records, failed_records, passed_records,
             failure_pct, pass_pct, severity, status,
             execution_time, run_timestamp, run_date, run_month, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     """
     bulk_insert(td_conn, sql, [(
         run["run_id"],
         rule.get("rule_id"),
         rule.get("rule_code"),
-        rule.get("project_name"),
-        rule.get("process_name"),
         table,
-        run.get("run_type"),
-        run.get("run_mode"),
-        run.get("batch_id"),
-        run.get("dataset_id"),
-        run.get("start_date"),
-        run.get("end_date"),
         total,
         failed,
         passed,
@@ -460,6 +455,24 @@ def execute_rule(rule: dict, db_conn, td_conn, run: dict, meta_db: str) -> str:
         record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
                               0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
         logger.error("Dialect mismatch — rule skipped: %s", exc)
+        return "ERROR"
+
+    # ── STEP -0.5: Write-statement guard — same defense-in-depth rationale
+    # as the dialect check above (core/engine.py::_pre_validate_rules
+    # already ran this; this protects rules changed after pre-validation
+    # or executed via a path that skips it). ─────────────────────────────
+    try:
+        check_no_dml_ddl(rule.get("rule_syntax") or "", rule.get("rule_code"))
+    except UnsafeRuleSQLError as exc:
+        log_issue(td_conn, run, rule, "UNSAFE_RULE_SQL", str(exc), meta_db=meta_db)
+        log_message(td_conn, run["run_id"], "ERROR",
+                    f"Unsafe rule_syntax for rule {rule.get('rule_code')}: {exc}",
+                    rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
+                    error_code="UNSAFE_RULE_SQL", error_detail=str(exc), meta_db=meta_db)
+        table = rule.get("src_tbl_nm", "UNKNOWN")
+        record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
+                              0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
+        logger.error("Unsafe rule_syntax — rule skipped: %s", exc)
         return "ERROR"
 
     # ── STEP 0: Source preparation ────────────────────────────────────────────
@@ -727,25 +740,21 @@ def _insert_exceptions(td_conn, run: dict, rule: dict, table: str,
     if not failed_rows:
         return
 
+    # Same reasoning as record_rule_execution above: project/process/
+    # run_type/run_mode/batch_id/dataset_id are derivable via run_id ->
+    # dq_run_control, so they're not repeated on every exception row.
     exc_sql = f"""
         INSERT INTO {meta_db}.dq_exceptions (
-            run_id, rule_id, rule_code, project_name, process_name,
-            table_name, run_type, run_mode, batch_id, dataset_id,
+            run_id, rule_id, rule_code, table_name,
             key_json, primary_key_str, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     """
     exc_rows = [
         (
             run["run_id"],
             rule.get("rule_id"),
             rule.get("rule_code"),
-            rule.get("project_name"),
-            rule.get("process_name"),
             table,
-            run.get("run_type"),
-            run.get("run_mode"),
-            run.get("batch_id"),
-            run.get("dataset_id"),
             build_json_pk(rule, r),
             build_pk_string(rule, r),
         )

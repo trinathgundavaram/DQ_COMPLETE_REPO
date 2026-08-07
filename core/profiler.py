@@ -162,8 +162,6 @@ def _profile_one_table(
 
         rows_to_insert.append((
             run["run_id"],
-            run.get("project_name"),
-            run.get("process_name"),
             table,
             col,
             stats["total_rows"],
@@ -183,13 +181,15 @@ def _profile_one_table(
     if not rows_to_insert:
         return
 
+    # project_name/process_name are NOT stored — derivable via run_id ->
+    # dq_run_control (see ddl.sql v7).
     sql = f"""
         INSERT INTO {meta_db}.dq_column_profile (
-            run_id, project_name, process_name, table_name, column_name,
+            run_id, table_name, column_name,
             total_rows, null_count, null_pct, distinct_count, distinct_pct,
             min_value, max_value, mean_value, stddev_value,
             top_values, profile_date, source_type, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     """
     bulk_insert(td_conn, sql, rows_to_insert)
     logger.info(

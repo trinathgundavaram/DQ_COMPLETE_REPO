@@ -556,7 +556,7 @@ def _sum_match(rule, table, filter_sql, params, source_type):
         f"         THEN ABS(p.total - r.total) / ABS(r.total) * 100.0\n"
         f"         ELSE NULL END AS pct_diff\n"
         f"FROM _primary p, _reference r\n"
-        f"WHERE ABS(p.total - r.total) > {tol_pct} * ABS(NULLIF(r.total, 0))"
+        f"WHERE ABS(p.total - r.total) > ({tol_pct} / 100.0) * ABS(NULLIF(r.total, 0))"
     )
 
 
@@ -592,7 +592,7 @@ def _count_match(rule, table, filter_sql, params, source_type):
         f"    r.cnt AS reference_count,\n"
         f"    ABS(p.cnt - r.cnt) AS absolute_diff\n"
         f"FROM _primary p, _reference r\n"
-        f"WHERE ABS(p.cnt - r.cnt) > {tol_pct} * NULLIF(r.cnt, 0)"
+        f"WHERE ABS(p.cnt - r.cnt) > ({tol_pct} / 100.0) * NULLIF(r.cnt, 0)"
     )
 
 

@@ -70,11 +70,13 @@ def log_issue(
     """Insert a row into dq_rule_issues for a non-fatal rule-level problem. Never raises."""
     meta_db = meta_db or get_meta_db()
 
+    # project_name/process_name are NOT stored — derivable via run_id ->
+    # dq_run_control (see ddl.sql v7).
     sql = f"""
         INSERT INTO {meta_db}.dq_rule_issues
-            (run_id, rule_id, rule_code, project_name, process_name,
+            (run_id, rule_id, rule_code,
              table_name, issue_type, issue_message, error_detail, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     """
     try:
         cursor = td.cursor()
@@ -82,8 +84,6 @@ def log_issue(
             run.get("run_id") or "",
             rule.get("rule_id"),
             rule.get("rule_code") or None,
-            rule.get("project_name") or None,
-            rule.get("process_name") or None,
             rule.get("src_tbl_nm") or None,
             issue_type,
             message,

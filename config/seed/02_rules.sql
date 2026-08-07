@@ -5,11 +5,11 @@
 -- ============================================================
 
 -- UM-REQ-001: Beneficiary first name must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1001,
     'UM-REQ-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -33,11 +33,11 @@ WHERE beneficiary_first_name IS NULL OR TRIM(CAST(beneficiary_first_name AS VARC
 );
 
 -- UM-REQ-002: Beneficiary last name must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1002,
     'UM-REQ-002',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -61,11 +61,11 @@ WHERE beneficiary_last_name IS NULL OR TRIM(CAST(beneficiary_last_name AS VARCHA
 );
 
 -- UM-REQ-003: Enrollee ID must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1003,
     'UM-REQ-003',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -89,11 +89,11 @@ WHERE enrollee_id IS NULL OR TRIM(CAST(enrollee_id AS VARCHAR(4000))) = ''''',
 );
 
 -- UM-REQ-004: Contract ID must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1004,
     'UM-REQ-004',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -117,11 +117,11 @@ WHERE contract_id IS NULL OR TRIM(CAST(contract_id AS VARCHAR(4000))) = ''''',
 );
 
 -- UM-REQ-005: Plan Benefit Package (PBP) must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1005,
     'UM-REQ-005',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -145,11 +145,11 @@ WHERE pbp IS NULL OR TRIM(CAST(pbp AS VARCHAR(4000))) = ''''',
 );
 
 -- UM-REQ-006: Auth/claim number must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1006,
     'UM-REQ-006',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -173,11 +173,11 @@ WHERE auth_or_claim_number IS NULL OR TRIM(CAST(auth_or_claim_number AS VARCHAR(
 );
 
 -- UM-REQ-007: Request received date/time must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1007,
     'UM-REQ-007',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -201,11 +201,11 @@ WHERE request_received_ts IS NULL OR TRIM(CAST(request_received_ts AS VARCHAR(40
 );
 
 -- UM-REQ-008: Decision date/time must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1008,
     'UM-REQ-008',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -229,11 +229,11 @@ WHERE decision_ts IS NULL OR TRIM(CAST(decision_ts AS VARCHAR(4000))) = ''''',
 );
 
 -- UM-REQ-009: Service type must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1009,
     'UM-REQ-009',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -257,11 +257,11 @@ WHERE service_type IS NULL OR TRIM(CAST(service_type AS VARCHAR(4000))) = ''''',
 );
 
 -- UM-REQ-010: Member ID must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1010,
     'UM-REQ-010',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -285,11 +285,11 @@ WHERE member_id IS NULL OR TRIM(CAST(member_id AS VARCHAR(4000))) = ''''',
 );
 
 -- UM-REQ-011: Provider ID must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1011,
     'UM-REQ-011',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -313,11 +313,11 @@ WHERE provider_id IS NULL OR TRIM(CAST(provider_id AS VARCHAR(4000))) = ''''',
 );
 
 -- UM-FMT-001: Auth/claim number must not contain letters other than 'H'
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1012,
     'UM-FMT-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -342,11 +342,11 @@ WHERE auth_or_claim_number IS NOT NULL
 );
 
 -- UM-FMT-002: Contract ID must match Medicare contract-number format
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1013,
     'UM-FMT-002',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -371,11 +371,11 @@ WHERE contract_id IS NOT NULL
 );
 
 -- UM-FMT-003: Enrollee ID must be numeric
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1014,
     'UM-FMT-003',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -400,11 +400,11 @@ WHERE enrollee_id IS NOT NULL
 );
 
 -- UM-VAL-001: Request disposition must be an allowed value
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1015,
     'UM-VAL-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -429,11 +429,11 @@ WHERE request_disposition NOT IN (''Approved'', ''Denied'', ''Withdrawn'', ''Dis
 );
 
 -- UM-VAL-002: Service type must be an allowed value
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1016,
     'UM-VAL-002',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -459,11 +459,11 @@ WHERE service_type NOT IN (''STANDARD_PRESERVICE'', ''PART_B_DRUG'', ''EXPEDITED
 );
 
 -- UM-VAL-003: Network status must be an allowed value
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1017,
     'UM-VAL-003',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -488,11 +488,11 @@ WHERE network_status NOT IN (''In-Network'', ''Out-of-Network'')
 );
 
 -- UM-COND-001: Denied requests must have a denial reason
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1018,
     'UM-COND-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -517,11 +517,11 @@ WHERE request_disposition = ''Denied''
 );
 
 -- UM-COND-002: Approved requests must have a real notification date
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1019,
     'UM-COND-002',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -549,11 +549,11 @@ WHERE request_disposition = ''Approved''
 );
 
 -- UM-COND-003: Withdrawn requests must have a withdrawal reason
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1020,
     'UM-COND-003',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -578,11 +578,11 @@ WHERE request_disposition = ''Withdrawn''
 );
 
 -- UM-COND-004: Denied requests must carry a written notification date
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1021,
     'UM-COND-004',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -607,11 +607,11 @@ WHERE request_disposition = ''Denied''
 );
 
 -- UM-XFIELD-001: Decision must not precede the request
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1022,
     'UM-XFIELD-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -636,11 +636,11 @@ WHERE decision_ts IS NOT NULL AND request_received_ts IS NOT NULL
 );
 
 -- UM-XFIELD-002: Effectuation must not precede the decision
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1023,
     'UM-XFIELD-002',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -665,11 +665,11 @@ WHERE effectuation_date IS NOT NULL AND decision_ts IS NOT NULL
 );
 
 -- UM-SLA-STD-001: Standard pre-service — 7 calendar days (no extension)
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1024,
     'UM-SLA-STD-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -696,11 +696,11 @@ WHERE service_type = ''STANDARD_PRESERVICE''
 );
 
 -- UM-SLA-STD-002: Standard pre-service with extension — 28 days (eff. 1/1/2026)
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1025,
     'UM-SLA-STD-002',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -727,11 +727,11 @@ WHERE service_type = ''STANDARD_PRESERVICE''
 );
 
 -- UM-SLA-PARTB-001: Part B drugs — 72 hours
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1026,
     'UM-SLA-PARTB-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -757,11 +757,11 @@ WHERE service_type = ''PART_B_DRUG''
 );
 
 -- UM-SLA-EXP-001: Expedited — 72 hours (no extension)
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1027,
     'UM-SLA-EXP-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -788,11 +788,11 @@ WHERE service_type = ''EXPEDITED''
 );
 
 -- UM-SLA-EXP-002: Expedited with extension — 17 days
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1028,
     'UM-SLA-EXP-002',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -819,11 +819,11 @@ WHERE service_type = ''EXPEDITED''
 );
 
 -- UM-SLA-EXPPARTB-001: Expedited Part B — 24 hours
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1029,
     'UM-SLA-EXPPARTB-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -849,11 +849,11 @@ WHERE service_type = ''EXPEDITED_PART_B''
 );
 
 -- UM-SLA-DSNP-001: DSNP-AIP — 3-day written notice rule
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1030,
     'UM-SLA-DSNP-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -883,11 +883,11 @@ WHERE service_type = ''DSNP_AIP''
 );
 
 -- UM-BIZHRS-001: Decision time must fall within business hours
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1031,
     'UM-BIZHRS-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -913,11 +913,11 @@ WHERE decision_ts IS NOT NULL
 );
 
 -- UM-DUP-001: Reopened case within 65 days of a prior denial
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1032,
     'UM-DUP-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -947,11 +947,11 @@ JOIN um_universe prior
 );
 
 -- UM-XTAB-SHRPA-001: Approved determinations requiring SHRPA clinical review
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1033,
     'UM-XTAB-SHRPA-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -978,11 +978,11 @@ WHERE u.request_disposition = ''Approved''
 );
 
 -- UM-XTAB-PROV-001: Provider must have an active contract at time of decision
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1034,
     'UM-XTAB-PROV-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -1009,11 +1009,11 @@ WHERE u.provider_id IS NOT NULL
 );
 
 -- UM-FRESH-001: Universe pull must occur every Friday (even on holidays)
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1035,
     'UM-FRESH-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -1035,11 +1035,11 @@ INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, proce
 );
 
 -- UM-VOL-001: Weekly universe volume must be in the expected range
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1036,
     'UM-VOL-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe',
     NULL,
     'teradata',
@@ -1061,11 +1061,11 @@ INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, proce
 );
 
 -- UM-REFDATA-PG-001: SHRPA reference rows must have a non-blank auth number
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1037,
     'UM-REFDATA-PG-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'shrpa_reference',
     NULL,
     'um_refdata',
@@ -1089,11 +1089,11 @@ WHERE authorization_number IS NULL OR TRIM(authorization_number) = ''''',
 );
 
 -- UM-ARCHIVE-S3-001: Archived weekly snapshot must be present in S3
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, project_name, process_name, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1038,
     'UM-ARCHIVE-S3-001',
-    'HEALTHSPRING_UM',
-    'UNIVERSE_VALIDATION',
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'UNIVERSE_VALIDATION'),
     'um_universe_archive',
     's3://healthspring-dq-archive/um_universe/*.parquet',
     'um_archive',

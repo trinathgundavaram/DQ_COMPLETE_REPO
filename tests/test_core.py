@@ -7,14 +7,19 @@ stands in for the target databases.
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import os
+import tempfile
+
 import duckdb
 import pytest
 
 from core.rule_sql import (
     check_dialect, DialectMismatchError,
-    build_rule_sql, validate_rule_params, is_raw_sql_rule, build_filter,
+    build_rule_sql, build_query, validate_rule_params, is_raw_sql_rule, build_filter,
+    check_no_dml_ddl, UnsafeRuleSQLError,
 )
 from core.executor import evaluate_rule
+from core.reporting import generate_report
 
 
 # ── Dialect enforcement ──────────────────────────────────────────────────
@@ -60,6 +65,109 @@ def test_invalid_dialect_value_raises():
     rule = {"rule_code": "R7", "sql_dialect": "mysql"}
     with pytest.raises(DialectMismatchError):
         check_dialect(rule, "postgresql")
+
+
+# ── Write-statement guard (rule_syntax must be read-only) ───────────────
+
+def test_bare_delete_statement_is_rejected():
+    with pytest.raises(UnsafeRuleSQLError) as exc:
+        check_no_dml_ddl("DELETE FROM um_universe WHERE 1=1", "R8")
+    assert "DELETE" in str(exc.value)
+    assert "R8" in str(exc.value)
+
+
+def test_dml_keyword_inside_string_literal_is_allowed():
+    # 'DELETE_REQUESTED' is a data value, not a statement — must not
+    # false-positive just because the banned word appears as a substring
+    # of a quoted literal.
+    check_no_dml_ddl(
+        "SELECT enrollee_id FROM um_universe WHERE status = 'DELETE_REQUESTED'",
+        "R9",
+    )  # must not raise
+
+
+def test_dml_keyword_inside_comment_is_allowed():
+    check_no_dml_ddl(
+        "-- old version used to DROP the staging table here\n"
+        "SELECT enrollee_id FROM um_universe",
+        "R10",
+    )  # must not raise
+
+
+def test_data_modifying_cte_is_rejected():
+    # A CTE can smuggle a real write and still parse as an overall SELECT —
+    # `WHERE 1=0` wrapping in validate_sql() would NOT stop the DELETE from
+    # firing as a side effect, so the guard must scan the whole body, not
+    # just check whether the statement starts with SELECT.
+    sql = (
+        "WITH t AS (DELETE FROM um_universe RETURNING enrollee_id) "
+        "SELECT * FROM t"
+    )
+    with pytest.raises(UnsafeRuleSQLError):
+        check_no_dml_ddl(sql, "R11")
+
+
+def test_validate_rule_params_rejects_unsafe_raw_sql_rule():
+    rule = {
+        "rule_code": "R12",
+        "sql_dialect": "postgres",
+        "primary_key_columns": "enrollee_id",
+        "rule_syntax": "INSERT INTO um_universe VALUES ('X','Y','Denied',NULL,'2026-01-01')",
+    }
+    err = validate_rule_params(rule)
+    assert err is not None
+    assert "INSERT" in err
+
+
+def test_validate_rule_params_rejects_unsafe_legacy_fragment_rule():
+    rule = {
+        "rule_code": "R13",
+        "rule_syntax": "1=1; DROP TABLE um_universe;--",
+    }
+    err = validate_rule_params(rule)
+    assert err is not None
+    assert "DROP" in err
+
+
+def test_build_rule_sql_raises_for_unsafe_raw_sql():
+    rule = {
+        "rule_code": "R14",
+        "sql_dialect": "postgres",
+        "primary_key_columns": "enrollee_id",
+        "rule_syntax": "UPDATE um_universe SET denial_reason = 'x'",
+    }
+    with pytest.raises(UnsafeRuleSQLError):
+        build_rule_sql(rule, table="um_universe", filter_sql="1=1", source_type="postgresql")
+
+
+def test_build_query_raises_for_unsafe_raw_sql_end_to_end():
+    rule = {
+        "rule_code": "R15",
+        "sql_dialect": "postgres",
+        "primary_key_columns": "enrollee_id",
+        "src_tbl_nm": "um_universe",
+        "rule_syntax": "TRUNCATE TABLE um_universe",
+    }
+    with pytest.raises(UnsafeRuleSQLError):
+        build_query(rule, {"run_mode": "FULL"}, source_type="postgresql")
+
+
+def test_legitimate_raw_sql_rule_still_passes_guard():
+    # Sanity check: a normal negative-SQL rule with joins/CTEs and no
+    # write keywords must sail through untouched.
+    rule = {
+        "rule_code": "R16",
+        "sql_dialect": "postgres",
+        "primary_key_columns": "enrollee_id",
+        "rule_syntax": (
+            "WITH denied AS (SELECT * FROM um_universe WHERE request_disposition = 'Denied') "
+            "SELECT enrollee_id FROM denied WHERE denial_reason IS NULL"
+        ),
+    }
+    assert validate_rule_params(rule) is None
+    sql, level = build_rule_sql(rule, table="um_universe", filter_sql="1=1", source_type="postgresql")
+    assert level == "ROW"
+    assert "denied" in sql.lower()
 
 
 # ── Raw-SQL rule authoring (end-to-end against DuckDB) ──────────────────
@@ -181,3 +289,52 @@ def test_evaluate_rule_and_operator_requires_both_breaches():
         severity="ERROR", threshold_operator="AND",
     )
     assert status2 == "FAIL"  # 50% > 5% AND 50 > 10
+
+
+# ── Static audit report (core/reporting.py) ──────────────────────────────
+
+def test_generate_report_end_to_end():
+    conn = duckdb.connect(":memory:")
+    # dq_run_control is scope_id-keyed, not raw project_name/process_name
+    # (see ddl.sql v7) — generate_report() joins dq_scope to recover them.
+    conn.execute("""
+        CREATE TABLE dq_scope (scope_id INTEGER, project_name VARCHAR, process_name VARCHAR)
+    """)
+    conn.execute("INSERT INTO dq_scope VALUES (1, 'HEALTHSPRING_UM', 'UNIVERSE_VALIDATION')")
+    conn.execute("""
+        CREATE TABLE dq_run_control (run_id VARCHAR, scope_id INTEGER,
+            run_type VARCHAR, run_mode VARCHAR)
+    """)
+    conn.execute("INSERT INTO dq_run_control VALUES ('RUN1',1,'WEEKLY','DATE')")
+
+    conn.execute("""
+        CREATE TABLE dq_rule_execution (run_id VARCHAR, rule_code VARCHAR, status VARCHAR,
+            total_records INTEGER, failed_records INTEGER, failure_pct FLOAT,
+            severity VARCHAR, execution_time FLOAT, run_timestamp TIMESTAMP)
+    """)
+    conn.execute("""
+        INSERT INTO dq_rule_execution VALUES
+        ('RUN1','UM-REQ-001','FAIL',1000,5,0.5,'Data Validation Error',1.2, CURRENT_TIMESTAMP),
+        ('RUN1','UM-SLA-STD-001','PASS',1000,0,0.0,'Timeliness',0.9, CURRENT_TIMESTAMP)
+    """)
+
+    conn.execute("""
+        CREATE TABLE dq_exceptions (exception_id INTEGER, run_id VARCHAR, rule_code VARCHAR,
+            table_name VARCHAR, primary_key_str VARCHAR, created_at TIMESTAMP)
+    """)
+    conn.execute("""
+        INSERT INTO dq_exceptions VALUES
+        (1,'RUN1','UM-REQ-001','um_universe','enrollee_id=E1', CURRENT_TIMESTAMP)
+    """)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = generate_report(conn, "main", "RUN1", tmp)
+        assert os.path.exists(path)
+        content = open(path).read()
+        assert "UM-REQ-001" in content
+        assert "RUN1" in content
+        assert "immutable" in content.lower()
+
+        # Re-generating with identical data should not create a second file / should be idempotent.
+        path2 = generate_report(conn, "main", "RUN1", tmp)
+        assert path == path2

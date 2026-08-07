@@ -47,12 +47,13 @@ from core.metrics import calculate_metrics, detect_and_log as detect_anomalies
 from core.rule_lifecycle import is_suppressed, record_suppressed_execution, snapshot_changed_rules
 from core.profiler import profile_tables_for_run
 from utils.ids import generate_run_id
+from utils.db_helpers import get_scope_id, find_scope_id
 from utils.metadata_writers import log_message
 from utils.alert import send_alert
 from core import reporting
 from utils.validation import validate_table_exists
 from utils.metadata_writers import log_issue
-from core.rule_sql import check_dialect, DialectMismatchError
+from core.rule_sql import check_dialect, DialectMismatchError, check_no_dml_ddl, UnsafeRuleSQLError
 
 # ── Configurable log level (DQ_LOG_LEVEL overrides; default INFO) ─────────────
 _log_level = getattr(logging, os.getenv("DQ_LOG_LEVEL", "INFO").upper(), logging.INFO)
@@ -158,6 +159,7 @@ def run_engine(
 
     run = {
         "run_id":       run_id,
+        "scope_id":     get_scope_id(td, project, process, meta_db),
         "project_name": project,
         "process_name": process,
         "run_type":     run_type,
@@ -553,6 +555,25 @@ def _pre_validate_rules(rules: list, cf, run: dict, meta_db: str, td) -> list:
                       f"Pre-validation failed: {exc}", str(exc), meta_db=meta_db)
             continue
 
+        # rule_syntax must be read-only — checked before it ever touches a
+        # live connection (see core/rule_sql.py::check_no_dml_ddl for why a
+        # generic SQL_SYNTAX failure isn't good enough: a data-modifying
+        # CTE still parses as a SELECT and would otherwise only be caught
+        # by validate_sql()'s dry-run below, by which point the write has
+        # already happened).
+        try:
+            check_no_dml_ddl(rule.get("rule_syntax") or "", code)
+        except UnsafeRuleSQLError as exc:
+            invalid.append(code)
+            log_message(td, run["run_id"], "ERROR",
+                        f"Pre-validation unsafe rule_syntax in rule {code}: {exc}",
+                        rule_id=rule.get("rule_id"), rule_code=code,
+                        error_code="UNSAFE_RULE_SQL", error_detail=str(exc),
+                        meta_db=meta_db)
+            log_issue(td, run, rule, "UNSAFE_RULE_SQL",
+                      f"Pre-validation failed: {exc}", str(exc), meta_db=meta_db)
+            continue
+
         try:
             if hasattr(db_conn, "prepare"):
                 db_conn.prepare(rule)
@@ -653,15 +674,14 @@ def _cleanup_stale_runs(td, meta_db: str):
 def _insert_run_control(td, run: dict, meta_db: str):
     sql = f"""
         INSERT INTO {meta_db}.dq_run_control (
-            run_id, project_name, process_name, run_type, run_mode,
+            run_id, scope_id, run_type, run_mode,
             batch_id, dataset_id, start_date, end_date,
             triggered_by, start_time, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'SYSTEM', CURRENT_TIMESTAMP, 'RUNNING', CURRENT_TIMESTAMP)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SYSTEM', CURRENT_TIMESTAMP, 'RUNNING', CURRENT_TIMESTAMP)
     """
     execute_dml(td, sql, [
         run["run_id"],
-        run["project_name"],
-        run["process_name"],
+        run["scope_id"],
         run["run_type"],
         run["run_mode"],
         run.get("batch_id") or "",
@@ -676,32 +696,48 @@ def _load_rules(td, project: str, process: str, meta_db: str) -> list:
     """
     Load active rules for project/process, ordered by priority then rule_id.
     fix #11: ORDER BY priority ASC ensures lower-priority-value rules run first.
+
+    dq_rules is keyed by scope_id, not raw project_name/process_name — the
+    scope lookup is read-only (find_scope_id, not get_scope_id): a
+    project/process nobody has ever run rules for simply has no scope row,
+    which correctly yields zero rules rather than creating one.
+    project_name/process_name are joined back in so each returned rule dict
+    still exposes those keys, since a lot of downstream code (profiler
+    config matching, rule_tester printouts, etc.) reads rule.get("project_name").
     """
+    scope_id = find_scope_id(td, project, process, meta_db)
+    if scope_id is None:
+        return []
     sql = f"""
-        SELECT *
-        FROM {meta_db}.dq_rules
-        WHERE project_name = '{project}'
-          AND process_name = '{process}'
-          AND active_flag  = 1
-        ORDER BY priority ASC, rule_id ASC
+        SELECT r.*, s.project_name, s.process_name
+        FROM {meta_db}.dq_rules r
+        JOIN {meta_db}.dq_scope s ON s.scope_id = r.scope_id
+        WHERE r.scope_id    = ?
+          AND r.active_flag = 1
+        ORDER BY r.priority ASC, r.rule_id ASC
     """
-    return execute_query(td, sql)
+    return execute_query(td, sql, [scope_id])
 
 
 def _count_issues(td, run_id: str, meta_db: str) -> int:
     rows = execute_query(
         td,
-        f"SELECT COUNT(*) AS cnt FROM {meta_db}.dq_rule_issues WHERE run_id = '{run_id}'"
+        f"SELECT COUNT(*) AS cnt FROM {meta_db}.dq_rule_issues WHERE run_id = ?",
+        [run_id],
     )
     return rows[0]["cnt"] if rows else 0
 
 
 def _update_run_control(td, run_id: str, status: str, meta_db: str):
+    # run_id traces back to CLI/Lambda-event project/process/batch_id input
+    # (see utils/ids.py::generate_run_id) — parameterized rather than
+    # f-string interpolated so a stray quote in a project name can't ever
+    # reach the SQL text, not just because it currently can't.
     execute_dml(td, f"""
         UPDATE {meta_db}.dq_run_control
         SET end_time = CURRENT_TIMESTAMP,
-            status   = '{status}'
-        WHERE run_id = '{run_id}'
-    """)
+            status   = ?
+        WHERE run_id = ?
+    """, [status, run_id])
     logger.info("Run control updated: %s -> %s", run_id, status)
 

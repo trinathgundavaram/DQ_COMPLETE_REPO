@@ -29,11 +29,11 @@ boto3>=1.34.0          # optional — only needed if resolving credentials via
                         # boto3 session chain rather than instance/task role
 
 # ── Local Python server execution context (Section 2) ────────────────────
-APScheduler>=3.10.0    # in-process cron for entrypoints/cron_runner.py --schedule
+APScheduler>=3.10.0    # in-process cron for entrypoints.py --schedule
 
 # ── Airflow execution context (Section 2) ─────────────────────────────────
 # apache-airflow is NOT pinned here — install whatever version your Airflow
-# environment already runs; entrypoints/airflow_operator.py degrades
+# environment already runs; entrypoints.py degrades
 # gracefully (plain-callable only) if apache-airflow is absent.
 
 # ── Dashboard (Section 3.6) ────────────────────────────────────────────────

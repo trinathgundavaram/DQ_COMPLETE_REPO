@@ -65,6 +65,7 @@ def calculate_metrics(td, run: dict, meta_db: str) -> dict:
         cross_run_types  – list of {run_type, avg_score, min_score, max_score}
     """
     run_id   = run["run_id"]
+    scope_id = run["scope_id"]
     project  = run["project_name"]
     process  = run["process_name"]
     run_type = run["run_type"]
@@ -81,7 +82,7 @@ def calculate_metrics(td, run: dict, meta_db: str) -> dict:
 
     _upsert_metrics(td, run, current, meta_db)
 
-    baseline      = _get_baseline(td, project, process, run_type, meta_db)
+    baseline      = _get_baseline(td, scope_id, run_type, meta_db)
     deviation_pct = 0.0
     breached      = False
 
@@ -123,7 +124,7 @@ def calculate_metrics(td, run: dict, meta_db: str) -> dict:
                 "WARN",
             )
 
-    cross  = _compare_run_types(td, project, process, meta_db)
+    cross  = _compare_run_types(td, scope_id, meta_db)
     result = {
         "current":         current,
         "baseline":        baseline,
@@ -152,9 +153,9 @@ def _aggregate_current_run(td, run_id: str, meta_db: str):
             COALESCE(SUM(failed_records), 0)                                AS failed_records,
             COALESCE(AVG(failure_pct),    0)                                AS avg_failure_pct
         FROM {meta_db}.dq_rule_execution
-        WHERE run_id = '{run_id}'
+        WHERE run_id = ?
     """
-    rows = execute_query(td, sql)
+    rows = execute_query(td, sql, [run_id])
     if not rows:
         return None
 
@@ -188,8 +189,7 @@ def _upsert_metrics(td, run: dict, current: dict, meta_db: str):
     today     = date.today()
     run_month = date(today.year, today.month, 1).strftime("%Y-%m-%d")
 
-    project    = run["project_name"]
-    process    = run.get("process_name") or ""
+    scope_id   = run["scope_id"]
     run_type   = run["run_type"]
     batch_id   = run.get("batch_id")   or ""
     dataset_id = run.get("dataset_id") or ""
@@ -202,50 +202,60 @@ def _upsert_metrics(td, run: dict, current: dict, meta_db: str):
     avg_fail_pct   = current["avg_failure_pct"]
     dq_score       = current["dq_score"]
 
+    # scope_id/run_type/batch_id/dataset_id trace back to CLI/Lambda-event
+    # input (see utils/ids.py::generate_run_id and run["scope_id"] resolution
+    # in engine.py) — bound as params rather than interpolated so a stray
+    # quote can never reach the SQL text.
     merge_sql = f"""
         MERGE INTO {meta_db}.dq_metrics_summary AS tgt
         USING (
             SELECT
-                '{project}'    AS project_name,
-                '{process}'    AS process_name,
-                '{run_type}'   AS run_type,
-                '{batch_id}'   AS batch_id,
-                '{dataset_id}' AS dataset_id,
-                DATE '{run_month}' AS run_month
+                ? AS scope_id,
+                ? AS run_type,
+                ? AS batch_id,
+                ? AS dataset_id,
+                CAST(? AS DATE) AS run_month
         ) AS src
-        ON  tgt.project_name = src.project_name
-        AND tgt.process_name = src.process_name
+        ON  tgt.scope_id     = src.scope_id
         AND tgt.run_type     = src.run_type
         AND tgt.batch_id     = src.batch_id
         AND tgt.dataset_id   = src.dataset_id
         AND tgt.run_month    = src.run_month
         WHEN MATCHED THEN UPDATE SET
             total_runs      = tgt.total_runs + 1,
-            total_rules     = tgt.total_rules     + {total_rules},
-            failed_rules    = tgt.failed_rules    + {failed_rules},
-            passed_rules    = tgt.passed_rules    + {passed_rules},
-            total_records   = tgt.total_records   + {total_records},
-            failed_records  = tgt.failed_records  + {failed_records},
-            avg_failure_pct = (tgt.avg_failure_pct * tgt.total_runs + {avg_fail_pct})
+            total_rules     = tgt.total_rules     + ?,
+            failed_rules    = tgt.failed_rules    + ?,
+            passed_rules    = tgt.passed_rules    + ?,
+            total_records   = tgt.total_records   + ?,
+            failed_records  = tgt.failed_records  + ?,
+            avg_failure_pct = (tgt.avg_failure_pct * tgt.total_runs + ?)
                               / (tgt.total_runs + 1),
-            dq_score        = (tgt.dq_score        * tgt.total_runs + {dq_score})
+            dq_score        = (tgt.dq_score        * tgt.total_runs + ?)
                               / (tgt.total_runs + 1),
             created_at      = CURRENT_TIMESTAMP
         WHEN NOT MATCHED THEN INSERT (
-            project_name, process_name, run_type, batch_id, dataset_id,
+            scope_id, run_type, batch_id, dataset_id,
             run_month, total_runs, total_rules, failed_rules, passed_rules,
             total_records, failed_records, avg_failure_pct, dq_score, created_at
         ) VALUES (
-            '{project}', '{process}', '{run_type}', '{batch_id}', '{dataset_id}',
-            DATE '{run_month}', 1, {total_rules}, {failed_rules}, {passed_rules},
-            {total_records}, {failed_records}, {avg_fail_pct}, {dq_score},
+            ?, ?, ?, ?,
+            CAST(? AS DATE), 1, ?, ?, ?,
+            ?, ?, ?, ?,
             CURRENT_TIMESTAMP
         )
     """
+    merge_params = [
+        scope_id, run_type, batch_id, dataset_id, run_month,
+        total_rules, failed_rules, passed_rules, total_records, failed_records,
+        avg_fail_pct, dq_score,
+        scope_id, run_type, batch_id, dataset_id, run_month,
+        total_rules, failed_rules, passed_rules,
+        total_records, failed_records, avg_fail_pct, dq_score,
+    ]
 
     try:
-        execute_dml(td, merge_sql)
-        logger.info("dq_metrics_summary upserted for %s/%s/%s.", project, process, run_type)
+        execute_dml(td, merge_sql, merge_params)
+        logger.info("dq_metrics_summary upserted for scope_id=%s/%s.", scope_id, run_type)
 
     except Exception as merge_err:
         # Fix #3: unique-index violation — another concurrent run inserted first.
@@ -253,8 +263,8 @@ def _upsert_metrics(td, run: dict, current: dict, meta_db: str):
         err_str = str(merge_err).lower()
         if any(k in err_str for k in ("unique", "duplicate", "2801", "primary index")):
             logger.warning(
-                "MERGE unique-index conflict for %s/%s/%s — falling back to UPDATE.",
-                project, process, run_type,
+                "MERGE unique-index conflict for scope_id=%s/%s — falling back to UPDATE.",
+                scope_id, run_type,
             )
             _fallback_update(td, run, current, run_month, meta_db)
         else:
@@ -266,8 +276,7 @@ def _fallback_update(td, run: dict, current: dict, run_month: str, meta_db: str)
     Pure UPDATE path when MERGE hits a unique-index race (fix #3).
     Uses the same weighted cumulative average formula as the MERGE.
     """
-    project    = run["project_name"]
-    process    = run.get("process_name") or ""
+    scope_id   = run["scope_id"]
     run_type   = run["run_type"]
     batch_id   = run.get("batch_id")   or ""
     dataset_id = run.get("dataset_id") or ""
@@ -275,28 +284,33 @@ def _fallback_update(td, run: dict, current: dict, run_month: str, meta_db: str)
     sql = f"""
         UPDATE {meta_db}.dq_metrics_summary SET
             total_runs      = total_runs + 1,
-            total_rules     = total_rules     + {current['total_rules']},
-            failed_rules    = failed_rules    + {current['failed_rules']},
-            passed_rules    = passed_rules    + {current['passed_rules']},
-            total_records   = total_records   + {current['total_records']},
-            failed_records  = failed_records  + {current['failed_records']},
-            avg_failure_pct = (avg_failure_pct * total_runs + {current['avg_failure_pct']})
+            total_rules     = total_rules     + ?,
+            failed_rules    = failed_rules    + ?,
+            passed_rules    = passed_rules    + ?,
+            total_records   = total_records   + ?,
+            failed_records  = failed_records  + ?,
+            avg_failure_pct = (avg_failure_pct * total_runs + ?)
                               / (total_runs + 1),
-            dq_score        = (dq_score        * total_runs + {current['dq_score']})
+            dq_score        = (dq_score        * total_runs + ?)
                               / (total_runs + 1),
             created_at      = CURRENT_TIMESTAMP
-        WHERE project_name = '{project}'
-          AND process_name = '{process}'
-          AND run_type     = '{run_type}'
-          AND batch_id     = '{batch_id}'
-          AND dataset_id   = '{dataset_id}'
-          AND run_month    = DATE '{run_month}'
+        WHERE scope_id     = ?
+          AND run_type     = ?
+          AND batch_id     = ?
+          AND dataset_id   = ?
+          AND run_month    = CAST(? AS DATE)
     """
-    execute_dml(td, sql)
-    logger.info("Fallback UPDATE applied for %s/%s/%s.", project, process, run_type)
+    params = [
+        current['total_rules'], current['failed_rules'], current['passed_rules'],
+        current['total_records'], current['failed_records'],
+        current['avg_failure_pct'], current['dq_score'],
+        scope_id, run_type, batch_id, dataset_id, run_month,
+    ]
+    execute_dml(td, sql, params)
+    logger.info("Fallback UPDATE applied for scope_id=%s/%s.", scope_id, run_type)
 
 
-def _get_baseline(td, project: str, process: str, run_type: str, meta_db: str):
+def _get_baseline(td, scope_id: int, run_type: str, meta_db: str):
     """Rolling average dq_score over the last BASELINE_LOOKBACK runs."""
     sql = f"""
         SELECT
@@ -308,13 +322,12 @@ def _get_baseline(td, project: str, process: str, run_type: str, meta_db: str):
         FROM (
             SELECT dq_score, avg_failure_pct, total_runs, run_month
             FROM {meta_db}.dq_metrics_summary
-            WHERE project_name = '{project}'
-              AND process_name = '{process}'
-              AND run_type     = '{run_type}'
+            WHERE scope_id      = ?
+              AND run_type     = ?
             QUALIFY ROW_NUMBER() OVER (ORDER BY run_month DESC) <= {BASELINE_LOOKBACK}
         ) sub
     """
-    rows = execute_query(td, sql)
+    rows = execute_query(td, sql, [scope_id, run_type])
     if not rows or rows[0].get("avg_dq_score") is None:
         return None
 
@@ -328,7 +341,7 @@ def _get_baseline(td, project: str, process: str, run_type: str, meta_db: str):
     }
 
 
-def _compare_run_types(td, project: str, process: str, meta_db: str) -> list:
+def _compare_run_types(td, scope_id: int, meta_db: str) -> list:
     sql = f"""
         SELECT
             run_type,
@@ -339,12 +352,11 @@ def _compare_run_types(td, project: str, process: str, meta_db: str) -> list:
             SUM(total_runs)       AS total_runs,
             MAX(run_month)        AS latest_run_month
         FROM {meta_db}.dq_metrics_summary
-        WHERE project_name = '{project}'
-          AND process_name = '{process}'
+        WHERE scope_id = ?
         GROUP BY run_type
         ORDER BY run_type
     """
-    rows = execute_query(td, sql)
+    rows = execute_query(td, sql, [scope_id])
     return [
         {
             "run_type":         r["run_type"],
@@ -395,12 +407,15 @@ def detect_and_log(td_conn, run: dict, meta_db: str) -> List[dict]:
     Returns a list of anomaly dicts (empty if none detected or insufficient
     history).
     """
+    scope_id = run.get("scope_id")
     project  = run.get("project_name", "")
     process  = run.get("process_name", "")
     run_type = run.get("run_type", "")
     run_id   = run.get("run_id", "")
 
-    # Load detection config (most-specific match wins)
+    # Load detection config (most-specific match wins) — dq_anomaly_config
+    # is a low-cardinality wildcard table, still matched on raw project/
+    # process, not scope_id; see the v7 note in ddl.sql.
     cfg = _load_config(td_conn, project, process, run_type, meta_db, execute_query)
 
     method    = cfg["method"].upper()
@@ -410,14 +425,14 @@ def detect_and_log(td_conn, run: dict, meta_db: str) -> List[dict]:
     do_alert  = cfg["alert_on_anomaly"]
 
     # Load current run's metrics
-    current = _load_current_metrics(td_conn, project, process, run_type,
+    current = _load_current_metrics(td_conn, scope_id, run_type,
                                      run_id, meta_db, execute_query)
     if current is None:
         logger.debug("No metrics row found for run %s — skipping anomaly detection.", run_id)
         return []
 
     # Load historical metrics (excluding current run)
-    history = _load_history(td_conn, project, process, run_type,
+    history = _load_history(td_conn, scope_id, run_type,
                             run_id, meta_db, execute_query)
 
     if len(history) < min_hist:
@@ -440,60 +455,30 @@ def detect_and_log(td_conn, run: dict, meta_db: str) -> List[dict]:
     for metric_name, current_val, hist_vals, higher_is_better in metrics_to_check:
         if current_val is None:
             continue
-        hist_clean = [v for v in hist_vals if v is not None]
-        if len(hist_clean) < min_hist:
-            continue
 
-        hist_mean = statistics.mean(hist_clean)
-        hist_std  = None
-        try:
-            hist_std = statistics.stdev(hist_clean)
-        except statistics.StatisticsError:
-            pass
+        # Math lives in evaluate_metric_drift() (below) so other frameworks
+        # -- currently sampling/anomaly.py's candidate-pool volume check --
+        # can reuse the exact same z-score/IQR statistics as a plain
+        # library call. This loop's job is just logging/persistence.
+        detections = evaluate_metric_drift(
+            current_val, hist_vals, method=method,
+            zscore_threshold=zthresh, iqr_multiplier=iqr_mult, min_history=min_hist,
+        )
 
-        detections = []
-
-        # ── Z-score detection ─────────────────────────────────────────────
-        if method in ("ZSCORE", "BOTH") and hist_std is not None and hist_std > 0:
-            z = (current_val - hist_mean) / hist_std
-            # For "higher is better" metrics (dq_score), a large negative z is the anomaly.
-            # For "lower is better" (failure rates), a large positive z is the anomaly.
-            is_anomaly = abs(z) > zthresh
-            sev        = _zscore_severity(abs(z), zthresh)
-            detections.append({
-                "method":    "ZSCORE",
-                "z_score":   round(z, 4),
-                "is_anomaly": is_anomaly,
-                "severity":  sev,
-            })
-            if is_anomaly:
-                direction = "below" if z < 0 else "above"
+        for det in detections:
+            if det["method"] == "ZSCORE" and det["is_anomaly"]:
+                direction = "below" if det["z_score"] < 0 else "above"
                 logger.warning(
                     "ANOMALY [z-score] %s: %s | current=%.4f μ=%.4f σ=%.4f z=%.2f (%s by %.1fσ)",
-                    run_id, metric_name, current_val, hist_mean,
-                    hist_std, z, direction, abs(z),
+                    run_id, metric_name, current_val, det["historical_mean"],
+                    det["historical_std"], det["z_score"], direction, abs(det["z_score"]),
                 )
-
-        # ── IQR detection ─────────────────────────────────────────────────
-        if method in ("IQR", "BOTH") and len(hist_clean) >= 4:
-            lower, upper = _iqr_bounds(hist_clean, iqr_mult)
-            is_anomaly   = (current_val < lower) or (current_val > upper)
-            sev          = _iqr_severity(current_val, lower, upper)
-            detections.append({
-                "method":      "IQR",
-                "iqr_lower":   round(lower, 4),
-                "iqr_upper":   round(upper, 4),
-                "is_anomaly":  is_anomaly,
-                "severity":    sev,
-            })
-            if is_anomaly:
+            if det["method"] == "IQR" and det["is_anomaly"]:
                 logger.warning(
                     "ANOMALY [IQR] %s: %s | current=%.4f bounds=[%.4f, %.4f]",
-                    run_id, metric_name, current_val, lower, upper,
+                    run_id, metric_name, current_val, det["iqr_lower"], det["iqr_upper"],
                 )
 
-        # Persist each detection as a separate row
-        for det in detections:
             if det["is_anomaly"]:
                 anomalies.append({
                     "metric_name":   metric_name,
@@ -504,13 +489,10 @@ def detect_and_log(td_conn, run: dict, meta_db: str) -> List[dict]:
 
             insert_rows.append((
                 run_id,
-                project,
-                process,
-                run_type,
                 metric_name,
                 current_val,
-                round(hist_mean, 6),
-                round(hist_std, 6) if hist_std is not None else None,
+                det.get("historical_mean"),
+                det.get("historical_std"),
                 det.get("z_score"),
                 det.get("iqr_lower"),
                 det.get("iqr_upper"),
@@ -522,13 +504,15 @@ def detect_and_log(td_conn, run: dict, meta_db: str) -> List[dict]:
     # Persist to dq_anomaly_log
     if insert_rows:
         try:
+            # project_name/process_name/run_type are NOT stored — derivable via
+            # run_id -> dq_run_control (they're set once at run start).
             sql = f"""
                 INSERT INTO {meta_db}.dq_anomaly_log (
-                    run_id, project_name, process_name, run_type,
+                    run_id,
                     metric_name, current_value, historical_mean, historical_std,
                     z_score, iqr_lower_bound, iqr_upper_bound,
                     is_anomaly, detection_method, severity, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """
             bulk_insert(td_conn, sql, insert_rows)
         except Exception as exc:
@@ -539,6 +523,93 @@ def detect_and_log(td_conn, run: dict, meta_db: str) -> List[dict]:
         _send_anomaly_alert(run, anomalies)
 
     return anomalies
+
+
+# ---------------------------------------------------------------------------
+# Public math API — reusable by other frameworks as a plain library call
+# ---------------------------------------------------------------------------
+
+def evaluate_metric_drift(
+    current_val: float,
+    history: list,
+    method: str = "BOTH",
+    zscore_threshold: float = 3.0,
+    iqr_multiplier: float = 1.5,
+    min_history: int = 1,
+) -> List[dict]:
+    """
+    Compare one current numeric value against a list of historical values
+    using z-score and/or IQR (Tukey fence) statistics. Pure function — no
+    DB access, no logging, no project/run context — so it's safe to reuse
+    from anywhere, not just detect_and_log() above.
+
+    This is the sanctioned reuse point for "sampling/ may use core/ as a
+    library, core/ never imports sampling/" (see DESIGN.md): sampling/
+    anomaly.py's candidate-pool volume drift check calls this directly
+    rather than reimplementing the same statistics. detect_and_log() also
+    calls it now, so there's exactly one implementation of this math.
+
+    Parameters
+    ----------
+    current_val : the value to test
+    history     : historical values to compare against (None entries are
+                  dropped automatically)
+    method      : "ZSCORE" | "IQR" | "BOTH"
+    zscore_threshold : |z| above this is flagged (ZSCORE method)
+    iqr_multiplier    : Tukey fence multiplier (IQR method; needs >= 4
+                        clean history points regardless of min_history)
+    min_history : minimum clean historical points required to run at all
+
+    Returns
+    -------
+    List of detection dicts (0, 1, or 2 entries — one per method that ran):
+        {"method": "ZSCORE", "z_score": float, "is_anomaly": bool,
+         "severity": str, "historical_mean": float, "historical_std": float|None}
+        {"method": "IQR", "iqr_lower": float, "iqr_upper": float,
+         "is_anomaly": bool, "severity": str,
+         "historical_mean": float, "historical_std": float|None}
+    Empty list if there isn't enough clean history to compare against.
+    """
+    hist_clean = [v for v in history if v is not None]
+    if len(hist_clean) < min_history:
+        return []
+
+    hist_mean = statistics.mean(hist_clean)
+    hist_std  = None
+    try:
+        hist_std = statistics.stdev(hist_clean)
+    except statistics.StatisticsError:
+        pass
+
+    method = (method or "BOTH").upper()
+    detections = []
+
+    if method in ("ZSCORE", "BOTH") and hist_std is not None and hist_std > 0:
+        z = (current_val - hist_mean) / hist_std
+        is_anomaly = abs(z) > zscore_threshold
+        detections.append({
+            "method":          "ZSCORE",
+            "z_score":         round(z, 4),
+            "is_anomaly":      is_anomaly,
+            "severity":        _zscore_severity(abs(z), zscore_threshold),
+            "historical_mean": round(hist_mean, 6),
+            "historical_std":  round(hist_std, 6),
+        })
+
+    if method in ("IQR", "BOTH") and len(hist_clean) >= 4:
+        lower, upper = _iqr_bounds(hist_clean, iqr_multiplier)
+        is_anomaly = (current_val < lower) or (current_val > upper)
+        detections.append({
+            "method":          "IQR",
+            "iqr_lower":       round(lower, 4),
+            "iqr_upper":       round(upper, 4),
+            "is_anomaly":      is_anomaly,
+            "severity":        _iqr_severity(current_val, lower, upper),
+            "historical_mean": round(hist_mean, 6),
+            "historical_std":  round(hist_std, 6) if hist_std is not None else None,
+        })
+
+    return detections
 
 
 # ---------------------------------------------------------------------------
@@ -611,7 +682,7 @@ def _failed_rule_pct(row: Optional[dict]) -> Optional[float]:
 
 
 def _load_current_metrics(
-    td_conn, project, process, run_type, run_id, meta_db, execute_query
+    td_conn, scope_id, run_type, run_id, meta_db, execute_query
 ) -> Optional[dict]:
     """Load the dq_metrics_summary row for the just-completed run."""
     try:
@@ -620,12 +691,11 @@ def _load_current_metrics(
             f"""
             SELECT *
             FROM {meta_db}.dq_metrics_summary
-            WHERE project_name = ?
-              AND process_name = ?
-              AND run_type     = ?
+            WHERE scope_id  = ?
+              AND run_type  = ?
             ORDER BY created_at DESC
             """,
-            [project, process, run_type],
+            [scope_id, run_type],
         )
         return rows[0] if rows else None
     except Exception as exc:
@@ -634,10 +704,10 @@ def _load_current_metrics(
 
 
 def _load_history(
-    td_conn, project, process, run_type, current_run_id, meta_db, execute_query
+    td_conn, scope_id, run_type, current_run_id, meta_db, execute_query
 ) -> list:
     """
-    Load historical dq_metrics_summary rows for the same project/process/run_type,
+    Load historical dq_metrics_summary rows for the same scope/run_type,
     excluding the current run's rows.
 
     Returns up to 100 most recent rows (sufficient for statistical purposes).
@@ -648,12 +718,11 @@ def _load_history(
             f"""
             SELECT dq_score, avg_failure_pct, total_rules, failed_rules
             FROM {meta_db}.dq_metrics_summary
-            WHERE project_name = ?
-              AND process_name = ?
-              AND run_type     = ?
+            WHERE scope_id  = ?
+              AND run_type  = ?
             ORDER BY created_at DESC
             """,
-            [project, process, run_type],
+            [scope_id, run_type],
         )[:100]
     except Exception as exc:
         logger.warning("Could not load metrics history for anomaly detection: %s", exc)

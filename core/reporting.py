@@ -37,8 +37,8 @@ you'd hand an auditor or regulator a year later, proving what was flagged
 and when, that doesn't change if someone edits a dashboard filter
 afterward." Content-addressed (filename embeds a SHA-256 of its own
 content) and never regenerated in place — a later disposition shows up as
-a new dq_case_dispositions row and a new report run, never an edit to this
-file. Generated automatically at end-of-run when DQ_AUTO_AUDIT_REPORT=true,
+a new dq_exception_dispositions row and a new report run, never an edit
+to this file. Generated automatically at end-of-run when DQ_AUTO_AUDIT_REPORT=true,
 or on demand via `python -m core.reporting --run-id <run_id>`.
 
 Public API
@@ -97,11 +97,11 @@ def _load_routes(td, project: str, process: str, finding_class: str, meta_db: st
             SELECT route_id, project_name, process_name, finding_class, audience,
                    channel_type, destination, business_correctable_only
             FROM {meta_db}.dq_notification_routes
-            WHERE finding_class = '{finding_class}'
+            WHERE finding_class = ?
               AND active_flag = 1
-              AND (project_name IS NULL OR project_name = '{project}')
-              AND (process_name IS NULL OR process_name = '{process}')
-        """)
+              AND (project_name IS NULL OR project_name = ?)
+              AND (process_name IS NULL OR process_name = ?)
+        """, [finding_class, project, process])
     except Exception as exc:
         logger.warning("Could not load dq_notification_routes (%s) — using fallback channel: %s",
                        finding_class, exc)
@@ -136,10 +136,10 @@ def _business_correctable_summary(td, run: dict, meta_db: str) -> dict:
             SELECT e.rule_code, COUNT(*) AS exception_count
             FROM {meta_db}.dq_exceptions e
             JOIN {meta_db}.dq_rules r ON r.rule_id = e.rule_id
-            WHERE e.run_id = '{run["run_id"]}' AND r.business_correctable = 1
+            WHERE e.run_id = ? AND r.business_correctable = 1
             GROUP BY e.rule_code
             ORDER BY exception_count DESC
-        """)
+        """, [run["run_id"]])
     except Exception as exc:
         logger.warning("business_correctable summary query failed: %s", exc)
         return {"rows": [], "total": 0}
@@ -176,10 +176,10 @@ def _notify_engine_failure(td, run: dict, meta_db: str, engine_issue_rules: int)
         details = execute_query(td, f"""
             SELECT rule_code, status, COUNT(*) AS n
             FROM {meta_db}.dq_rule_execution
-            WHERE run_id = '{run_id}' AND status IN ('ERROR', 'SKIP')
+            WHERE run_id = ? AND status IN ('ERROR', 'SKIP')
             GROUP BY rule_code, status
             ORDER BY status, rule_code
-        """)
+        """, [run_id])
     except Exception:
         details = []
     detail_lines = "\n".join(f"  {d['rule_code']} — {d['status']}" for d in details) or "  (see dq_rule_issues)"
@@ -234,7 +234,7 @@ _REPORT_TEMPLATE = """<!DOCTYPE html>
   This is a point-in-time, immutable snapshot. Findings shown here reflect
   dq_exceptions and dq_rule_execution as of the generation timestamp above.
   Any later case disposition (waived/resolved/corrected) is recorded as a
-  NEW row in dq_case_dispositions and will NOT alter this file — see the
+  NEW row in dq_exception_dispositions and will NOT alter this file — see the
   live dashboard for current disposition status.
 </div>
 
@@ -257,7 +257,12 @@ def generate_report(td, meta_db: str, run_id: str, out_dir: str) -> str:
     """Build and write the static audit report for one run_id. Returns the path written."""
     from core.executor import execute_query
 
-    run_rows = execute_query(td, f"SELECT * FROM {meta_db}.dq_run_control WHERE run_id = '{run_id}'")
+    run_rows = execute_query(td, f"""
+        SELECT rc.*, s.project_name, s.process_name
+        FROM {meta_db}.dq_run_control rc
+        JOIN {meta_db}.dq_scope s ON s.scope_id = rc.scope_id
+        WHERE rc.run_id = ?
+    """, [run_id])
     if not run_rows:
         raise ValueError(f"No dq_run_control row found for run_id={run_id}")
     run_row = run_rows[0]
@@ -265,12 +270,12 @@ def generate_report(td, meta_db: str, run_id: str, out_dir: str) -> str:
     rule_rows = execute_query(td, f"""
         SELECT rule_code, status, total_records, failed_records, failure_pct,
                severity, execution_time, run_timestamp
-        FROM {meta_db}.dq_rule_execution WHERE run_id = '{run_id}' ORDER BY rule_code
-    """)
+        FROM {meta_db}.dq_rule_execution WHERE run_id = ? ORDER BY rule_code
+    """, [run_id])
     exception_rows = execute_query(td, f"""
         SELECT e.rule_code, e.table_name, e.primary_key_str, e.created_at
-        FROM {meta_db}.dq_exceptions e WHERE e.run_id = '{run_id}' ORDER BY e.rule_code, e.created_at
-    """)
+        FROM {meta_db}.dq_exceptions e WHERE e.run_id = ? ORDER BY e.rule_code, e.created_at
+    """, [run_id])
 
     rule_table = _rows_to_html_table(
         rule_rows,

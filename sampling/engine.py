@@ -1,15 +1,38 @@
 """
-core/stratified_sampling.py
-------------------------------
-Config-driven stratified/ranked sample selection.
+sampling/engine.py
+-------------------
+The Sampling Framework's entry point: config-driven stratified/ranked
+sample selection.
 
-This is deliberately a SEPARATE step from rule evaluation — it answers a
-different question than dq_rules does. Rules ask "is this row valid?"
-(pass/fail against the whole universe). Sampling asks "which N cases, out
-of a clean universe, are the highest-value ones for a human reviewer to
-look at this cycle?" That's a ranking/quota problem, not a pass/fail
-problem, so it gets its own module and its own output table
-(dq_sample_selections) rather than being shoehorned into dq_exceptions.
+This is a SEPARATE FRAMEWORK from the DQ Rules Engine in core/ — not a
+submodule of it. It answers a different question than dq_rules does.
+Rules ask "is this row valid?" (pass/fail against the whole universe).
+Sampling asks "which N cases, out of a clean universe, are the
+highest-value ones for a human reviewer to look at this cycle?" That's a
+ranking/quota problem, not a pass/fail problem, with its own config table
+(dq_sampling_config), its own output table (dq_sample_selections), and its
+own algorithm — it doesn't extend or wrap rule evaluation, and nothing in
+core/ imports from this package.
+
+What it reuses from the rules engine, as a plain library dependency (the
+direction only ever goes this way — core/ never imports from sampling/):
+  - core.executor.execute_query / bulk_insert — the same thin DB-driver
+    wrappers every adapter already uses; no reason to reimplement them.
+  - core.rule_sql.build_filter — the same BATCH/DATE/FULL run-mode
+    scoping machinery every rule uses, so a sampling config's
+    scope_column gets identical date-window handling for free.
+  - db.connection_factory.ConnectionFactory — the shared connector layer
+    (Teradata/Postgres/S3/etc.) — sampling pulls its universe table
+    through the exact same adapters rules do.
+  - core.metrics.evaluate_metric_drift, via sampling/anomaly.py — the
+    same z-score/IQR statistics core/ uses for DQ-score anomaly
+    detection, reused here to flag candidate-pool volume drift. See
+    sampling/anomaly.py's module docstring for why this is a sanctioned,
+    narrowly-scoped exception rather than a re-coupling: it's one pure,
+    DB-free function, never the rules-engine metrics tables themselves.
+That's the full extent of the coupling: three function imports and the
+connection factory. A deployment could run the sampling framework against
+a metadata store that has never run a single dq_rules row, and vice versa.
 
 Every project-specific detail lives in config (dq_sampling_config), not
 code: which connection/table to pull from, which column holds the
@@ -74,8 +97,12 @@ def run_stratified_sampling(cf, td, config: dict, run: dict, meta_db: str) -> di
     """
     from core.executor import execute_query, bulk_insert
     from core.rule_sql import build_filter
+    from sampling.anomaly import detect_candidate_pool_drift
 
-    sample_name = _slug(config.get("sample_name") or config["process_name"])
+    # sample_name is NOT NULL on dq_sampling_config — no project_name/
+    # process_name fallback needed (config no longer carries those columns
+    # anyway; it's scope_id-keyed, see ddl.sql v7).
+    sample_name = _slug(config["sample_name"])
     sample_run_id = f"{sample_name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
 
     conn_name = config["connection_name"]
@@ -117,9 +144,20 @@ def run_stratified_sampling(cf, td, config: dict, run: dict, meta_db: str) -> di
     candidates = execute_query(db_conn, query)
     logger.info("Stratified sampling: %d candidate rows after exclusions.", len(candidates))
 
+    # Candidate-pool volume drift check (config_id-scoped, against this
+    # config's own history in dq_sample_selections) -- non-fatal, mirrors
+    # how core/engine.py treats calculate_metrics()/detect_anomalies() as
+    # opt-in observability that must never block the run itself.
+    drift = {}
+    try:
+        drift = detect_candidate_pool_drift(td, config, sample_run_id, len(candidates), meta_db)
+    except Exception as exc:
+        logger.error("Candidate-pool drift detection failed (non-fatal): %s", exc, exc_info=True)
+
     if not candidates:
         return {"sample_run_id": sample_run_id, "candidates": 0,
-                "selected": 0, "target_volume": target_vol, "by_stratum": {}}
+                "selected": 0, "target_volume": target_vol, "by_stratum": {},
+                "volume_drift": drift}
 
     # Priority already applied via ORDER BY — assign an explicit rank so the
     # persisted record is self-describing even without re-running the query.
@@ -169,12 +207,14 @@ def run_stratified_sampling(cf, td, config: dict, run: dict, meta_db: str) -> di
     selected_keys = {_row_key(r, key_cols) for r in selected_rows}
 
     # ── Persist EVERY candidate (audit defensibility) ─────────────────────
+    # project_name/process_name are NOT stored — derivable via config_id ->
+    # dq_sampling_config.scope_id (see ddl.sql v7).
     insert_sql = f"""
         INSERT INTO {meta_db}.dq_sample_selections (
-            sample_run_id, config_id, project_name, process_name, sample_cycle,
+            sample_run_id, config_id, sample_cycle,
             case_key, determination_type, functional_area, priority_rank,
             excluded_flag, exclusion_reason, selected_flag, strata_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     """
     today = datetime.utcnow().date()
     insert_rows = []
@@ -184,8 +224,6 @@ def run_stratified_sampling(cf, td, config: dict, run: dict, meta_db: str) -> di
         insert_rows.append((
             sample_run_id,
             config.get("config_id"),
-            config["project_name"],
-            config["process_name"],
             today,
             key,
             str(row.get(determ_col)) if determ_col else None,
@@ -208,6 +246,7 @@ def run_stratified_sampling(cf, td, config: dict, run: dict, meta_db: str) -> di
         "selected":      len(selected_rows),
         "target_volume": target_vol,
         "by_stratum":    by_stratum,
+        "volume_drift":  drift,
     }
 
 

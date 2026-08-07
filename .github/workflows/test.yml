@@ -1,0 +1,79 @@
+name: Tests
+
+# Runs the full test suite (core/ rules engine + sampling/ framework) and a
+# compile sweep of every .py file on every push and pull request. No live
+# Teradata/Postgres/Databricks/SQL Server connection is required or used --
+# DuckDB stands in for the target databases throughout tests/ (see
+# tests/test_engine_e2e.py's module docstring for why that's a faithful
+# stand-in for the write path, not just the read path).
+#
+# Only pytest + duckdb are installed (NOT the full requirements.txt): the
+# optional source-system drivers (teradatasql, psycopg2-binary, pyodbc,
+# databricks-sql-connector) require system-level libraries CI doesn't have,
+# and db/adapters.py already imports every one of them behind its own
+# try/except ImportError guard specifically so the engine degrades
+# gracefully without them -- installing them here would make CI slower and
+# more fragile for zero test-coverage benefit.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest duckdb
+
+      - name: Compile every module (catches syntax errors independent of test coverage)
+        run: |
+          find . -name "*.py" -not -path "./.git/*" -print0 \
+            | xargs -0 -n1 python -m py_compile
+
+      - name: Run test suite
+        run: pytest tests/ -v
+
+      - name: Verify core/ never imports sampling/ (framework boundary)
+        run: |
+          python -c "
+          import ast, pathlib, sys
+
+          violations = []
+          for path in pathlib.Path('core').rglob('*.py'):
+              tree = ast.parse(path.read_text(), filename=str(path))
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      names = [a.name for a in node.names]
+                  elif isinstance(node, ast.ImportFrom):
+                      names = [node.module or '']
+                  else:
+                      continue
+                  if any(n == 'sampling' or n.startswith('sampling.') for n in names):
+                      violations.append(f'{path}: imports {names}')
+
+          if violations:
+              print('core/ must never import sampling/ -- one-directional dependency violated:')
+              for v in violations:
+                  print(f'  {v}')
+              sys.exit(1)
+          print('OK: core/ has no sampling/ imports.')
+          "

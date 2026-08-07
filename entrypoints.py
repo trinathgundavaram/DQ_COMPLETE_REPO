@@ -3,16 +3,24 @@ entrypoints.py
 -----------------
 Trigger/orchestration-specific wrappers — one function or class per
 execution context, all calling core.engine.run_engine() (the same function
-main.py's CLI calls). Nothing in core/, db/, or utils/ imports anything
-from this file — the dependency only goes one way. That's what "only the
-trigger differs" means in code: delete any one function below and the
-engine still works everywhere else. Adding a 4th execution context means
-adding one more function here, not a new file.
+main.py's CLI calls). Nothing in core/, db/, sampling/, or utils/ imports
+anything from this file — the dependency only goes one way. That's what
+"only the trigger differs" means in code: delete any one function below
+and the engine still works everywhere else. Adding a 4th execution context
+means adding one more function here, not a new file.
 
   lambda_handler(event, context)          — AWS Lambda
   glue_main()                              — AWS Glue (Python Shell or ETL-as-wrapper)
   run_dq_engine(...) / DataQualityEngineOperator — Airflow (plain callable + optional operator)
   cron_run_once(argv) / cron_run_scheduler(path) — local Python server (crontab or APScheduler)
+
+This file is where the two frameworks in this repo (core/ = DQ rules
+engine, sampling/ = stratified sampling) meet, but only at the
+orchestration level: cron_run_scheduler() can optionally chain a
+sampling.engine.run_stratified_sampling() call after a rules-engine run
+finishes (see _run_cron_sampling()), for deployments that want both on the
+same schedule. Neither framework imports the other; this file is the only
+place a single call chain touches both.
 
 Credentials/connections are always configured via the same DQ_* env vars
 regardless of which function below is the trigger.
@@ -205,8 +213,12 @@ def cron_run_scheduler(config_path: str):
           "run_mode": "DATE", "cron": "0 8 * * FRI", "lookback_days": 7,
           "sampling_config_name": "WEEKLY_REVIEW_SAMPLE"}]
 
-    "sampling_config_name" is optional — set it to also fire
-    core.stratified_sampling as a follow-on step after the engine run.
+    "sampling_config_name" is optional — set it to also fire the
+    Sampling Framework (sampling/engine.py) as a follow-on step after the
+    rules-engine run. The two frameworks stay decoupled even here: this
+    function just calls both in sequence and hands the rules-engine run_id
+    through for cross-referencing, the same way any other caller of
+    sampling.engine.run_stratified_sampling() would.
     """
     try:
         from apscheduler.schedulers.blocking import BlockingScheduler
@@ -247,9 +259,12 @@ def _run_cron_job(job: dict):
 
 
 def _run_cron_sampling(job: dict, engine_result: dict):
+    """Fire the Sampling Framework as a follow-on step after a rules-engine
+    cron job. This is the only place in entrypoints.py that touches both
+    frameworks — it's deployment glue, not a dependency between them."""
     from config.env_config import get_meta_db
     from core.executor import execute_query
-    from core.stratified_sampling import run_stratified_sampling
+    from sampling.engine import run_stratified_sampling
     from db.connection_factory import ConnectionFactory
 
     meta_db = get_meta_db()
@@ -259,8 +274,8 @@ def _run_cron_sampling(job: dict, engine_result: dict):
     try:
         rows = execute_query(td, f"""
             SELECT * FROM {meta_db}.dq_sampling_config
-            WHERE sample_name = '{job['sampling_config_name']}' AND active_flag = 1
-        """)
+            WHERE sample_name = ? AND active_flag = 1
+        """, [job['sampling_config_name']])
         if not rows:
             logger.warning("No active dq_sampling_config row named '%s'.", job["sampling_config_name"])
             return

@@ -6,6 +6,20 @@
 -- see the DQ_<NAME>_* env vars documented next to each connection row.
 -- ============================================================
 
+-- ── Scope (project/process dimension) ───────────────────────────────────
+-- dq_rules and dq_sampling_config below reference these by scope_id
+-- instead of each repeating its own project_name/process_name pair — see
+-- ddl.sql v7. HealthSpring UM uses two distinct scopes: the rule-engine
+-- process (UNIVERSE_VALIDATION) and the sampling process
+-- (COMO_WEEKLY_SAMPLE) are tracked separately since they run on different
+-- cadences and are two different "processes" within the same project.
+INSERT INTO CMSUNIV_FILELAND_T.dq_scope (project_name, process_name)
+VALUES ('HEALTHSPRING_UM', 'UNIVERSE_VALIDATION');
+
+INSERT INTO CMSUNIV_FILELAND_T.dq_scope (project_name, process_name)
+VALUES ('HEALTHSPRING_UM', 'COMO_WEEKLY_SAMPLE');
+
+
 -- ── Connections ──────────────────────────────────────────────────────────
 -- connection_name must match DQ_CONNECTION_NAMES and dq_rules.source_system.
 
@@ -38,13 +52,16 @@ VALUES
 
 -- ── COMO weekly stratified sample (Section 3.4) ─────────────────────────
 INSERT INTO CMSUNIV_FILELAND_T.dq_sampling_config (
-    config_id, project_name, process_name, sample_name, connection_name,
+    config_id, scope_id, sample_name, connection_name,
     universe_table, key_columns, scope_column, target_volume,
     determination_column, determination_mix_json,
     functional_area_column, functional_area_mix_json,
     exclusion_sql, priority_rank_sql, schedule_cron, active_flag
 ) VALUES (
-    1, 'HEALTHSPRING_UM', 'COMO_WEEKLY_SAMPLE', 'COMO_WEEKLY_SAMPLE', 'teradata',
+    1,
+    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+     WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'COMO_WEEKLY_SAMPLE'),
+    'COMO_WEEKLY_SAMPLE', 'teradata',
     'um_universe', 'enrollee_id, auth_or_claim_number', 'pull_date', 150,
     'request_disposition',
     '{"Denied": 0.80, "Withdrawn": 0.10, "Dismissed": 0.02, "Approved": 0.08}',
@@ -65,7 +82,7 @@ INSERT INTO CMSUNIV_FILELAND_T.dq_sampling_config (
 -- TODO once confirmed with COMO: the out-of-network subset of denials
 -- ("only a subset of denials being out-of-network") needs a hard cap
 -- beyond the mix config above — add a `secondary_cap_json` column or a
--- second-pass filter in core/stratified_sampling.py once the real target
+-- second-pass filter in sampling/engine.py once the real target
 -- percentage is known. Not guessed at here.
 
 

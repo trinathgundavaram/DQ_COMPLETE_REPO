@@ -1,0 +1,27 @@
+[
+  {
+    "project": "MY_PROJECT",
+    "process": "UNIVERSE_VALIDATION",
+    "run_type": "WEEKLY",
+    "run_mode": "DATE",
+    "cron": "0 8 * * FRI",
+    "lookback_days": 7,
+    "sampling_config_name": "WEEKLY_REVIEW_SAMPLE"
+  },
+  {
+    "project": "MY_PROJECT",
+    "process": "DAILY_FEED_CHECK",
+    "run_type": "DAILY",
+    "run_mode": "DATE",
+    "cron": "0 6 * * *",
+    "lookback_days": 1
+  },
+  {
+    "project": "MY_PROJECT",
+    "process": "MONTHLY_ROLLUP",
+    "run_type": "MONTHLY",
+    "run_mode": "BATCH",
+    "cron": "0 5 1 * *",
+    "batch_id": "MONTHLY_CLOSE"
+  }
+]

@@ -48,6 +48,7 @@ check_dialect(rule, source_type) -> None       (raises DialectMismatchError)
 """
 
 import logging
+import re
 from typing import Optional, Tuple
 
 from core.check_types import CHECK_CATALOG, get_level, _parse_params
@@ -56,6 +57,95 @@ from utils.db_helpers import resolve_table
 logger = logging.getLogger(__name__)
 
 _ALIAS = "t"
+
+
+# =============================================================================
+# Write-statement guard (rule_syntax must be read-only)
+# =============================================================================
+#
+# Raw-SQL and legacy-fragment rules (paths 1 and 3) hand rule authors a
+# free-text SQL string that ends up embedded in queries the engine executes
+# against a live connection (see _build_raw_sql / build_rule_sql below, and
+# core/executor.py's _count_failed/_fetch_failed_rows, which wrap it as
+# `SELECT COUNT(*) FROM (<rule_syntax>) x`). A bare DML/DDL statement in
+# that position is usually just a syntax error once wrapped in a subquery
+# -- but a data-modifying CTE (e.g. Postgres/DuckDB's
+# `WITH t AS (DELETE FROM foo RETURNING *) SELECT * FROM t`) still parses
+# as a SELECT overall and would execute the DELETE as a side effect the
+# moment the CTE is evaluated, including during validate_sql()'s syntax
+# dry-run. check_no_dml_ddl() closes that gap by rejecting any banned
+# keyword appearing outside a string literal or comment, regardless of
+# where in the statement it appears.
+
+class UnsafeRuleSQLError(Exception):
+    """Raised when rule_syntax contains a DML/DDL statement rule authors must never write."""
+
+
+_BANNED_SQL_KEYWORDS = {
+    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "MERGE",
+    "CREATE", "GRANT", "REVOKE", "EXEC", "EXECUTE", "CALL", "COPY",
+    "ATTACH", "DETACH", "VACUUM", "REPLACE", "PRAGMA",
+}
+
+
+def _strip_sql_noise(sql: str) -> str:
+    """
+    Strip string literals and comments so keyword scanning doesn't
+    false-positive on a banned word inside a quoted value (e.g.
+    WHERE status = 'DELETE_REQUESTED') or a comment. Not a full SQL
+    parser -- just enough to not choke on what rule authors actually write.
+    """
+    out = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'" and j + 1 < n and sql[j + 1] == "'":
+                    j += 2
+                    continue
+                if sql[j] == "'":
+                    j += 1
+                    break
+                j += 1
+            i = j
+            continue
+        if ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            nl = sql.find("\n", i)
+            i = n if nl == -1 else nl + 1
+            continue
+        if ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            end = sql.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def check_no_dml_ddl(rule_syntax: str, rule_code: str = "") -> None:
+    """
+    Raise UnsafeRuleSQLError if rule_syntax contains a DML/DDL keyword
+    outside a string literal or comment. Rule authors get a full
+    negative-SQL SELECT (subqueries, joins, CTEs feeding a SELECT) --
+    never a statement that writes to the database.
+
+    Called from both validate_rule_params() (load-time / pre-validation,
+    same call site as check_dialect() in core/engine.py) and directly from
+    the raw-SQL / legacy-fragment build paths below (execution-time
+    defense in depth, same pattern as check_dialect()'s second call site
+    in core/executor.py).
+    """
+    cleaned = _strip_sql_noise(rule_syntax or "")
+    words = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", cleaned.upper())
+    hit = next((w for w in words if w in _BANNED_SQL_KEYWORDS), None)
+    if hit:
+        raise UnsafeRuleSQLError(
+            f"{rule_code or '(unknown rule)'}: rule_syntax contains a disallowed "
+            f"DML/DDL keyword '{hit}'. Rules may only read data (SELECT, including "
+            f"CTEs that feed a SELECT) -- they must never write to the database."
+        )
 
 
 # =============================================================================
@@ -171,6 +261,7 @@ def build_rule_sql(rule: dict, table: str, filter_sql: str, source_type: str) ->
         sql = (rule.get("rule_syntax") or "").strip()
         if not sql:
             raise ValueError(f"Rule {rule.get('rule_code')} has no sql_dialect, check_type, or rule_syntax.")
+        check_no_dml_ddl(sql, rule.get("rule_code"))
         return sql, "ROW"
 
     if ct == "COLUMN_EXISTS":
@@ -183,6 +274,7 @@ def build_rule_sql(rule: dict, table: str, filter_sql: str, source_type: str) ->
         sql = (rule.get("rule_syntax") or "").strip()
         if not sql:
             raise ValueError(f"Unknown check_type '{ct}' and no rule_syntax fallback (rule_code={rule.get('rule_code')}).")
+        check_no_dml_ddl(sql, rule.get("rule_code"))
         return sql, "ROW"
 
     level, params, fn = spec["level"], _parse_params(rule), spec["fn"]
@@ -215,6 +307,8 @@ def _build_raw_sql(rule: dict, filter_sql: str) -> Tuple[str, str]:
     if not sql:
         raise ValueError(f"Rule {rule.get('rule_code')} declares sql_dialect='{rule.get('sql_dialect')}' but rule_syntax is empty.")
 
+    check_no_dml_ddl(sql, rule.get("rule_code"))
+
     if sql.endswith(";"):
         sql = sql[:-1].rstrip()
 
@@ -234,18 +328,29 @@ def validate_rule_params(rule: dict) -> Optional[str]:
         dialect = (rule.get("sql_dialect") or "").strip().lower()
         if dialect not in VALID_DIALECTS:
             return f"sql_dialect '{dialect}' is invalid — must be one of {', '.join(sorted(VALID_DIALECTS))}."
-        if not (rule.get("rule_syntax") or "").strip():
+        rule_syntax = (rule.get("rule_syntax") or "").strip()
+        if not rule_syntax:
             return "sql_dialect is set but rule_syntax is empty."
         if not (rule.get("primary_key_columns") or "").strip():
             return ("Raw SQL rules must declare primary_key_columns (the key_columns "
                    "identifying the audited entity in the rule's own SELECT).")
+        try:
+            check_no_dml_ddl(rule_syntax, rule.get("rule_code"))
+        except UnsafeRuleSQLError as exc:
+            return str(exc)
         return None
 
     ct = (rule.get("check_type") or "").strip().upper()
 
     if not ct:
-        return None if (rule.get("rule_syntax") or "").strip() else \
-               "sql_dialect/check_type are not set and rule_syntax is empty."
+        rule_syntax = (rule.get("rule_syntax") or "").strip()
+        if not rule_syntax:
+            return "sql_dialect/check_type are not set and rule_syntax is empty."
+        try:
+            check_no_dml_ddl(rule_syntax, rule.get("rule_code"))
+        except UnsafeRuleSQLError as exc:
+            return str(exc)
+        return None
 
     if ct == "COLUMN_EXISTS":
         return None if (rule.get("check_column") or "").strip() else "COLUMN_EXISTS requires check_column."

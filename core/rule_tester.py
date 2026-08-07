@@ -291,9 +291,12 @@ def test_rule(
 
 def _fetch_rule(td, rule_code: str, meta_db: str) -> Optional[dict]:
     """Load a single rule row from dq_rules by rule_code."""
+    # rule_code is CLI-supplied (see _cli() below) — bound as a param
+    # rather than interpolated.
     rows = execute_query(
         td,
-        f"SELECT * FROM {meta_db}.dq_rules WHERE rule_code = '{rule_code}'"
+        f"SELECT * FROM {meta_db}.dq_rules WHERE rule_code = ?",
+        [rule_code],
     )
     return rows[0] if rows else None
 

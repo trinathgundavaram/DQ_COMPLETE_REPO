@@ -56,10 +56,13 @@ Daily/monthly ROAR views reuse the SAME rule set with a different
 `--run-type` / date window — no rule changes needed; the dashboard's
 Daily/Weekly/Monthly selector reads whatever window you ask for.
 
-COMO weekly sample (run after universe validation completes, same week):
+COMO weekly sample (run after universe validation completes, same week).
+This is the **Sampling Framework** (`sampling/`) — a separate framework
+from the rules engine above, run as its own step; it just happens to
+follow a rules-engine run in this cadence:
 
 ```python
-from core.stratified_sampling import run_stratified_sampling
+from sampling.engine import run_stratified_sampling
 from core.executor import execute_query
 from db.connection_factory import ConnectionFactory
 from config.env_config import get_meta_db
@@ -75,8 +78,10 @@ run_stratified_sampling(cf, td, config, {
     "run_id": "COMO_MANUAL_RUN", "start_date": "2026-08-01", "end_date": "2026-08-07",
 }, meta_db)
 ```
-(`core/stratified_sampling.py` is generic — `COMO_WEEKLY_SAMPLE` here is
-just the `sample_name` value HealthSpring UM's own seed config uses.)
+(`sampling/engine.py` is generic — `COMO_WEEKLY_SAMPLE` here is just the
+`sample_name` value HealthSpring UM's own seed config uses. It reuses
+`core.executor`/`db.connection_factory` as a plain library, the same way
+this snippet does directly above — it isn't part of the rules engine.)
 
 Or schedule both via `python entrypoints.py --schedule` using a
 `schedule.json` with `"sampling_config_name": "COMO_WEEKLY_SAMPLE"` on the
