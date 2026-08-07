@@ -4,7 +4,7 @@ sampling/engine.py
 The Sampling Framework's entry point: config-driven stratified/ranked
 sample selection.
 
-This is a SEPARATE FRAMEWORK from the DQ Rules Engine in core/ — not a
+This is a SEPARATE FRAMEWORK from the DQ Rules Engine in rules_engine/ — not a
 submodule of it. It answers a different question than dq_rules does.
 Rules ask "is this row valid?" (pass/fail against the whole universe).
 Sampling asks "which N cases, out of a clean universe, are the
@@ -12,20 +12,20 @@ highest-value ones for a human reviewer to look at this cycle?" That's a
 ranking/quota problem, not a pass/fail problem, with its own config table
 (dq_sampling_config), its own output table (dq_sample_selections), and its
 own algorithm — it doesn't extend or wrap rule evaluation, and nothing in
-core/ imports from this package.
+rules_engine/ imports from this package.
 
 What it reuses from the rules engine, as a plain library dependency (the
-direction only ever goes this way — core/ never imports from sampling/):
-  - core.executor.execute_query / bulk_insert — the same thin DB-driver
+direction only ever goes this way — rules_engine/ never imports from sampling/):
+  - rules_engine.executor.execute_query / bulk_insert — the same thin DB-driver
     wrappers every adapter already uses; no reason to reimplement them.
-  - core.rule_sql.build_filter — the same BATCH/DATE/FULL run-mode
+  - rules_engine.rule_sql.build_filter — the same BATCH/DATE/FULL run-mode
     scoping machinery every rule uses, so a sampling config's
     scope_column gets identical date-window handling for free.
   - db.connection_factory.ConnectionFactory — the shared connector layer
     (Teradata/Postgres/S3/etc.) — sampling pulls its universe table
     through the exact same adapters rules do.
-  - core.metrics.evaluate_metric_drift, via sampling/anomaly.py — the
-    same z-score/IQR statistics core/ uses for DQ-score anomaly
+  - rules_engine.metrics.evaluate_metric_drift, via sampling/anomaly.py — the
+    same z-score/IQR statistics rules_engine/ uses for DQ-score anomaly
     detection, reused here to flag candidate-pool volume drift. See
     sampling/anomaly.py's module docstring for why this is a sanctioned,
     narrowly-scoped exception rather than a re-coupling: it's one pure,
@@ -95,13 +95,13 @@ def run_stratified_sampling(cf, td, config: dict, run: dict, meta_db: str) -> di
     -------
     dict summary: {sample_run_id, candidates, selected, target_volume, by_stratum}
     """
-    from core.executor import execute_query, bulk_insert
-    from core.rule_sql import build_filter
+    from rules_engine.executor import execute_query, bulk_insert
+    from rules_engine.rule_sql import build_filter
     from sampling.anomaly import detect_candidate_pool_drift
 
     # sample_name is NOT NULL on dq_sampling_config — no project_name/
     # process_name fallback needed (config no longer carries those columns
-    # anyway; it's scope_id-keyed, see ddl.sql v7).
+    # anyway; it's scope_id-keyed, see ddl_shared.sql v7).
     sample_name = _slug(config["sample_name"])
     sample_run_id = f"{sample_name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
 
@@ -146,7 +146,7 @@ def run_stratified_sampling(cf, td, config: dict, run: dict, meta_db: str) -> di
 
     # Candidate-pool volume drift check (config_id-scoped, against this
     # config's own history in dq_sample_selections) -- non-fatal, mirrors
-    # how core/engine.py treats calculate_metrics()/detect_anomalies() as
+    # how rules_engine/engine.py treats calculate_metrics()/detect_anomalies() as
     # opt-in observability that must never block the run itself.
     drift = {}
     try:
@@ -208,7 +208,7 @@ def run_stratified_sampling(cf, td, config: dict, run: dict, meta_db: str) -> di
 
     # ── Persist EVERY candidate (audit defensibility) ─────────────────────
     # project_name/process_name are NOT stored — derivable via config_id ->
-    # dq_sampling_config.scope_id (see ddl.sql v7).
+    # dq_sampling_config.scope_id (see ddl_shared.sql v7).
     insert_sql = f"""
         INSERT INTO {meta_db}.dq_sample_selections (
             sample_run_id, config_id, sample_cycle,

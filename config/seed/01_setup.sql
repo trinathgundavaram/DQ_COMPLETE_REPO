@@ -9,7 +9,7 @@
 -- ── Scope (project/process dimension) ───────────────────────────────────
 -- dq_rules and dq_sampling_config below reference these by scope_id
 -- instead of each repeating its own project_name/process_name pair — see
--- ddl.sql v7. HealthSpring UM uses two distinct scopes: the rule-engine
+-- ddl_shared.sql v7. HealthSpring UM uses two distinct scopes: the rule-engine
 -- process (UNIVERSE_VALIDATION) and the sampling process
 -- (COMO_WEEKLY_SAMPLE) are tracked separately since they run on different
 -- cadences and are two different "processes" within the same project.
@@ -102,7 +102,7 @@ VALUES
      'um-intake-correction-team@healthspring.example.com', 1, 1);
 
 -- ENGINE FAILURE -> ENGINEERING only. NEVER routed to ROAR/BUSINESS —
--- this is enforced by core/reporting.py routing on finding_class, not by
+-- this is enforced by rules_engine/reporting.py routing on finding_class, not by
 -- anything in this table; these rows just say where each class goes.
 INSERT INTO CMSUNIV_FILELAND_T.dq_notification_routes
     (route_id, project_name, process_name, finding_class, audience, channel_type, destination, business_correctable_only, active_flag)
@@ -122,7 +122,7 @@ VALUES
 
 -- ── Auto-determined thresholds (Section 3.4) ────────────────────────────
 -- z-score/IQR against each rule's OWN run history — reuses the engine's
--- existing anomaly detector (core/metrics.py), not a new mechanism.
+-- existing anomaly detector (rules_engine/metrics.py), not a new mechanism.
 INSERT INTO CMSUNIV_FILELAND_T.dq_anomaly_config
     (config_id, project_name, process_name, run_type, method,
      zscore_threshold, iqr_multiplier, min_history_runs, alert_on_anomaly)

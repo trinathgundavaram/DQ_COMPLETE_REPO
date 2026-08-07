@@ -39,6 +39,3 @@ APScheduler>=3.10.0    # in-process cron for entrypoints.py --schedule
 # ── Dashboard (Section 3.6) ────────────────────────────────────────────────
 streamlit>=1.32.0
 pandas>=2.0.0           # already listed above (file adapter) — reused by the dashboard
-
-# ── Testing ──────────────────────────────────────────────────────────────
-pytest>=7.4.0

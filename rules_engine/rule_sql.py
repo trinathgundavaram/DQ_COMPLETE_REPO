@@ -1,5 +1,5 @@
 """
-core/rule_sql.py
+rules_engine/rule_sql.py
 -------------------
 Everything involved in turning one dq_rules row into ready-to-run,
 dialect-safe SQL: the run-scope filter, the three rule-authoring paths, and
@@ -14,10 +14,10 @@ Three rule-authoring paths, checked in this order
    violating the rule (its own joins/subqueries/CTEs, any valid SQL for the
    declared dialect) — zero rows returned means the rule passed. check_type,
    if also set, is used ONLY as a dashboard/taxonomy classification tag
-   (see core/check_types.py) — it does not affect SQL generation here.
+   (see rules_engine/check_types.py) — it does not affect SQL generation here.
 
 2. Built-in check_type (check_type set, sql_dialect NOT set) — declarative
-   generation via core/check_types.py's 23 built-in generators, which
+   generation via rules_engine/check_types.py's 23 built-in generators, which
    already emit dialect-correct SQL per source_type. Good for simple,
    single-table checks that don't need custom SQL.
 
@@ -31,8 +31,8 @@ Dialect safety
 Every raw-SQL rule (path 1) declares sql_dialect ('teradata' | 'postgres' |
 'ansi'). check_dialect() compares it against the target connection's
 source_type (DIALECT_COMPATIBILITY below) and raises DialectMismatchError
-on a mismatch — called from core/engine.py (pre-validation, load-time) and
-core/executor.py (defense-in-depth, immediately before execution) so a
+on a mismatch — called from rules_engine/engine.py (pre-validation, load-time) and
+rules_engine/executor.py (defense-in-depth, immediately before execution) so a
 mismatch is always caught before a query reaches the database, never as a
 confusing mid-run syntax error. 'ansi' is accepted everywhere by
 definition. Rules using path 2/3 have no sql_dialect and are exempt — the
@@ -51,7 +51,7 @@ import logging
 import re
 from typing import Optional, Tuple
 
-from core.check_types import CHECK_CATALOG, get_level, _parse_params
+from rules_engine.check_types import CHECK_CATALOG, get_level, _parse_params
 from utils.db_helpers import resolve_table
 
 logger = logging.getLogger(__name__)
@@ -66,7 +66,7 @@ _ALIAS = "t"
 # Raw-SQL and legacy-fragment rules (paths 1 and 3) hand rule authors a
 # free-text SQL string that ends up embedded in queries the engine executes
 # against a live connection (see _build_raw_sql / build_rule_sql below, and
-# core/executor.py's _count_failed/_fetch_failed_rows, which wrap it as
+# rules_engine/executor.py's _count_failed/_fetch_failed_rows, which wrap it as
 # `SELECT COUNT(*) FROM (<rule_syntax>) x`). A bare DML/DDL statement in
 # that position is usually just a syntax error once wrapped in a subquery
 # -- but a data-modifying CTE (e.g. Postgres/DuckDB's
@@ -132,10 +132,10 @@ def check_no_dml_ddl(rule_syntax: str, rule_code: str = "") -> None:
     never a statement that writes to the database.
 
     Called from both validate_rule_params() (load-time / pre-validation,
-    same call site as check_dialect() in core/engine.py) and directly from
+    same call site as check_dialect() in rules_engine/engine.py) and directly from
     the raw-SQL / legacy-fragment build paths below (execution-time
     defense in depth, same pattern as check_dialect()'s second call site
-    in core/executor.py).
+    in rules_engine/executor.py).
     """
     cleaned = _strip_sql_noise(rule_syntax or "")
     words = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", cleaned.upper())

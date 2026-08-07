@@ -1,5 +1,5 @@
 """
-core/executor.py
+rules_engine/executor.py
 ----------------
 Single-rule execution engine.
 
@@ -38,13 +38,13 @@ import time
 import logging
 from datetime import datetime, date
 
-from core.rule_sql import build_query, build_count_query
+from rules_engine.rule_sql import build_query, build_count_query
 from utils.db_helpers import resolve_table
 from utils.validation import validate_table_exists
 from utils.ids import build_json_pk, build_pk_string
 from utils.metadata_writers import log_issue
 from utils.metadata_writers import log_message
-from core.rule_sql import check_dialect, DialectMismatchError, check_no_dml_ddl, UnsafeRuleSQLError
+from rules_engine.rule_sql import check_dialect, DialectMismatchError, check_no_dml_ddl, UnsafeRuleSQLError
 
 logger = logging.getLogger(__name__)
 
@@ -439,7 +439,7 @@ def execute_rule(rule: dict, db_conn, td_conn, run: dict, meta_db: str) -> str:
     source_type = getattr(db_conn, "source_type", "teradata")
 
     # ── STEP -1: Dialect guard (Section 4/8) — fail fast, never mid-run ──────
-    # Defense-in-depth: core/engine.py::_pre_validate_rules already runs this
+    # Defense-in-depth: rules_engine/engine.py::_pre_validate_rules already runs this
     # same check before the run starts. This second check protects rules
     # added/changed after pre-validation ran, or executed via a path that
     # skips pre-validation (e.g. rule_tester.py single-rule harness).
@@ -458,7 +458,7 @@ def execute_rule(rule: dict, db_conn, td_conn, run: dict, meta_db: str) -> str:
         return "ERROR"
 
     # ── STEP -0.5: Write-statement guard — same defense-in-depth rationale
-    # as the dialect check above (core/engine.py::_pre_validate_rules
+    # as the dialect check above (rules_engine/engine.py::_pre_validate_rules
     # already ran this; this protects rules changed after pre-validation
     # or executed via a path that skips it). ─────────────────────────────
     try:

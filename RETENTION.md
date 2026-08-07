@@ -4,14 +4,16 @@ This document is operational guidance for DBAs/platform owners, not code
 this repo runs automatically -- consistent with the runbook's existing
 stance on the static audit report ("this repo does not manage retention
 lifecycle itself," HEALTHSPRING_UM_RUNBOOK.md §6). It extends that same
-philosophy to the metadata tables in `ddl.sql`: which ones grow without
+philosophy to the metadata tables in `ddl_shared.sql`, `rules_engine/ddl.sql`,
+and `sampling/ddl.sql`: which ones grow without
 bound, how long each one needs to be kept, and how to partition/archive
 them in Teradata without breaking the audit trail CMS-facing reporting
 depends on.
 
 ## 1. Table growth classification
 
-Every table in `ddl.sql` falls into one of three buckets. This matters
+Every table across `ddl_shared.sql`, `rules_engine/ddl.sql`, and
+`sampling/ddl.sql` falls into one of three buckets. This matters
 because the retention policy and the partitioning approach are both
 driven by *why* a table grows, not just how fast.
 
@@ -19,19 +21,19 @@ driven by *why* a table grows, not just how fast.
 
 | Table                        | Grows by                          | Framework |
 |-------------------------------|------------------------------------|-----------|
-| `dq_rule_execution`           | 1 row per rule per run             | core/     |
-| `dq_exceptions`                | up to `MAX_EXCEPTIONS` rows per failing rule per run (capped -- see `core/executor.py`) | core/ |
-| `dq_run_logs`                  | several rows per run (INFO/WARN/ERROR messages) | core/ |
-| `dq_rule_issues`                | 0-N rows per run (only on pre-validation/engine failures) | core/ |
-| `dq_column_profile`             | 1 row per profiled column per run (opt-in via `dq_profile_config`) | core/ |
-| `dq_anomaly_log`                 | 0-3 rows per run (one per metric that has enough history to check) | core/ |
+| `dq_rule_execution`           | 1 row per rule per run             | rules_engine/     |
+| `dq_exceptions`                | up to `MAX_EXCEPTIONS` rows per failing rule per run (capped -- see `rules_engine/executor.py`) | rules_engine/ |
+| `dq_run_logs`                  | several rows per run (INFO/WARN/ERROR messages) | rules_engine/ |
+| `dq_rule_issues`                | 0-N rows per run (only on pre-validation/engine failures) | rules_engine/ |
+| `dq_column_profile`             | 1 row per profiled column per run (opt-in via `dq_profile_config`) | rules_engine/ |
+| `dq_anomaly_log`                 | 0-3 rows per run (one per metric that has enough history to check) | rules_engine/ |
 | `dq_sample_selections`           | 1 row per candidate considered per sampling run (**not** just the N selected) | sampling/ |
-| `dq_exception_dispositions`       | 1 row per disposition event (waive/resolve/reopen) -- sparse, event-driven | core/ |
+| `dq_exception_dispositions`       | 1 row per disposition event (waive/resolve/reopen) -- sparse, event-driven | rules_engine/ |
 
 These are the tables this document is actually about. Left unmanaged,
 `dq_rule_execution` and `dq_exceptions` in particular grow linearly with
 run frequency x rule count x universe size forever, and every SELECT
-against them (the dashboard, `core/reporting.py`, `core/metrics.py`'s
+against them (the dashboard, `rules_engine/reporting.py`, `rules_engine/metrics.py`'s
 history queries) does a full-table or near-full-table scan without
 partition elimination once they're large.
 
@@ -75,13 +77,13 @@ mistake to avoid:
 
 **Audit-of-record data** -- anything that could be asked for in a CMS
 audit or compliance review must follow the same 10-year retention this
-repo already applies to `dq_sample_selections` (see `ddl.sql`'s comment
-on that table) and the static audit report (runbook §6):
+repo already applies to `dq_sample_selections` (see `sampling/ddl.sql`'s
+comment on that table) and the static audit report (runbook §6):
 - `dq_rule_execution`, `dq_exceptions`, `dq_exception_dispositions` --
   these ARE the finding and its disposition history; CMS-facing reporting
   depends on being able to reconstruct "what did the engine find, and
   what happened to it" for any historical run.
-- `dq_sample_selections` -- already documented as 10y in `ddl.sql`.
+- `dq_sample_selections` -- already documented as 10y in `sampling/ddl.sql`.
 - `dq_run_control` -- the run-level record (status, timing, scope) that
   every audit-of-record row above joins back to via run_id/scope_id
   (v7's normalization made this join load-bearing -- see §6.5 of
@@ -94,7 +96,7 @@ for proving what a rule found:
   pre-validation/engine-failure detail. 90 days is generally enough to
   debug a recent incident; nothing here is a compliance finding.
 - `dq_anomaly_log` -- statistical drift detections. 1 year keeps enough
-  history for `core/metrics.py`'s own z-score/IQR baseline calculations
+  history for `rules_engine/metrics.py`'s own z-score/IQR baseline calculations
   (`BASELINE_LOOKBACK = 10` runs) many times over; beyond that it's just
   noise for a dashboard trend chart.
 - `dq_column_profile` -- profiling snapshots. 1 year, same reasoning as
@@ -102,7 +104,7 @@ for proving what a rule found:
 - `dq_rule_versions`, `dq_rule_suppressions` -- low-volume audit trail of
   rule *definition* changes (not findings). Keep indefinitely; the volume
   is trivial and the forensic value ("what did this rule check for when
-  it produced that finding") is high -- `core/rule_lifecycle.py`'s
+  it produced that finding") is high -- `rules_engine/rule_lifecycle.py`'s
   `get_version_at_run()` is built specifically to answer that question,
   and it stops working for any run older than however far back
   `dq_rule_versions` has been purged.
@@ -114,12 +116,13 @@ specific retention window does.
 
 ## 3. Partitioning strategy (Teradata)
 
-None of the tables in `ddl.sql` are partitioned today -- every one uses a
+None of the tables in `ddl_shared.sql`, `rules_engine/ddl.sql`, or
+`sampling/ddl.sql` are partitioned today -- every one uses a
 plain `PRIMARY INDEX` for row distribution, with no `PARTITION BY`
 clause. That's fine at low volume; it stops being fine once the
 high-growth tables in §1 reach the millions-of-rows range, for two
 compounding reasons: (a) queries filtered by a date range (the dashboard's
-Daily/Weekly/Monthly selector, `core/metrics.py`'s history lookback, any
+Daily/Weekly/Monthly selector, `rules_engine/metrics.py`'s history lookback, any
 "last N days" report) do a full-table scan instead of touching only the
 relevant partitions, and (b) purging aged-out data means a `DELETE`
 statement that has to find and remove matching rows one at a time, which
@@ -230,9 +233,9 @@ Python code):
 
 ## 5. What this repo does NOT do
 
-To be explicit about the boundary: no code in `core/`, `sampling/`,
+To be explicit about the boundary: no code in `rules_engine/`, `sampling/`,
 `utils/`, or `entrypoints.py` purges, archives, or partitions anything.
-`core/engine.py::_cleanup_stale_runs()` is the one piece of built-in
+`rules_engine/engine.py::_cleanup_stale_runs()` is the one piece of built-in
 lifecycle management that exists today, and it only reclassifies phantom
 `RUNNING` rows as `ABORTED` after `DQ_STALE_RUN_HOURS` -- it does not
 delete rows. Implementing §3/§4 above is a DBA/platform decision (schema

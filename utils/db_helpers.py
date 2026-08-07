@@ -28,7 +28,7 @@ find_scope_id() / get_scope_id() — dq_scope is the single dimension table
     create, used only where a row must be persisted against some scope
     that may not have been seen before (dq_run_control, dq_metrics_summary)
     — race-safe via the same duplicate-key-then-reselect fallback pattern
-    core/metrics.py::_upsert_metrics already uses for concurrent runs.
+    rules_engine/metrics.py::_upsert_metrics already uses for concurrent runs.
 """
 
 import logging
@@ -94,7 +94,7 @@ def find_scope_id(td, project_name: str, process_name, meta_db: str):
     (correct for read-side filters — a scope that doesn't exist matches
     zero rows, same as one that exists but is empty).
     """
-    from core.executor import execute_query
+    from rules_engine.executor import execute_query
 
     if process_name is None:
         sql = f"""
@@ -120,11 +120,11 @@ def get_scope_id(td, project_name: str, process_name, meta_db: str) -> int:
     Used only where a row must be persisted against a scope that may not
     have been seen before (dq_run_control at run start, dq_metrics_summary
     on upsert). Two threads racing to create the same new scope is handled
-    the same way core/metrics.py::_upsert_metrics handles a concurrent-run
+    the same way rules_engine/metrics.py::_upsert_metrics handles a concurrent-run
     MERGE race: attempt the INSERT, and on a duplicate-key error just
     re-select the row the other thread already created.
     """
-    from core.executor import execute_dml, execute_query
+    from rules_engine.executor import execute_dml, execute_query
 
     existing = find_scope_id(td, project_name, process_name, meta_db)
     if existing is not None:

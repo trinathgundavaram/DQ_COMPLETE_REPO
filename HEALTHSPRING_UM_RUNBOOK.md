@@ -2,8 +2,11 @@
 
 ## 1. Apply schema changes
 
-Run `ddl.sql` top to bottom on a fresh environment, or apply the `v5 → v6`
-ALTER block (bottom of the file) on an existing one. Then load, in order:
+Run these three files, in order, on a fresh environment -- `ddl_shared.sql`
+first (dq_scope + dq_connections, which the other two depend on), then
+`rules_engine/ddl.sql`, then `sampling/ddl.sql` -- or apply the `v5 → v6`
+ALTER block (bottom of `ddl_shared.sql`) on an existing one. Then load,
+in order:
 
 ```
 config/seed/01_setup.sql
@@ -48,7 +51,7 @@ webhooks and distribution emails before loading.
 Weekly universe validation (matches the Friday pull cadence):
 
 ```
-python main.py --project HEALTHSPRING_UM --process UNIVERSE_VALIDATION \
+python rules_engine/main.py --project HEALTHSPRING_UM --process UNIVERSE_VALIDATION \
     --run-type WEEKLY --run-mode DATE --start 2026-08-01 --end 2026-08-07
 ```
 
@@ -63,7 +66,7 @@ follow a rules-engine run in this cadence:
 
 ```python
 from sampling.engine import run_stratified_sampling
-from core.executor import execute_query
+from rules_engine.executor import execute_query
 from db.connection_factory import ConnectionFactory
 from config.env_config import get_meta_db
 
@@ -80,7 +83,7 @@ run_stratified_sampling(cf, td, config, {
 ```
 (`sampling/engine.py` is generic — `COMO_WEEKLY_SAMPLE` here is just the
 `sample_name` value HealthSpring UM's own seed config uses. It reuses
-`core.executor`/`db.connection_factory` as a plain library, the same way
+`rules_engine.executor`/`db.connection_factory` as a plain library, the same way
 this snippet does directly above — it isn't part of the rules engine.)
 
 Or schedule both via `python entrypoints.py --schedule` using a
@@ -103,7 +106,7 @@ Automatic per run when `DQ_AUTO_AUDIT_REPORT=true` is set on the engine
 process, or on demand:
 
 ```
-python -m core.reporting --run-id <run_id> --out-dir ./dq_audit_reports
+python -m rules_engine.reporting --run-id <run_id> --out-dir ./dq_audit_reports
 ```
 
 Copy `./dq_audit_reports/*` into the 10-year retention archive (S3, same
@@ -112,9 +115,14 @@ tooling — this repo does not manage retention lifecycle itself.
 
 ## 7. Verify before relying on this for CMS-facing reporting
 
+This repo doesn't bundle an automated test suite (it's a reusable
+framework, not an application with its own release gate) -- `.github/workflows/ci.yml`
+runs a compile sweep and the rules_engine/-never-imports-sampling/
+boundary check on every push. Before relying on a new rule set or a
+change to the engine itself, run a dry run against your real connections:
+
 ```
-pytest tests/ -q                                                 # unit/integration tests
-python main.py --project HEALTHSPRING_UM --process UNIVERSE_VALIDATION \
+python rules_engine/main.py --project HEALTHSPRING_UM --process UNIVERSE_VALIDATION \
     --run-type TEST --run-mode FULL --dry-run                    # validates every rule's SQL
                                                                     # + dialect against real connections
                                                                     # without writing any results

@@ -3,11 +3,11 @@ sampling/anomaly.py
 ---------------------
 Candidate-pool volume drift detection for the Sampling Framework.
 
-Reuses core.metrics.evaluate_metric_drift() (z-score/IQR statistics) as a
-plain library call -- the same "sampling/ may use core/ as a library,
-core/ never imports sampling/" rule documented in DESIGN.md that
-sampling/engine.py already follows for core.executor/core.rule_sql.
-core/ has no knowledge this module exists.
+Reuses rules_engine.metrics.evaluate_metric_drift() (z-score/IQR statistics) as a
+plain library call -- the same "sampling/ may use rules_engine/ as a library,
+rules_engine/ never imports sampling/" rule documented in DESIGN.md that
+sampling/engine.py already follows for rules_engine.executor/rules_engine.rule_sql.
+rules_engine/ has no knowledge this module exists.
 
 No new metadata table is needed: candidate-pool volume history is fully
 recoverable from dq_sample_selections, which run_stratified_sampling()
@@ -31,7 +31,7 @@ detect_candidate_pool_drift(td, config: dict, sample_run_id: str,
 
 import logging
 
-from core.metrics import evaluate_metric_drift
+from rules_engine.metrics import evaluate_metric_drift
 from utils.alert import send_alert
 from utils.metadata_writers import log_message
 
@@ -60,16 +60,16 @@ def detect_candidate_pool_drift(
     Called by run_stratified_sampling() (sampling/engine.py) after the
     candidate pool is pulled, non-fatally -- a drift-detection failure
     must never block a sampling run from completing, the same principle
-    core/engine.py applies to its own post-run metrics/anomaly steps.
+    rules_engine/engine.py applies to its own post-run metrics/anomaly steps.
 
     Returns {} if there isn't enough history yet or nothing looks
     anomalous; otherwise a dict describing the drift (method, severity,
     z_score/iqr bounds, historical_mean/historical_std, plus
     sample_run_id/sample_name/candidate_count for context) -- the same
-    shape core.metrics.evaluate_metric_drift() returns per detection,
+    shape rules_engine.metrics.evaluate_metric_drift() returns per detection,
     flattened with the run context merged in.
     """
-    from core.executor import execute_query
+    from rules_engine.executor import execute_query
 
     config_id   = config.get("config_id")
     sample_name = config.get("sample_name", "")

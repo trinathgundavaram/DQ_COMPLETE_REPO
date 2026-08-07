@@ -1,6 +1,6 @@
 # Onboarding a New Project
 
-A step-by-step walkthrough for standing up the DQ Rules Engine (`core/`)
+A step-by-step walkthrough for standing up the DQ Rules Engine (`rules_engine/`)
 and, optionally, the Sampling Framework (`sampling/`) against a brand-new
 project's data -- from an empty metadata schema to a first successful run.
 `HEALTHSPRING_UM_RUNBOOK.md` is a worked example of everything below for
@@ -13,7 +13,7 @@ calls things.
 
 - Python >= 3.8 (see `requirements.txt`'s header comment).
 - A Teradata database to use as the metadata store -- this is the one
-  hard requirement; `core/` and `sampling/` both write their metadata
+  hard requirement; `rules_engine/` and `sampling/` both write their metadata
   tables there regardless of what source system your actual DATA lives
   in (see `db/connection_factory.py`'s docstring: "the metadata store is
   always Teradata").
@@ -30,16 +30,19 @@ pip install teradatasql psycopg2-binary tenacity
 
 ## 1. Apply the schema
 
-Fresh metadata schema:
+Fresh metadata schema -- run these three files, in this order, against
+your Teradata metadata database:
 
 ```
--- run top to bottom against your Teradata metadata database
-ddl.sql
+ddl_shared.sql        -- FIRST: dq_scope + dq_connections (both frameworks depend on these)
+rules_engine/ddl.sql   -- rules-engine tables (skip if you only need sampling)
+sampling/ddl.sql       -- sampling tables (skip if you only need the rules engine)
 ```
 
 Upgrading an existing pre-v7 deployment instead: run
 `migrations/v6_to_v7.sql` (phase by phase, with the backups it
-recommends -- see that file's header) rather than `ddl.sql` directly.
+recommends -- see that file's header) rather than the three DDL files
+directly.
 
 ## 2. Configure connections
 
@@ -93,7 +96,7 @@ simple ones to prove the pipeline end to end before writing your full
 rule set.
 
 **Path 2 -- built-in check_type** (declarative, no SQL to write; see
-`core/check_types.py` for all 24 generators and `tests/test_check_types.py`
+`rules_engine/check_types.py` for all 24 generators and their docstrings
 for a worked example of each):
 
 ```sql
@@ -112,8 +115,8 @@ INSERT INTO <your_meta_db>.dq_rules (
 ```
 
 **Path 1 -- raw SQL** (a complete negative-SQL SELECT -- returns the
-rows that VIOLATE the rule; zero rows = PASS; see `core/rule_sql.py`'s
-module docstring for the full authoring model, and `core/rule_sql.py`'s
+rows that VIOLATE the rule; zero rows = PASS; see `rules_engine/rule_sql.py`'s
+module docstring for the full authoring model, and `rules_engine/rule_sql.py`'s
 `check_no_dml_ddl()` guard, which rejects anything that isn't a
 read-only SELECT):
 
@@ -135,14 +138,14 @@ INSERT INTO <your_meta_db>.dq_rules (
 ```
 
 `sql_dialect` must match a dialect your `source_system` connection's
-`source_type` is compatible with -- see `core/rule_sql.py`'s
+`source_type` is compatible with -- see `rules_engine/rule_sql.py`'s
 `DIALECT_COMPATIBILITY` table. Mismatches are caught before any rule
 runs, not as a confusing mid-run SQL error.
 
 ## 5. Dry-run before writing anything
 
 ```
-python main.py --project ACME_CLAIMS --process MONTHLY_AUDIT \
+python rules_engine/main.py --project ACME_CLAIMS --process MONTHLY_AUDIT \
     --run-type TEST --run-mode FULL --dry-run
 ```
 
@@ -153,7 +156,7 @@ flags before proceeding.
 ## 6. Run it for real
 
 ```
-python main.py --project ACME_CLAIMS --process MONTHLY_AUDIT \
+python rules_engine/main.py --project ACME_CLAIMS --process MONTHLY_AUDIT \
     --run-type MONTHLY --run-mode FULL
 ```
 
@@ -182,7 +185,7 @@ fully worked example of every field), then run it directly:
 
 ```python
 from sampling.engine import run_stratified_sampling
-from core.executor import execute_query
+from rules_engine.executor import execute_query
 from db.connection_factory import ConnectionFactory
 from config.env_config import get_meta_db
 
@@ -218,13 +221,13 @@ python entrypoints.py --schedule
 
 Or wire `entrypoints.py`'s `lambda_handler` / `glue_main` /
 `DataQualityEngineOperator` into Lambda / Glue / Airflow instead -- all
-of them are thin wrappers around the same `core.engine.run_engine()`
-call `main.py` and the scheduler use.
+of them are thin wrappers around the same `rules_engine.engine.run_engine()`
+call `rules_engine/main.py` and the scheduler use.
 
 ## 9. Where to go next
 
 - **DESIGN.md** -- full architecture: the two-framework split, every
-  extension point (`core/check_types.py` for a new check type,
+  extension point (`rules_engine/check_types.py` for a new check type,
   `db/adapters.py` for a new source system), dialect enforcement, the
   write-statement guard, `dq_scope` normalization.
 - **RETENTION.md** -- once you're running in production, plan

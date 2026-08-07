@@ -13,7 +13,7 @@ Adapter interface (SourceAdapter ABC)
                               (no-op by default; FileAdapter/S3Adapter use it to
                               register a DuckDB view for the rule's table)
     source_type: str        -> class attribute identifying the SQL dialect the
-                              adapter speaks; used by core/rule_sql.py to pick
+                              adapter speaks; used by rules_engine/rule_sql.py to pick
                               dialect-correct SQL and to enforce the dialect
                               guard (a rule's declared sql_dialect vs. this).
 
@@ -433,7 +433,7 @@ class S3Adapter(SourceAdapter):
     """
     DuckDB-over-S3: queries Parquet/CSV objects directly on S3 with full SQL
     (joins, aggregates, window functions) — required because every DQ rule
-    is SQL (see core/rule_sql.py), and a source that only returns file
+    is SQL (see rules_engine/rule_sql.py), and a source that only returns file
     bytes can't be queried that way.
 
     Thread model mirrors FileAdapter: one DuckDB connection per thread, each

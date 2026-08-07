@@ -13,7 +13,7 @@ so DQ_ENV/DQ_META_DB changes after import are respected.
 
 Deliberately separate from dq_exceptions (utils/ids.py builds the keys
 for those) — a data finding and an engine problem are never the same row,
-see core/executor.py and DESIGN.md.
+see rules_engine/executor.py and DESIGN.md.
 """
 
 import logging
@@ -71,7 +71,7 @@ def log_issue(
     meta_db = meta_db or get_meta_db()
 
     # project_name/process_name are NOT stored — derivable via run_id ->
-    # dq_run_control (see ddl.sql v7).
+    # dq_run_control (see ddl_shared.sql v7).
     sql = f"""
         INSERT INTO {meta_db}.dq_rule_issues
             (run_id, rule_id, rule_code,

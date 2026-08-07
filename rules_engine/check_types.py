@@ -1,5 +1,5 @@
 """
-core/check_types.py
+rules_engine/check_types.py
 -------------------
 Built-in check type catalog for the DQ framework.
 
@@ -39,7 +39,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-_ALIAS = "t"   # outer table alias used throughout core/rule_sql.py
+_ALIAS = "t"   # outer table alias used throughout rules_engine/rule_sql.py
 
 # ─── Dimension constants ──────────────────────────────────────────────────────
 COMPLETENESS  = "COMPLETENESS"

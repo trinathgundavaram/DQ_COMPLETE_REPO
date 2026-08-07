@@ -1,5 +1,5 @@
 """
-core/profiler.py
+rules_engine/profiler.py
 ----------------
 Automated per-column statistical profiling.
 
@@ -78,7 +78,7 @@ def profile_tables_for_run(
     run      : run context dict
     meta_db  : metadata schema name
     """
-    from core.executor import execute_query, bulk_insert
+    from rules_engine.executor import execute_query, bulk_insert
 
     # Build unique (source_system, table_name) pairs from this run's rules
     seen    = set()
@@ -100,7 +100,7 @@ def profile_tables_for_run(
     # match the same table_name (e.g. a global default plus a project-
     # specific override). Resolve to the most specific row per table_name —
     # exact project+process > project-only wildcard > global wildcard —
-    # mirroring the same pattern used in core/reporting.py::_load_routes().
+    # mirroring the same pattern used in rules_engine/reporting.py::_load_routes().
     cfg_rows = _load_profile_configs(td_conn, run, meta_db, execute_query)
     cfg_by_table = _resolve_most_specific_configs(cfg_rows)
 
@@ -188,7 +188,7 @@ def _profile_one_table(
         return
 
     # project_name/process_name are NOT stored — derivable via run_id ->
-    # dq_run_control (see ddl.sql v7).
+    # dq_run_control (see ddl_shared.sql v7).
     sql = f"""
         INSERT INTO {meta_db}.dq_column_profile (
             run_id, table_name, column_name,
@@ -223,7 +223,7 @@ def _profile_column(
     query. Net effect: 1 scan instead of 2 for numeric columns, no change
     in query count or behavior for non-numeric columns.
     """
-    from core.executor import execute_query
+    from rules_engine.executor import execute_query
 
     stddev_fn = "STDEV" if source_type in ("sqlserver", "mssql") else "STDDEV_SAMP"
 
@@ -304,7 +304,7 @@ def _profile_column(
 
 def _get_top_n(db_conn, source_type: str, table: str, col: str, n: int) -> list:
     """Return top-N values by frequency as [{value, count}] list."""
-    from core.executor import execute_query
+    from rules_engine.executor import execute_query
 
     st = (source_type or "").lower()
 
@@ -467,7 +467,7 @@ def _should_run_now(cfg: dict) -> bool:
 
 def _update_last_profiled(td_conn, config_id, meta_db: str, execute_query):
     """Stamp last_profiled on the config row after a successful profile run."""
-    from core.executor import execute_dml
+    from rules_engine.executor import execute_dml
     try:
         execute_dml(
             td_conn,

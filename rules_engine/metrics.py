@@ -1,5 +1,5 @@
 """
-core/metrics.py
+rules_engine/metrics.py
 ---------------
 Everything that happens to dq_metrics_summary / dq_anomaly_log after a run
 finishes — computing this run's numbers, comparing them to history, and
@@ -26,7 +26,7 @@ import statistics
 from datetime import date
 from typing import List, Optional, Tuple
 
-from core.executor import execute_query, execute_dml, bulk_insert
+from rules_engine.executor import execute_query, execute_dml, bulk_insert
 from utils.alert import send_alert
 from utils.metadata_writers import log_message
 
@@ -415,7 +415,7 @@ def detect_and_log(td_conn, run: dict, meta_db: str) -> List[dict]:
 
     # Load detection config (most-specific match wins) — dq_anomaly_config
     # is a low-cardinality wildcard table, still matched on raw project/
-    # process, not scope_id; see the v7 note in ddl.sql.
+    # process, not scope_id; see the v7 note in ddl_shared.sql.
     cfg = _load_config(td_conn, project, process, run_type, meta_db, execute_query)
 
     method    = cfg["method"].upper()
@@ -543,8 +543,8 @@ def evaluate_metric_drift(
     DB access, no logging, no project/run context — so it's safe to reuse
     from anywhere, not just detect_and_log() above.
 
-    This is the sanctioned reuse point for "sampling/ may use core/ as a
-    library, core/ never imports sampling/" (see DESIGN.md): sampling/
+    This is the sanctioned reuse point for "sampling/ may use rules_engine/ as a
+    library, rules_engine/ never imports sampling/" (see DESIGN.md): sampling/
     anomaly.py's candidate-pool volume drift check calls this directly
     rather than reimplementing the same statistics. detect_and_log() also
     calls it now, so there's exactly one implementation of this math.

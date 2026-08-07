@@ -1,8 +1,8 @@
 """
-core/rule_lifecycle.py
+rules_engine/rule_lifecycle.py
 -------------------------
 Rule governance that happens ONCE per run, on the main thread, before/around
-execution — as opposed to core/executor.py which runs each rule. Two
+execution — as opposed to rules_engine/executor.py which runs each rule. Two
 concerns, both about a rule's lifecycle rather than its data checks:
 
 Suppression (snooze)
@@ -60,7 +60,7 @@ def is_suppressed(td_conn, rule: dict, meta_db: str) -> Tuple[bool, str]:
     A lookup failure is treated as not-suppressed (fail open) so a
     misconfigured suppressions table never blocks rule execution.
     """
-    from core.executor import execute_query
+    from rules_engine.executor import execute_query
 
     rule_id = rule.get("rule_id")
     if rule_id is None:
@@ -92,7 +92,7 @@ def is_suppressed(td_conn, rule: dict, meta_db: str) -> Tuple[bool, str]:
 
 def record_suppressed_execution(td_conn, run: dict, rule: dict, meta_db: str, reason: str):
     """Write a SUPPRESSED status row so the metrics denominator stays accurate."""
-    from core.executor import record_rule_execution
+    from rules_engine.executor import record_rule_execution
     from utils.metadata_writers import log_message
 
     table = rule.get("src_tbl_nm") or "UNKNOWN"
@@ -120,7 +120,7 @@ _TRACKED_FIELDS: List[str] = [
 
 def snapshot_changed_rules(td_conn, rules: list, meta_db: str) -> int:
     """Archive a dq_rule_versions row for every rule whose tracked fields changed. Returns count archived."""
-    from core.executor import execute_query, bulk_insert
+    from rules_engine.executor import execute_query, bulk_insert
 
     versioned = 0
     for rule in rules:
@@ -137,7 +137,7 @@ def snapshot_changed_rules(td_conn, rules: list, meta_db: str) -> int:
 
 def get_version_at_run(td_conn, rule_id: int, run_timestamp: str, meta_db: str) -> Optional[dict]:
     """Return the rule version active at run_timestamp, or None. Forensic lookup."""
-    from core.executor import execute_query
+    from rules_engine.executor import execute_query
 
     try:
         rows = execute_query(td_conn, f"""

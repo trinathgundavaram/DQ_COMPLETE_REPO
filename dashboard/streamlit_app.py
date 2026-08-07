@@ -30,7 +30,7 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.env_config import get_meta_db
-from core.executor import execute_query
+from rules_engine.executor import execute_query
 from db.connection_factory import ConnectionFactory
 
 st.set_page_config(page_title="DQ Engine Dashboard", layout="wide")
@@ -103,7 +103,7 @@ def main():
     # the same "sc" alias, so this clause is reusable everywhere. Values
     # are bound as params (not interpolated) even though selectbox/
     # multiselect inputs are DB-sourced — defense in depth, same standard
-    # applied to CLI-sourced values in core/.
+    # applied to CLI-sourced values in rules_engine/.
     process_clause = "AND sc.process_name = ?" if process != "(all)" else ""
     process_params = [process] if process != "(all)" else []
 

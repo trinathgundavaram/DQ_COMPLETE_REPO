@@ -45,7 +45,7 @@ def send_alert(message: str, level: str = "INFO"):
 
     This is the global/fallback channel — used when no row in
     dq_notification_routes matches. Prefer send_alert_to() for
-    audience-routed notifications (see core/reporting.py).
+    audience-routed notifications (see rules_engine/reporting.py).
     """
     cfg = _load_config()
     level = (level or "INFO").upper()
@@ -70,7 +70,7 @@ def send_alert(message: str, level: str = "INFO"):
 
 def send_alert_to(message: str, level: str, channel_type: str, destination: str):
     """
-    Dispatch an alert to an EXPLICIT destination — used by core/reporting.py
+    Dispatch an alert to an EXPLICIT destination — used by rules_engine/reporting.py
     for audience-routed notifications (dq_notification_routes rows), as
     opposed to send_alert() which always uses the single global env-configured
     channel.

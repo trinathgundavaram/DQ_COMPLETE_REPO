@@ -1,5 +1,5 @@
 """
-core/rule_tester.py
+rules_engine/rule_tester.py
 -------------------
 Single-rule test harness — issue #18.
 
@@ -10,11 +10,11 @@ Usage
 -----
 From the command line:
 
-    python -m core.rule_tester --rule-code MY_RULE_001
+    python -m rules_engine.rule_tester --rule-code MY_RULE_001
 
 From Python:
 
-    from core.rule_tester import test_rule
+    from rules_engine.rule_tester import test_rule
     result = test_rule(rule_code="MY_RULE_001", run_mode="FULL")
     print(result)
 
@@ -31,7 +31,7 @@ from typing import Optional
 
 from config.env_config import get_meta_db
 from db.connection_factory import ConnectionFactory
-from core.executor import (
+from rules_engine.executor import (
     execute_query,
     validate_sql,
     evaluate_rule,
@@ -41,7 +41,7 @@ from core.executor import (
     _fetch_failed_rows,
     _check_column_exists,
 )
-from core.rule_sql import build_query, build_count_query
+from rules_engine.rule_sql import build_query, build_count_query
 from utils.db_helpers import resolve_table
 
 logging.basicConfig(
@@ -311,10 +311,10 @@ def _cli():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m core.rule_tester --rule-code MY_RULE_001
-  python -m core.rule_tester --rule-code MY_RULE_001 --run-mode DATE --start 2024-01-01 --end 2024-01-31
-  python -m core.rule_tester --rule-code MY_RULE_001 --run-mode BATCH --batch-id BATCH_2024
-  python -m core.rule_tester --rule-code MY_RULE_001 --show-rows 50
+  python -m rules_engine.rule_tester --rule-code MY_RULE_001
+  python -m rules_engine.rule_tester --rule-code MY_RULE_001 --run-mode DATE --start 2024-01-01 --end 2024-01-31
+  python -m rules_engine.rule_tester --rule-code MY_RULE_001 --run-mode BATCH --batch-id BATCH_2024
+  python -m rules_engine.rule_tester --rule-code MY_RULE_001 --show-rows 50
         """,
     )
     parser.add_argument("--rule-code", required=True,

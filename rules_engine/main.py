@@ -5,12 +5,12 @@ Command-line entry point for the Data Quality Framework.
 
 Usage
 -----
-    python main.py --project CLAIMS --process MEMBER --run-type MONTHLY --run-mode BATCH --batch-id BATCH_2024
+    python rules_engine/main.py --project CLAIMS --process MEMBER --run-type MONTHLY --run-mode BATCH --batch-id BATCH_2024
 
-    python main.py --project CLAIMS --process MEMBER --run-type DAILY \
+    python rules_engine/main.py --project CLAIMS --process MEMBER --run-type DAILY \
                    --run-mode DATE --start 2024-01-01 --end 2024-01-31
 
-    python main.py --project CLAIMS --process MEMBER --run-type MONTHLY \
+    python rules_engine/main.py --project CLAIMS --process MEMBER --run-type MONTHLY \
                    --run-mode FULL --dry-run
 
 Environment variables (set before running)
@@ -38,7 +38,15 @@ Exit codes
 import argparse
 import json
 import logging
+import os
 import sys
+
+# This module lives in rules_engine/ but imports the top-level rules_engine
+# package (from rules_engine.engine import run_engine, below) — running
+# `python rules_engine/main.py` puts rules_engine/ itself on sys.path[0],
+# not the repo root, so the package import would otherwise fail. Same fix
+# dashboard/streamlit_app.py already uses for the same reason.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +58,10 @@ def _parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python main.py --project CLAIMS --process MEMBER --run-type MONTHLY --run-mode FULL
-  python main.py --project CLAIMS --process MEMBER --run-type DAILY --run-mode BATCH --batch-id B001
-  python main.py --project CLAIMS --process MEMBER --run-type DAILY --run-mode DATE --start 2024-01-01 --end 2024-01-31
-  python main.py --project CLAIMS --process MEMBER --run-type MONTHLY --run-mode FULL --dry-run
+  python rules_engine/main.py --project CLAIMS --process MEMBER --run-type MONTHLY --run-mode FULL
+  python rules_engine/main.py --project CLAIMS --process MEMBER --run-type DAILY --run-mode BATCH --batch-id B001
+  python rules_engine/main.py --project CLAIMS --process MEMBER --run-type DAILY --run-mode DATE --start 2024-01-01 --end 2024-01-31
+  python rules_engine/main.py --project CLAIMS --process MEMBER --run-type MONTHLY --run-mode FULL --dry-run
         """,
     )
 
@@ -62,7 +70,7 @@ Examples:
     parser.add_argument("--process",   required=True,
                         help="process_name (matches dq_rules.process_name)")
     # No choices= restriction: the engine treats run_type as an open string
-    # (see core/metrics.py::RUN_TYPE_DEVIATION_THRESHOLDS, which falls back
+    # (see rules_engine/metrics.py::RUN_TYPE_DEVIATION_THRESHOLDS, which falls back
     # to DEFAULT_DEVIATION_THRESHOLD_PCT for any unrecognized value), so the
     # CLI should not artificially restrict which run types can be used.
     parser.add_argument("--run-type",  required=True, dest="run_type",
@@ -99,7 +107,7 @@ def main(argv=None):
     args = _parse_args(argv)
 
     # Import here so DQ_LOG_LEVEL (set before invocation) takes effect first
-    from core.engine import run_engine
+    from rules_engine.engine import run_engine
 
     try:
         result = run_engine(

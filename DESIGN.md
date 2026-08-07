@@ -6,12 +6,12 @@ Sample Optimization / HealthSpring UM requirements, and (2) genericness — a
 different team pointing this engine at a different dataset tomorrow.
 
 **This repo hosts two separate frameworks, not one.** The DQ Rules Engine
-(`core/`) answers "is this row valid?" The Sampling Framework
+(`rules_engine/`) answers "is this row valid?" The Sampling Framework
 (`sampling/`) answers "which N cases are highest-value for a human
 reviewer this cycle?" — a different question, with its own config table,
 its own output table, and its own package. `sampling/` uses a small set of
-functions from `core/` and the shared connector layer as a plain library
-dependency (see §3.6/§9), but `core/` has no awareness `sampling/` exists, and
+functions from `rules_engine/` and the shared connector layer as a plain library
+dependency (see §3.6/§9), but `rules_engine/` has no awareness `sampling/` exists, and
 neither is required to deploy or run the other. Wherever this document
 says "the engine," it means the rules engine specifically, unless a
 section is explicitly about sampling.
@@ -19,81 +19,110 @@ section is explicitly about sampling.
 ## 1. Starting point
 
 The repo was not built from scratch here. It already implemented a
-thread-safe, priority/dependency-ordered rule engine (`core/engine.py`);
+thread-safe, priority/dependency-ordered rule engine (`rules_engine/engine.py`);
 accurate failed-record counting even when exceptions are capped; SKIP
 recording when a rule can't run; empty-table handling via `require_rows`;
 AND/OR threshold logic; retry on transient source errors; lazily-read
-credentials; a CLI (`main.py`); rule versioning; suppression; statistical
+credentials; a CLI (`rules_engine/main.py`); rule versioning; suppression; statistical
 anomaly detection (z-score/IQR); and a pluggable connector layer
 (Teradata, Postgres/Aurora, Databricks, SQL Server, flat files via DuckDB).
 
-Verifying this took a full read of `ddl.sql`, `main.py`, and every file
-under `core/`, `db/`, `utils/`, `config/`, plus a DuckDB-backed test pass,
-before writing anything (§2 below has the item-by-item gap mapping). What
-follows is what genuinely needed to be added, not a rewrite.
+Verifying this took a full read of the schema DDL, the CLI, and every file
+under `rules_engine/`, `db/`, `utils/`, `config/`, plus a DuckDB-backed
+verification pass, before writing anything (§2 below has the item-by-item
+gap mapping). What follows is what genuinely needed to be added, not a
+rewrite.
 
 ## 2. File layout
 
+This repo is organized as three top-level, purpose-specific folders --
+`rules_engine/`, `dashboard/`, `sampling/` -- plus the infrastructure all
+three genuinely share (`db/`, `utils/`, `config/`, and the top-level
+orchestration/deployment glue). Nothing in this repo bundles an automated
+test suite -- it's a reusable framework, not an application with its own
+release gate; verification during development was done with DuckDB-backed
+manual runs.
+
 ```
-core/                    -- FRAMEWORK 1: the DQ rules engine
-  engine.py            orchestrator: run scheduling, thread pool, pre-validation
-  executor.py           query execution + rule evaluation (merged former evaluator.py)
-  rule_sql.py            SQL construction, raw-SQL rules, dialect enforcement
-  check_types.py        built-in declarative check_type -> SQL generators
+rules_engine/                    -- FRAMEWORK 1: the DQ rules engine
+  main.py                CLI entrypoint: `python rules_engine/main.py ...`
+  ddl.sql                 rules-engine tables only (dq_rules through
+                          dq_notification_routes) -- run ddl_shared.sql first
+  engine.py               orchestrator: run scheduling, thread pool, pre-validation
+  executor.py             query execution + rule evaluation (merged former evaluator.py)
+  rule_sql.py             SQL construction, raw-SQL rules, dialect enforcement
+  check_types.py          built-in declarative check_type -> SQL generators
   rule_lifecycle.py       rule versioning + suppression
-  metrics.py             run metrics + anomaly (z-score/IQR) detection
-  reporting.py            notification routing + static audit report
-  profiler.py             source-table profiling
-  rule_tester.py           single-rule dry-run harness
+  metrics.py              run metrics + anomaly (z-score/IQR) detection
+  reporting.py             notification routing + static audit report
+  profiler.py              source-table profiling
+  rule_tester.py            single-rule dry-run harness
+dashboard/                -- FRAMEWORK VIEWER: read-only, its own folder
+  streamlit_app.py         findings / sample / engine-health views over both
+                          frameworks' output tables -- no schema of its own
 sampling/                -- FRAMEWORK 2: the sampling framework (separate; see §3.6)
-  engine.py               config-driven ranked sampling (e.g. COMO weekly sample)
-  anomaly.py              candidate-pool volume drift check (reuses core.metrics's
+  engine.py                config-driven ranked sampling (e.g. COMO weekly sample)
+  anomaly.py               candidate-pool volume drift check (reuses rules_engine.metrics's
                           z-score/IQR math as a library — see §3.6)
-db/                       -- shared: connector layer, used by both frameworks
-  adapters.py            SourceAdapter ABC + Teradata/Postgres/Databricks/SqlServer/File/S3
-  connection_factory.py  builds + caches adapters from DQ_CONNECTION_NAMES env
-utils/                    -- shared: cross-cutting helpers, used by both frameworks
-  db_helpers.py          table/db name resolution + dq_scope resolver
-  metadata_writers.py    dq_run_logs / dq_rule_issues writers
-  ids.py                 run-id + primary-key JSON helpers
-  validation.py          rule-definition validation
-  alert.py               low-level Teams/email senders
-entrypoints.py           shared: Lambda handler, Glue main, Airflow operator, cron
-                         runner, CLI -- all call core.engine.run_engine(); the cron
-                         runner can optionally chain sampling.engine as a follow-on
-                         step (see §3.6) -- the only place both frameworks meet
-dashboard/streamlit_app.py   shared viewer: findings / sample / engine-health views
-                              over both frameworks' output tables
-config/seed/             HealthSpring UM onboarded purely via config (see §5)
-ddl.sql                  full schema, v1 -> v7 -- rules-engine tables, sampling-
-                         framework tables, and the shared dq_scope/dq_connections
-                         tables are clearly sectioned (see the file's own header)
-migrations/v6_to_v7.sql  runnable schema-normalization migration (see §6.5) --
-                         a real ALTER/backfill/DROP script, not illustrative
-                         comments like ddl.sql's earlier v1->v2 .. v5->v6 blocks
-main.py                  CLI entrypoint (rules engine)
-RETENTION.md             partitioning/archival strategy for high-growth tables --
-                         operational guidance, not code this repo runs itself
-ONBOARDING.md            generic step-by-step walkthrough: empty schema -> first
-                         successful run, for a brand-new project (not HealthSpring UM)
-.env.example             every DQ_* env var this repo reads, with inline docs
-schedule.json.example    entrypoints.py --schedule job-file shape, worked examples
+  ddl.sql                  sampling-only tables: dq_sampling_config,
+                          dq_sample_selections -- run ddl_shared.sql first
+db/                       -- shared: connector layer, used by all three folders above
+  adapters.py             SourceAdapter ABC + Teradata/Postgres/Databricks/SqlServer/File/S3
+  connection_factory.py   builds + caches adapters from DQ_CONNECTION_NAMES env
+utils/                    -- shared: cross-cutting helpers, used by all three folders above
+  db_helpers.py           table/db name resolution + dq_scope resolver
+  metadata_writers.py     dq_run_logs / dq_rule_issues writers
+  ids.py                  run-id + primary-key JSON helpers
+  validation.py           rule-definition validation
+  alert.py                low-level Teams/email senders
+config/seed/              HealthSpring UM onboarded purely via config (see §5)
+entrypoints.py            shared: Lambda handler, Glue main, Airflow operator, cron
+                          runner -- all call rules_engine.engine.run_engine() (the
+                          same function rules_engine/main.py's CLI calls); the cron
+                          runner can optionally chain sampling.engine as a follow-on
+                          step (see §3.6) -- the only place both frameworks meet
+ddl_shared.sql            the two tables both frameworks depend on -- dq_scope
+                          (project/process dimension) and dq_connections (source
+                          catalogue) -- plus the full v1->v7 change rationale and
+                          illustrative version-history ALTER blocks. Run this file
+                          FIRST, before rules_engine/ddl.sql and/or sampling/ddl.sql.
+migrations/v6_to_v7.sql   runnable schema-normalization migration (see §6.5) --
+                          a real ALTER/backfill/DROP script, not illustrative
+                          comments like ddl_shared.sql's earlier v1->v2 .. v5->v6 blocks
+RETENTION.md              partitioning/archival strategy for high-growth tables --
+                          operational guidance, not code this repo runs itself
+ONBOARDING.md             generic step-by-step walkthrough: empty schema -> first
+                          successful run, for a brand-new project (not HealthSpring UM)
+.env.example              every DQ_* env var this repo reads, with inline docs
+schedule.json.example     entrypoints.py --schedule job-file shape, worked examples
 ```
 
 Each module has one job and a new capability slots into an existing file
 rather than requiring a new one: a new source is a new adapter class in
 `db/adapters.py`; a new check type is a new generator function in
-`core/check_types.py`; a new execution context is a new function in
+`rules_engine/check_types.py`; a new execution context is a new function in
 `entrypoints.py`. The one-file-per-concern rule applies across the
 framework boundary too: `sampling/` is two small, single-purpose files --
 `engine.py` for the sample-selection algorithm, `anomaly.py` for the
 candidate-pool drift check -- not one file doing two jobs. See §3.6.
 
+`db/`, `utils/`, and `config/` stay outside the three framework folders on
+purpose: they're genuinely shared low-level infrastructure (connection
+pooling, env-var parsing, ID generation, metadata writers), not
+domain logic belonging to any one framework. Duplicating them into
+`rules_engine/`, `dashboard/`, and `sampling/` separately would mean three
+copies of connection-handling code drifting out of sync -- the same
+one-directional-dependency principle that keeps `rules_engine/` from
+importing `sampling/` argues against that duplication too. `entrypoints.py`
+stays at the repo root for the same reason: it is explicitly the one file
+where both frameworks' orchestration meets (see above), so it cannot live
+inside either folder without implying a dependency that doesn't exist.
+
 ## 3. What was added (v6) and why
 
 ### 3.1 SQL-dialect enforcement
 
-New: dialect-checking functions in `core/rule_sql.py`
+New: dialect-checking functions in `rules_engine/rule_sql.py`
 (`check_dialect`, `DialectMismatchError`, `DIALECT_COMPATIBILITY`),
 `dq_rules.sql_dialect` column.
 
@@ -104,8 +133,8 @@ that are safe against it -- `ansi` is accepted everywhere by definition.
 The check runs in two places, both **before** the rule's query ever
 reaches the source database:
 
-1. `core/engine.py::_pre_validate_rules` -- load-time, before the run starts.
-2. `core/executor.py::execute_rule` -- a second, defense-in-depth check
+1. `rules_engine/engine.py::_pre_validate_rules` -- load-time, before the run starts.
+2. `rules_engine/executor.py::execute_rule` -- a second, defense-in-depth check
    immediately before any query is built, so a rule added *after*
    pre-validation ran (or invoked via the rule-tester single-rule harness,
    which bypasses pre-validation) is still protected.
@@ -125,7 +154,7 @@ Section 8 item 8) -- no dialect concept existed in the reference repo.
 
 ### 3.2 Raw-SQL rule authoring
 
-New: `_build_raw_sql()` in `core/rule_sql.py`, and a documented 3-path
+New: `_build_raw_sql()` in `rules_engine/rule_sql.py`, and a documented 3-path
 priority order (raw SQL -> check_type generation -> legacy fragment).
 
 The reference repo's existing `rule_syntax` fallback treats it as a
@@ -159,8 +188,9 @@ tag -- it does not affect SQL generation for this path. That's the point:
 a taxonomy, not a code-generator, once SQL is the primary authoring
 surface.
 
-Tested end-to-end against DuckDB in `tests/test_core.py`, including a
-cross-table join mirroring the SHRPA pattern.
+Verified end-to-end against DuckDB during development, including a
+cross-table join mirroring the SHRPA pattern. This repo doesn't bundle
+an automated test suite (see §2) -- verification was manual, DuckDB-backed.
 
 ### 3.3 S3 connector
 
@@ -206,11 +236,11 @@ the static report.
 
 ### 3.5 Notification audience-splitting
 
-New: notification functions in `core/reporting.py`
+New: notification functions in `rules_engine/reporting.py`
 (`notify_run_completion`, `_dispatch`), `dq_notification_routes` table,
 `utils/alert.send_alert_to()`, `dq_rules.business_correctable`.
 
-This was a real gap, not just missing config: `core/engine.py`'s previous
+This was a real gap, not just missing config: `rules_engine/engine.py`'s previous
 `_send_completion_alert()` lumped `FAIL/WARN/ERROR/SKIP/SUPPRESSED` into one
 `failed_rules` count and sent ONE alert on ONE channel -- exactly the
 failure mode the brief calls out ("a rule that errors must never look
@@ -228,7 +258,7 @@ notification calls, looked up against `dq_notification_routes` by
 **The code has no concept of audience names.** `dq_notification_routes.
 audience` is a free-text label carried through purely for humans managing
 the routing table -- the engine never branches on its value. The only two
-decisions `core/reporting.py` makes in code are:
+decisions `rules_engine/reporting.py` makes in code are:
 
 - `finding_class = 'DATA_VIOLATION'` -> every active route for that finding
   class gets the full message; routes with `business_correctable_only = 1`
@@ -268,29 +298,30 @@ that share nothing with `dq_rules`/`dq_rule_execution`/`dq_exceptions`.
 **The dependency only ever goes one way.** `sampling/` imports a small,
 enumerable set of things from outside its own package, all as a plain
 library, the same way any external caller would use them:
-- `core.executor.execute_query` / `bulk_insert` (`sampling/engine.py`) --
+- `rules_engine.executor.execute_query` / `bulk_insert` (`sampling/engine.py`) --
   the same thin parameterised-query wrappers every source adapter already uses.
-- `core.rule_sql.build_filter` (`sampling/engine.py`) -- the same
+- `rules_engine.rule_sql.build_filter` (`sampling/engine.py`) -- the same
   BATCH/DATE/FULL run-mode date-scoping every rule uses, so a sampling
   config's `scope_column` gets identical window handling for free,
   without a second templating language.
 - `db.connection_factory.ConnectionFactory` (`sampling/engine.py`) -- the
   shared connector layer.
-- `core.metrics.evaluate_metric_drift` (`sampling/anomaly.py` only --
-  never `engine.py` directly) -- the same z-score/IQR statistics `core/`
+- `rules_engine.metrics.evaluate_metric_drift` (`sampling/anomaly.py` only --
+  never `engine.py` directly) -- the same z-score/IQR statistics `rules_engine/`
   uses for DQ-score anomaly detection, reused for candidate-pool volume
   drift (see below). This is a single pure, DB-free function with no
   side effects; `sampling/` never touches `dq_metrics_summary`,
   `dq_anomaly_config`, or any other rules-engine metrics table, and never
   calls `calculate_metrics()`/`detect_and_log()` themselves.
 
-`core/` has zero imports from `sampling/` and zero knowledge it exists.
-`tests/test_sampling.py::test_sampling_framework_does_not_import_core_engine_or_rules_tables`
-enforces this directly across every file in the package -- it fails the
-build if `sampling/engine.py` or `sampling/anomaly.py` ever imports
-`core.engine`/`core.reporting`, queries `dq_rule_execution`/`dq_exceptions`/
-`dq_rules`, or if the `core.metrics` reuse ever widens past the one
-sanctioned function. A deployment can run the sampling framework against
+`rules_engine/` has zero imports from `sampling/` and zero knowledge it exists.
+`.github/workflows/ci.yml`'s framework-boundary check enforces the
+`rules_engine/`-never-imports-`sampling/` half of this directly on every
+push, via a static AST scan of every file under `rules_engine/`. (The
+reverse direction -- `sampling/` may only reuse `rules_engine.metrics`'s
+one sanctioned function, and must never query `dq_rule_execution`/
+`dq_exceptions`/`dq_rules` directly -- is a design invariant documented
+here rather than a CI-checked one.) A deployment can run the sampling framework against
 a metadata store that has never evaluated a single `dq_rules` row, and
 vice versa. The only place the two frameworks meet at all is
 `entrypoints.py::_run_cron_sampling` -- deployment glue that optionally
@@ -301,9 +332,8 @@ frameworks' tables, not a dependency either framework has on the other.
 
 (HealthSpring UM's own use of this -- the "COMO weekly sample" -- is
 configured entirely in `config/seed/01_setup.sql`. The module itself has
-no knowledge of COMO, ROAR, or any other project-specific name;
-`tests/test_sampling.py` asserts this directly by scanning the module
-source for project-specific vocabulary.)
+no knowledge of COMO, ROAR, or any other project-specific name -- verified
+by inspection during development, not by an automated scan.)
 
 Algorithm (all config-driven via `dq_sampling_config`, nothing hardcoded):
 1. Pull candidates from the universe table, `WHERE NOT (exclusion_sql)`
@@ -328,8 +358,8 @@ Algorithm (all config-driven via `dq_sampling_config`, nothing hardcoded):
 step 1 pulls the candidate pool, `run_stratified_sampling()` compares its
 size against that same `dq_sampling_config` row's own history --
 config_id-scoped, so a different sample definition has its own
-independent baseline -- using `core.metrics.evaluate_metric_drift()`
-(z-score and/or IQR, same math and same severity tiers `core/`'s DQ-score
+independent baseline -- using `rules_engine.metrics.evaluate_metric_drift()`
+(z-score and/or IQR, same math and same severity tiers `rules_engine/`'s DQ-score
 anomaly detection uses). No new metadata table was needed: every prior
 run's candidate count is already fully recoverable from
 `dq_sample_selections` (one row per candidate per `sample_run_id`,
@@ -339,7 +369,7 @@ upstream feed broke and fewer rows landed than normal; a sharp jump can
 mean a `universe_table`/`exclusion_sql` config change let unintended rows
 through -- both are worth a human's attention before N cases get pulled
 from a pool that's quietly the wrong size. Detection is non-fatal (same
-principle as `core/`'s post-run metrics/anomaly steps) and its result is
+principle as `rules_engine/`'s post-run metrics/anomaly steps) and its result is
 always present under the `volume_drift` key of `run_stratified_sampling()`'s
 return dict (`{}` when nothing looks anomalous or there isn't history yet).
 
@@ -349,10 +379,10 @@ guessed at -- the exact target % wasn't in the source document excerpt
 provided, and a wrong guess baked into code is worse than an explicit
 TODO in config.
 
-Tested end-to-end against a 1,000-row synthetic universe in
-`tests/test_sampling.py` (mix ratios, exclusion enforcement, target
-volume, the no-project-specific-vocabulary check, the framework-boundary
-guard described above, and -- separately, against a synthetic
+Verified end-to-end against a 1,000-row synthetic universe during
+development (mix ratios, exclusion enforcement, target volume, the
+no-project-specific-vocabulary check, the framework-boundary guard
+described above, and -- separately, against a synthetic
 `dq_sample_selections` history -- the volume drift detector: flags a
 sharp drop, stays silent on a stable pool, and returns `{}` cleanly on a
 config's very first-ever run with no history to compare against).
@@ -364,8 +394,8 @@ New: `entrypoints.py` -- `lambda_handler`, `glue_main`,
 
 All are thin: they parse a platform-specific trigger shape (Lambda event /
 Glue job args / cron tick / Airflow context) and call
-`core.engine.run_engine()` -- the same function `main.py`'s existing CLI
-calls. Nothing in `core/`, `db/`, `sampling/`, or `utils/` imports from
+`rules_engine.engine.run_engine()` -- the same function `rules_engine/main.py`'s existing CLI
+calls. Nothing in `rules_engine/`, `db/`, `sampling/`, or `utils/` imports from
 `entrypoints.py`, so the dependency only goes one way -- remove any one
 wrapper function and the engine still runs everywhere else.
 `DataQualityEngineOperator` degrades gracefully (wrapped in
@@ -378,18 +408,18 @@ optionally chains into the Sampling Framework: a job entry's
 `sampling.engine.run_stratified_sampling()` after the rules-engine run
 completes (`_run_cron_sampling`). That's deployment-schedule
 convenience, not a code dependency between the two frameworks -- see §3.6
-for why `sampling/` never imports back into `core/`.
+for why `sampling/` never imports back into `rules_engine/`.
 
 ### 3.8 Severity vocabulary
 
 `dq_rules.severity` is free text -- a project stores its own vocabulary
 **exactly as its source document defines it** rather than being forced
-into a generic enum. `core/executor.py::evaluate_rule()` decides FAIL vs
+into a generic enum. `rules_engine/executor.py::evaluate_rule()` decides FAIL vs
 WARN by INVERSION rather than by hardcoding any project's labels: a small
 fixed set of "soft" severities (`WARN`, `WARNING`, `INFO`, `NOTICE`)
 resolve to WARN, and everything else -- whatever a project calls it
 (`'Compliance Flag'`, `'Timeliness'`, `'P1'`, anything) -- resolves to FAIL.
-No project's severity vocabulary is ever written into `core/executor.py`;
+No project's severity vocabulary is ever written into `rules_engine/executor.py`;
 HealthSpring UM's three severities work purely because they aren't in the
 soft set, the same as any other project's would.
 
@@ -397,14 +427,14 @@ soft set, the same as any other project's would.
 
 | # | Issue | Status | Evidence |
 |---|---|---|---|
-| 1 | Failed-record count wrong when capped | Already correct | `core/executor.py::_count_failed()` runs a separate `COUNT(*)` subquery; `_fetch_failed_rows()` is only used for exception capture, never for the recorded count. |
+| 1 | Failed-record count wrong when capped | Already correct | `rules_engine/executor.py::_count_failed()` runs a separate `COUNT(*)` subquery; `_fetch_failed_rows()` is only used for exception capture, never for the recorded count. |
 | 2 | Rule that fails to run must be SKIPPED, not omitted | Already correct | `execute_rule()` calls `record_rule_execution(..., status="SKIP", ...)` before returning when `validate_table_exists` fails. |
-| 3 | Empty source table must not silently PASS | Already correct | `core/executor.py::evaluate_rule()` -- `require_rows` param, `dq_rules.require_rows` column. |
-| 4 | Threshold logic needs AND and OR | Already correct | `evaluate_rule(..., threshold_operator=...)`, wired from `execute_rule()` -> `rule.get("threshold_operator", "OR")`; covered by `tests/test_core.py`. |
-| 5 | No silent double-counting on concurrent runs | Already correct | `dq_metrics_summary_uix` UNIQUE INDEX + `core/metrics.py::_upsert_metrics()` catches the duplicate-key error and falls back to a pure `UPDATE`. |
+| 3 | Empty source table must not silently PASS | Already correct | `rules_engine/executor.py::evaluate_rule()` -- `require_rows` param, `dq_rules.require_rows` column. |
+| 4 | Threshold logic needs AND and OR | Already correct | `evaluate_rule(..., threshold_operator=...)`, wired from `execute_rule()` -> `rule.get("threshold_operator", "OR")`; verified manually against DuckDB. |
+| 5 | No silent double-counting on concurrent runs | Already correct | `dq_metrics_summary_uix` UNIQUE INDEX + `rules_engine/metrics.py::_upsert_metrics()` catches the duplicate-key error and falls back to a pure `UPDATE`. |
 | 6 | Credentials read at call time, not import | Already correct | Every adapter's `_require()`/env read happens inside `build()`, called from `ConnectionFactory._build()` at `load()`/reconnect/`new_connection()` time -- never at module import. `utils/alert.py::_load_config()` is called inside `send_alert()`, not at import. |
-| 7 | Retry transient source errors | Already correct | `core/executor.py` wraps `_count_total`, `_count_failed`, `_run_table_check`, `_fetch_failed_rows` in a `tenacity` retry decorator (`DQ_QUERY_MAX_RETRIES`, exponential backoff). |
-| 8 | Dialect mismatch must fail before execution | Fixed here | Did not exist -- no dialect concept in the reference repo at all. Added dialect enforcement in `core/rule_sql.py` + `dq_rules.sql_dialect`, wired into both `engine.py::_pre_validate_rules` (load-time) and `executor.py::execute_rule` (defense-in-depth). See §3.1 and `tests/test_core.py`. |
+| 7 | Retry transient source errors | Already correct | `rules_engine/executor.py` wraps `_count_total`, `_count_failed`, `_run_table_check`, `_fetch_failed_rows` in a `tenacity` retry decorator (`DQ_QUERY_MAX_RETRIES`, exponential backoff). |
+| 8 | Dialect mismatch must fail before execution | Fixed here | Did not exist -- no dialect concept in the reference repo at all. Added dialect enforcement in `rules_engine/rule_sql.py` + `dq_rules.sql_dialect`, wired into both `engine.py::_pre_validate_rules` (load-time) and `executor.py::execute_rule` (defense-in-depth). See §3.1. |
 
 Net new work from Section 8: one item (dialect enforcement). Everything
 else was already correct in the repo; re-verified here rather than
@@ -415,14 +445,15 @@ and risks regressions.
 
 - The connector interface (`SourceAdapter` ABC) -- S3 slots in without
   touching `cursor()`/`commit()`/`close()`/`ping()`/`prepare()`.
-- The thread-pool / dependency-graph / priority-ordering engine core.
+- The thread-pool / dependency-graph / priority-ordering engine rules_engine.
 - The rule-versioning, suppression, profiling, and anomaly-detection
   modules -- reused rather than reinvented; "what did the rule say a year
   ago" is already served by `dq_rule_versions`.
 - `dq_exceptions`'s schema and immutability contract -- extended via a
   joined table, not mutated.
 
-## 6. Data model deltas (v6) -- see `ddl.sql` for full DDL
+## 6. Data model deltas (v6) -- see `ddl_shared.sql`, `rules_engine/ddl.sql`,
+and `sampling/ddl.sql` for full DDL
 
 | Change | Table | Why |
 |---|---|---|
@@ -448,10 +479,10 @@ audit-fidelity reasons:
 that used to carry its own project/process pair now carries a `scope_id`
 FK instead: `dq_rules`, `dq_run_control`, `dq_metrics_summary`,
 `dq_sampling_config`. Resolved via `utils/db_helpers.py::get_scope_id()`
-(get-or-create, race-safe the same way `core/metrics.py::_upsert_metrics`
+(get-or-create, race-safe the same way `rules_engine/metrics.py::_upsert_metrics`
 already handled concurrent-run MERGE races) at write time, or
 `find_scope_id()` (read-only, returns `None` for an unseen project/process
-rather than creating one) at read/filter time. `core/engine.py::run_engine`
+rather than creating one) at read/filter time. `rules_engine/engine.py::run_engine`
 resolves this once per run and stores it on the in-memory `run` dict as
 `run["scope_id"]`, so every rule execution in that run reuses the same
 resolved value instead of re-resolving per rule.
@@ -492,8 +523,8 @@ by `exception_id` for everything else.
 `dq_anomaly_config`, `dq_notification_routes`.** These are low-row-count,
 NULL-wildcard config tables ("`project_name IS NULL` = applies to every
 project") matched by a most-specific-row-wins rule at read time
-(`core/metrics.py::_load_config`, `core/reporting.py::_load_routes`,
-`core/profiler.py::_load_profile_configs`). They're not high-volume fact
+(`rules_engine/metrics.py::_load_config`, `rules_engine/reporting.py::_load_routes`,
+`rules_engine/profiler.py::_load_profile_configs`). They're not high-volume fact
 tables, so the duplication-avoidance payoff is negligible, and collapsing
 project_name+process_name into one `scope_id` FK would still need to
 represent three distinct wildcard levels (fully global / project-wide /
@@ -509,7 +540,7 @@ To onboard an unrelated second use case: insert rows into `dq_connections`
 `check_type` tag, or check_type-generated), optionally a
 `dq_sampling_config` row if it needs ranked sampling, and
 `dq_notification_routes` rows for its own audiences. Zero files under
-`core/` or `utils/` need to change, and `db/adapters.py` only changes if a
+`rules_engine/` or `utils/` need to change, and `db/adapters.py` only changes if a
 4th connector type is needed. This is the same mechanism HealthSpring UM
 itself is configured through (`config/seed/`) -- it isn't a special case.
 

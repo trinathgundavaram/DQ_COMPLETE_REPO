@@ -1,5 +1,5 @@
 """
-core/engine.py
+rules_engine/engine.py
 --------------
 Main DQ execution engine.
 
@@ -36,25 +36,25 @@ from datetime import datetime
 
 from config.env_config import get_meta_db
 from db.connection_factory import ConnectionFactory
-from core.executor import (
+from rules_engine.executor import (
     execute_query,
     execute_dml,
     execute_rule,
     record_rule_execution,
     validate_sql,
 )
-from core.rule_sql import build_query
-from core.metrics import calculate_metrics, detect_and_log as detect_anomalies
-from core.rule_lifecycle import is_suppressed, record_suppressed_execution, snapshot_changed_rules
-from core.profiler import profile_tables_for_run
+from rules_engine.rule_sql import build_query
+from rules_engine.metrics import calculate_metrics, detect_and_log as detect_anomalies
+from rules_engine.rule_lifecycle import is_suppressed, record_suppressed_execution, snapshot_changed_rules
+from rules_engine.profiler import profile_tables_for_run
 from utils.ids import generate_run_id
 from utils.db_helpers import get_scope_id, find_scope_id
 from utils.metadata_writers import log_message
 from utils.alert import send_alert
-from core import reporting
+from rules_engine import reporting
 from utils.validation import validate_table_exists
 from utils.metadata_writers import log_issue
-from core.rule_sql import check_dialect, DialectMismatchError, check_no_dml_ddl, UnsafeRuleSQLError
+from rules_engine.rule_sql import check_dialect, DialectMismatchError, check_no_dml_ddl, UnsafeRuleSQLError
 
 # ── Configurable log level (DQ_LOG_LEVEL overrides; default INFO) ─────────────
 _log_level = getattr(logging, os.getenv("DQ_LOG_LEVEL", "INFO").upper(), logging.INFO)
@@ -407,7 +407,7 @@ def run_engine(
 
         # Section 3.5: data findings (FAIL/WARN) and engine/rule failures
         # (ERROR/SKIP) are ALWAYS split into separate notification audiences
-        # — never merged into one alert. See core/reporting.py.
+        # — never merged into one alert. See rules_engine/reporting.py.
         data_issue_rules   = sum(1 for v in results.values() if v in ("FAIL", "WARN"))
         engine_issue_rules = sum(1 for v in results.values() if v in ("ERROR", "SKIP"))
         suppressed_rules   = sum(1 for v in results.values() if v == "SUPPRESSED")
@@ -424,7 +424,7 @@ def run_engine(
         # env var so ad-hoc/local runs don't spam the report archive.
         if os.getenv("DQ_AUTO_AUDIT_REPORT", "false").lower() == "true":
             try:
-                from core.reporting import generate_report
+                from rules_engine.reporting import generate_report
                 out_dir = os.getenv("DQ_AUDIT_REPORT_DIR", "./dq_audit_reports")
                 report_path = generate_report(td, meta_db, run_id, out_dir)
                 logger.info("Audit report generated: %s", report_path)
@@ -599,7 +599,7 @@ def _pre_validate_rules(rules: list, cf, run: dict, meta_db: str, td) -> list:
             continue
 
         # rule_syntax must be read-only — checked before it ever touches a
-        # live connection (see core/rule_sql.py::check_no_dml_ddl for why a
+        # live connection (see rules_engine/rule_sql.py::check_no_dml_ddl for why a
         # generic SQL_SYNTAX failure isn't good enough: a data-modifying
         # CTE still parses as a SELECT and would otherwise only be caught
         # by validate_sql()'s dry-run below, by which point the write has

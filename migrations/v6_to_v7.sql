@@ -11,7 +11,7 @@
 -- raw project_name/process_name pair at it via a scope_id FK, then drops
 -- the now-redundant columns from child tables that can derive the same
 -- information through an existing FK join (run_id -> dq_run_control,
--- config_id -> dq_sampling_config). See ddl.sql's v7 header comment for
+-- config_id -> dq_sampling_config). See ddl_shared.sql's v7 header comment for
 -- the full rationale (in particular: rule_code/severity/table_name on
 -- dq_rule_execution/dq_exceptions are DELIBERATELY NOT touched by this
 -- migration -- those are frozen audit snapshots, not duplication).
@@ -37,7 +37,7 @@
 --    already have a dq_scope row to join against.
 -- 4. Test this against a lower environment (DEV/QA) copy of the schema
 --    before running it against PROD -- this script has been validated
---    for internal consistency and against ddl.sql's documented v7 shape,
+--    for internal consistency and against ddl_shared.sql's documented v7 shape,
 --    not executed against a live Teradata instance as part of this repo
 --    (the test suite uses DuckDB as a stand-in; see tests/test_engine_e2e.py).
 -- 5. Deploy the application code that expects v7 (this repo, current
@@ -45,8 +45,8 @@
 --    scope_id exists and the old project_name/process_name columns on
 --    dq_rules/dq_run_control/dq_metrics_summary/dq_sampling_config are
 --    gone (utils/db_helpers.py::get_scope_id/find_scope_id, and every
---    scope_id-joined query in core/engine.py, core/metrics.py,
---    core/reporting.py, sampling/engine.py).
+--    scope_id-joined query in rules_engine/engine.py, rules_engine/metrics.py,
+--    rules_engine/reporting.py, sampling/engine.py).
 -- ============================================================
 
 
@@ -178,7 +178,7 @@ ON CMSUNIV_FILELAND_DEV_T.dq_run_control;
 -- (project_name, process_name, run_type, batch_id, dataset_id, run_month)
 -- (see the v1->v2 block above) -- it must be dropped and recreated on
 -- (scope_id, run_type, batch_id, dataset_id, run_month), or the MERGE in
--- core/metrics.py::_upsert_metrics will violate the old index the moment
+-- rules_engine/metrics.py::_upsert_metrics will violate the old index the moment
 -- two scope_ids share a run_type/batch_id/dataset_id/run_month combo.
 DROP INDEX dq_metrics_summary_uix ON CMSUNIV_FILELAND_DEV_T.dq_metrics_summary;
 
@@ -218,7 +218,8 @@ ALTER TABLE CMSUNIV_FILELAND_DEV_T.dq_sampling_config DROP COLUMN project_name;
 ALTER TABLE CMSUNIV_FILELAND_DEV_T.dq_sampling_config DROP COLUMN process_name;
 
 -- Optional, environment-permitting: enforce NOT NULL on the four scope_id
--- columns above to match ddl.sql's final v7 shape (dq_rules,
+-- columns above to match rules_engine/ddl.sql's and sampling/ddl.sql's
+-- final v7 shape (dq_rules,
 -- dq_run_control, and dq_sampling_config declare scope_id NOT NULL;
 -- dq_metrics_summary leaves it nullable). Teradata's ALTER TABLE ... ADD
 -- CONSTRAINT for column nullability varies by platform version -- if
@@ -241,7 +242,7 @@ ALTER TABLE CMSUNIV_FILELAND_DEV_T.dq_sampling_config DROP COLUMN process_name;
 -- NOT touched: dq_rule_execution.rule_code/severity/table_name and
 -- dq_exceptions.rule_code/table_name -- deliberate frozen audit
 -- snapshots of what a mutable dq_rules row said at execution time, see
--- ddl.sql's v7 header comment. Do not drop those.
+-- ddl_shared.sql's v7 header comment. Do not drop those.
 -- ============================================================
 
 ALTER TABLE CMSUNIV_FILELAND_DEV_T.dq_rule_execution DROP COLUMN project_name;
@@ -301,14 +302,15 @@ CREATE INDEX dq_exception_dispositions_lookup_ix (exception_id, effective_flag)
 ON CMSUNIV_FILELAND_DEV_T.dq_exception_dispositions;
 
 -- All dispositions are re-derivable via a JOIN to dq_exceptions on
--- exception_id (which is itself immutable) -- see ddl.sql's v7 header
+-- exception_id (which is itself immutable) -- see ddl_shared.sql's v7 header
 -- comment, point 3, for why nothing here needed a backfill either.
 
 
 -- ============================================================
 -- FINAL VERIFICATION
 -- ============================================================
--- Compare the live schema against ddl.sql's v7 CREATE TABLE statements
+-- Compare the live schema against rules_engine/ddl.sql's and
+-- sampling/ddl.sql's v7 CREATE TABLE statements
 -- for every table this script touched, e.g.:
 --   HELP TABLE CMSUNIV_FILELAND_DEV_T.dq_rules;
 --   HELP TABLE CMSUNIV_FILELAND_DEV_T.dq_run_control;

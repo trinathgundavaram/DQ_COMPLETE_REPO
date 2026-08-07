@@ -1,0 +1,64 @@
+name: CI
+
+# Lightweight CI: a compile sweep of every .py file, plus a static check
+# that the one-directional framework boundary (rules_engine/ must never
+# import sampling/) hasn't been violated. No test suite is run here --
+# this repo is a reusable framework, not an application with its own
+# bundled test suite, so there's nothing to exercise beyond making sure
+# every module parses and the architecture invariant documented in
+# DESIGN.md still holds.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  compile-and-boundary-check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile every module (catches syntax errors)
+        run: |
+          find . -name "*.py" -not -path "./.git/*" -print0 \
+            | xargs -0 -n1 python -m py_compile
+
+      - name: Verify rules_engine/ never imports sampling/ (framework boundary)
+        run: |
+          python -c "
+          import ast, pathlib, sys
+
+          violations = []
+          for path in pathlib.Path('rules_engine').rglob('*.py'):
+              tree = ast.parse(path.read_text(), filename=str(path))
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      names = [a.name for a in node.names]
+                  elif isinstance(node, ast.ImportFrom):
+                      names = [node.module or '']
+                  else:
+                      continue
+                  if any(n == 'sampling' or n.startswith('sampling.') for n in names):
+                      violations.append(f'{path}: imports {names}')
+
+          if violations:
+              print('rules_engine/ must never import sampling/ -- one-directional dependency violated:')
+              for v in violations:
+                  print(f'  {v}')
+              sys.exit(1)
+          print('OK: rules_engine/ has no sampling/ imports.')
+          "

@@ -2,8 +2,8 @@
 entrypoints.py
 -----------------
 Trigger/orchestration-specific wrappers — one function or class per
-execution context, all calling core.engine.run_engine() (the same function
-main.py's CLI calls). Nothing in core/, db/, sampling/, or utils/ imports
+execution context, all calling rules_engine.engine.run_engine() (the same function
+rules_engine/main.py's CLI calls). Nothing in rules_engine/, db/, sampling/, or utils/ imports
 anything from this file — the dependency only goes one way. That's what
 "only the trigger differs" means in code: delete any one function below
 and the engine still works everywhere else. Adding a 4th execution context
@@ -14,7 +14,7 @@ means adding one more function here, not a new file.
   run_dq_engine(...) / DataQualityEngineOperator — Airflow (plain callable + optional operator)
   cron_run_once(argv) / cron_run_scheduler(path) — local Python server (crontab or APScheduler)
 
-This file is where the two frameworks in this repo (core/ = DQ rules
+This file is where the two frameworks in this repo (rules_engine/ = DQ rules
 engine, sampling/ = stratified sampling) meet, but only at the
 orchestration level: cron_run_scheduler() can optionally chain a
 sampling.engine.run_stratified_sampling() call after a rules-engine run
@@ -49,7 +49,7 @@ def lambda_handler(event, context):
     `event` may be the payload directly, or wrapped under "input"/"detail"
     (Step Functions / EventBridge rule conventions) — both are handled.
     """
-    from core.engine import run_engine
+    from rules_engine.engine import run_engine
 
     payload = event.get("detail", event.get("input", event)) if isinstance(event, dict) else event
     if isinstance(payload, str):
@@ -90,7 +90,7 @@ def glue_main():
     except ImportError:
         args = optional = _parse_plain_args(sys.argv[1:])
 
-    from core.engine import run_engine
+    from rules_engine.engine import run_engine
 
     result = run_engine(
         project=args["project"], process=args["process"],
@@ -138,7 +138,7 @@ def run_dq_engine(
                        "run_type": "WEEKLY", "run_mode": "DATE",
                        "start_date": "{{ ds }}", "end_date": "{{ ds }}"})
     """
-    from core.engine import run_engine
+    from rules_engine.engine import run_engine
 
     result = run_engine(project=project, process=process, run_type=run_type, run_mode=run_mode,
                         batch_id=batch_id, start_date=start_date, end_date=end_date, dry_run=dry_run)
@@ -196,10 +196,10 @@ except ImportError:
 def cron_run_once(argv=None):
     """
     Single-shot mode for a plain crontab entry — identical to running
-    main.py directly:
+    rules_engine/main.py directly:
         python -m entrypoints --once --project ... (via the CLI below)
     """
-    from main import main as cli_main
+    from rules_engine.main import main as cli_main
     cli_main(argv)
 
 
@@ -241,7 +241,7 @@ def cron_run_scheduler(config_path: str):
 
 
 def _run_cron_job(job: dict):
-    from core.engine import run_engine
+    from rules_engine.engine import run_engine
 
     end_date = date.today()
     start_date = end_date - timedelta(days=int(job.get("lookback_days", 7)) - 1)
@@ -273,7 +273,7 @@ def _run_cron_sampling(job: dict, engine_result: dict, start_date=None, end_date
     cron job. This is the only place in entrypoints.py that touches both
     frameworks — it's deployment glue, not a dependency between them."""
     from config.env_config import get_meta_db
-    from core.executor import execute_query
+    from rules_engine.executor import execute_query
     from sampling.engine import run_stratified_sampling
     from db.connection_factory import ConnectionFactory
 
