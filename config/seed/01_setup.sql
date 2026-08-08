@@ -102,7 +102,7 @@ VALUES
 -- z-score/IQR against each rule's OWN run history — reuses the engine's
 -- existing anomaly detector (rules_engine/metrics.py), not a new mechanism.
 INSERT INTO CMSUNIV_FILELAND_T.dq_anomaly_config
-    (config_id, project_name, process_name, run_type, method,
+    (config_id, project_name, process_name, run_type, process,
      zscore_threshold, iqr_multiplier, min_history_runs, alert_on_anomaly)
 VALUES
     (1, 'HEALTHSPRING_UM', 'UNIVERSE_VALIDATION', NULL, 'BOTH', 3.0, 1.5, 8, 1);

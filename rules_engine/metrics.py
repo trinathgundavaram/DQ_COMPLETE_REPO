@@ -822,7 +822,10 @@ def _load_config(
 
     best = max(rows, key=specificity)
     return {
-        "method":           (best.get("method") or _DEFAULT_METHOD).upper(),
+        # dq_anomaly_config's column is named 'process' (not 'method' --
+        # that's a Teradata reserved word); the "method" key here is this
+        # module's own internal name for the detection algorithm choice.
+        "method":           (best.get("process") or _DEFAULT_METHOD).upper(),
         "zscore_threshold": float(best.get("zscore_threshold") or _DEFAULT_ZSCORE_THRESHOLD),
         "iqr_multiplier":   float(best.get("iqr_multiplier")   or _DEFAULT_IQR_MULTIPLIER),
         "min_history_runs": int(best.get("min_history_runs")   or _DEFAULT_MIN_HISTORY),

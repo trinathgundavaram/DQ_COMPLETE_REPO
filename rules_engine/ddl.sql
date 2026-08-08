@@ -314,7 +314,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_profile_config (
     project_name    VARCHAR(100),       -- NULL = all projects
     process_name    VARCHAR(100),       -- NULL = all processes
     table_name      VARCHAR(200) NOT NULL,  -- fully-qualified table name
-    enabled         BYTEINT DEFAULT 1,
+    active          BYTEINT DEFAULT 1,      -- 'enabled' is a Teradata reserved word
     columns_include VARCHAR(2000),      -- CSV of columns; NULL = all columns
     columns_exclude VARCHAR(2000),      -- CSV of columns to skip
     top_n_values    INTEGER DEFAULT 10,
@@ -337,7 +337,8 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_anomaly_config (
     project_name        VARCHAR(100),   -- NULL = global default
     process_name        VARCHAR(100),   -- NULL = all processes in project
     run_type            VARCHAR(50),    -- NULL = all run types
-    method               VARCHAR(10) DEFAULT 'ZSCORE',  -- ZSCORE | IQR | BOTH
+    process             VARCHAR(10) DEFAULT 'ZSCORE',  -- detection algorithm: ZSCORE | IQR | BOTH
+                                                          -- ('method' is a Teradata reserved word)
     zscore_threshold    FLOAT DEFAULT 3.0,
     iqr_multiplier      FLOAT DEFAULT 1.5,
     min_history_runs    INTEGER DEFAULT 10, -- skip detection if < N history points

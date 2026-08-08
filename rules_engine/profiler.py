@@ -12,7 +12,7 @@ Insert a row into dq_profile_config:
 
     INSERT INTO {meta_db}.dq_profile_config
         (config_id, project_name, process_name, table_name,
-         enabled, columns_include, columns_exclude, top_n_values, run_frequency)
+         active, columns_include, columns_exclude, top_n_values, run_frequency)
     VALUES
         (1, 'CLAIMS', 'MEMBER', 'CLAIMS_DB.SCHEMA.MEMBER_TBL',
          1, NULL, 'LOAD_TS,AUDIT_USER', 10, 'ALWAYS');
@@ -110,7 +110,7 @@ def profile_tables_for_run(
         rule = target["rule"]
         cfg  = cfg_by_table.get(tbl)
 
-        if cfg is None or not cfg.get("enabled", 1):
+        if cfg is None or not cfg.get("active", 1):
             continue
         if not _should_run_now(cfg):
             logger.debug("Profiling skipped for %s (frequency=%s, last_profiled=%s).",
@@ -425,7 +425,7 @@ def _load_profile_configs(td_conn, run: dict, meta_db: str, execute_query) -> li
             f"""
             SELECT *
             FROM {meta_db}.dq_profile_config
-            WHERE enabled = 1
+            WHERE active = 1
               AND (project_name IS NULL OR project_name = ?)
               AND (process_name IS NULL OR process_name = ?)
             """,
