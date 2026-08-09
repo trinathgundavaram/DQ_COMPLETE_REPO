@@ -38,7 +38,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_sampling_config (
     active_flag              BYTEINT DEFAULT 1,
     created_at                TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (config_id);
+UNIQUE PRIMARY INDEX (config_id);
 
 -- Immutable output: every candidate case considered, scored, and whether it
 -- was selected — not just the final 150. Retained 10y per Section 3.7;
@@ -60,7 +60,13 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_sample_selections (
     strata_json                   CLOB,               -- snapshot of the row's stratification attrs
     created_at                      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (sample_run_id);
+PRIMARY INDEX (sample_run_id);   -- NUPI on purpose: every candidate case
+                                  -- considered in one sampling run shares
+                                  -- sample_run_id. sample_row_id (identity)
+                                  -- is the real per-row identifier.
 
+-- Matches sampling/anomaly.py's "WHERE config_id = ? ... GROUP BY
+-- sample_run_id" (candidate-pool history) -- config_id isn't the PI, so
+-- that filter would otherwise be a full-table scan.
 CREATE INDEX dq_sample_selections_lookup_ix (config_id, sample_cycle, selected_flag)
 ON CMSUNIV_FILELAND_DEV_T.dq_sample_selections;

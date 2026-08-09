@@ -173,7 +173,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_rule_execution (
     run_month       DATE,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (run_id, rule_id)
+UNIQUE PRIMARY INDEX (run_id, rule_id)
 PARTITION BY RANGE_N(
     run_date BETWEEN DATE '2024-01-01' AND DATE '2034-12-31'
     EACH INTERVAL '1' MONTH
@@ -185,12 +185,12 @@ Notes on this pattern:
   revisited before it's reached -- `ALTER TABLE ... MODIFY ... ADD RANGE`
   extends it without a rebuild, so this is a much cheaper maintenance
   task than the initial partitioning migration.
-- `PRIMARY INDEX` is unchanged (still `run_id, rule_id`) -- partitioning
-  is a physical storage/pruning mechanism layered on top of the primary
-  index, not a replacement for it. Existing queries keyed on `run_id`
-  keep working exactly as they do today; queries that ALSO filter on
-  `run_date`/`created_at` (which most dashboard and reporting queries do)
-  get partition elimination for free.
+- `PRIMARY INDEX` is unchanged (still `UNIQUE PRIMARY INDEX (run_id,
+  rule_id)`) -- partitioning is a physical storage/pruning mechanism
+  layered on top of the primary index, not a replacement for it.
+  Existing queries keyed on `run_id` keep working exactly as they do
+  today; queries that ALSO filter on `run_date`/`created_at` (which most
+  dashboard and reporting queries do) get partition elimination for free.
 - Apply the same `RANGE_N(... EACH INTERVAL '1' MONTH)` pattern to the
   other seven tables in the table above, substituting each table's own
   partition column.

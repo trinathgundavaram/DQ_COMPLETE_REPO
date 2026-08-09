@@ -51,7 +51,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_rules (
     sql_dialect          VARCHAR(10),                         -- 'teradata'|'postgres'|'ansi'
     business_correctable BYTEINT DEFAULT 0                    -- drives notification routing
 )
-PRIMARY INDEX (rule_id);
+UNIQUE PRIMARY INDEX (rule_id);
 
 CREATE INDEX dq_rules_scope_ix (scope_id, active_flag)
 ON CMSUNIV_FILELAND_DEV_T.dq_rules;
@@ -73,10 +73,13 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_run_control (
     status        VARCHAR(20),
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (run_id);
+UNIQUE PRIMARY INDEX (run_id);
 
-CREATE INDEX dq_run_control_scope_ix (scope_id, run_type, start_time)
-ON CMSUNIV_FILELAND_DEV_T.dq_run_control;
+-- No secondary index here: nothing in the codebase filters dq_run_control
+-- by scope_id/run_type/start_time. Every real access is either
+-- WHERE run_id = ? (the PI, direct single-AMP retrieve) or
+-- WHERE status = 'RUNNING' AND start_time < ... (stale-run cleanup, a
+-- once-per-engine-startup scan of a small table -- not worth an index).
 
 
 
@@ -105,7 +108,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_rule_execution (
     run_month       DATE,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (run_id, rule_id);
+UNIQUE PRIMARY INDEX (run_id, rule_id);   -- one row per rule per run
 
 
 -- same reasoning as dq_rule_execution above — project/process/run_type/
@@ -120,7 +123,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_exceptions (
     primary_key_str  VARCHAR(500),
     created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (exception_id);
+UNIQUE PRIMARY INDEX (exception_id);
 
 
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_metrics_summary (
@@ -139,7 +142,11 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_metrics_summary (
     dq_score         FLOAT,
     created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (scope_id, run_type, run_month);
+PRIMARY INDEX (scope_id, run_type, run_month);   -- NUPI on purpose: chosen for
+                                                   -- AMP-distribution/grouping,
+                                                   -- not identity -- the real
+                                                   -- uniqueness key is wider
+                                                   -- (see the USI right below)
 
 -- UNIQUE INDEX prevents double-INSERT when two runs MERGE concurrently
 CREATE UNIQUE INDEX dq_metrics_summary_uix
@@ -147,12 +154,16 @@ CREATE UNIQUE INDEX dq_metrics_summary_uix
 ON CMSUNIV_FILELAND_DEV_T.dq_metrics_summary;
 
 -- Secondary index on dq_exceptions for fast lookup by run_id / rule_id
---     (PI is exception_id/identity — run-based queries would be full-table scans)
+--     (PI is exception_id/identity — run-based queries would be full-table
+--     scans otherwise; matches rules_engine/reporting.py's
+--     "WHERE run_id = ?" reads and its JOIN to dq_rules on rule_id)
 CREATE INDEX dq_exceptions_run_rule_ix (run_id, rule_id)
 ON CMSUNIV_FILELAND_DEV_T.dq_exceptions;
 
 -- Secondary index on dq_rule_execution for dashboard status filtering
---     (e.g. WHERE run_id = ? AND status = 'FAIL')
+--     (matches rules_engine/reporting.py's and dashboard/streamlit_app.py's
+--     "WHERE run_id = ? [AND status IN (...)]" reads; PI is (run_id,
+--     rule_id) so a run_id-only filter still needs this to avoid a scan)
 CREATE INDEX dq_rule_execution_status_ix (run_id, status)
 ON CMSUNIV_FILELAND_DEV_T.dq_rule_execution;
 
@@ -169,7 +180,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_check_catalog (
     optional_params   VARCHAR(500),         -- comma-separated list of optional param keys
     created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (check_type);
+UNIQUE PRIMARY INDEX (check_type);
 
 -- Seed data for dq_check_catalog (run once after table creation)
 INSERT INTO CMSUNIV_FILELAND_DEV_T.dq_check_catalog VALUES ('NOT_NULL',               'COMPLETENESS',  'ROW',   'Column must not contain NULL values',                                           '',                                    '',                    CURRENT_TIMESTAMP);
@@ -209,7 +220,8 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_run_logs (
     error_detail  CLOB,
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (run_id);
+PRIMARY INDEX (run_id);   -- NUPI on purpose: many log lines per run.
+                          -- log_id (identity) is the real per-row identifier.
 
 
 -- project_name/process_name dropped — derivable via run_id -> dq_run_control.
@@ -224,7 +236,8 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_rule_issues (
     error_detail  CLOB,
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (run_id);
+PRIMARY INDEX (run_id);   -- NUPI on purpose: many issues per run.
+                          -- issue_id (identity) is the real per-row identifier.
 
 
 -- ── Rule suppression, versioning, profiling, anomaly detection ─────────────
@@ -243,9 +256,17 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_rule_suppressions (
     lifted_by       VARCHAR(100),
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (rule_id);
+PRIMARY INDEX (rule_id);      -- NUPI on purpose: many suppressions per rule
+                               -- over time; rule_id lookups (is_suppressed())
+                               -- already get single-AMP access from this PI,
+                               -- so no secondary index needed for that path.
 
-CREATE INDEX dq_rule_suppressions_active_ix (rule_id, lifted_at, expires_at)
+-- suppression_id is the natural key ops uses to lift a specific
+-- suppression (see rule_lifecycle.py's docstring: "WHERE suppression_id
+-- = ?") but it isn't the PI (rule_id was chosen instead, for locality
+-- with is_suppressed()'s per-rule lookups) -- this is the only thing
+-- enforcing it can't collide.
+CREATE UNIQUE INDEX dq_rule_suppressions_id_uix (suppression_id)
 ON CMSUNIV_FILELAND_DEV_T.dq_rule_suppressions;
 
 
@@ -271,10 +292,11 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_rule_versions (
     changed_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     change_reason       VARCHAR(500)
 )
-PRIMARY INDEX (rule_id, version_num);
+UNIQUE PRIMARY INDEX (rule_id, version_num);   -- version_num never repeats per rule
 
-CREATE INDEX dq_rule_versions_code_ix (rule_code, changed_at)
-ON CMSUNIV_FILELAND_DEV_T.dq_rule_versions;
+-- No secondary index: every read in rules_engine/rule_lifecycle.py
+-- filters WHERE rule_id = ? (get_version_at_run, _write_snapshot),
+-- never rule_code -- the PI's leading column already serves those.
 
 
 -- Per-column statistical profile snapshots.
@@ -298,10 +320,14 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_column_profile (
     source_type     VARCHAR(50),
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (run_id, table_name, column_name);
+UNIQUE PRIMARY INDEX (run_id, table_name, column_name);   -- one profile row
+                                                            -- per column per
+                                                            -- table per run
 
-CREATE INDEX dq_column_profile_table_ix (table_name, profile_date)
-ON CMSUNIV_FILELAND_DEV_T.dq_column_profile;
+-- No secondary index: dq_column_profile is currently write-only (nothing
+-- in rules_engine/ or dashboard/ reads it back yet) -- an index with no
+-- query to serve is pure overhead. Add one, matched to the real WHERE
+-- clause, if/when a reader is built.
 
 
 -- Controls which tables are profiled and with what settings (opt-in).
@@ -322,10 +348,13 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_profile_config (
     last_profiled   TIMESTAMP,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (config_id);
+UNIQUE PRIMARY INDEX (config_id);
 
-CREATE INDEX dq_profile_config_lookup_ix (project_name, process_name, table_name)
-ON CMSUNIV_FILELAND_DEV_T.dq_profile_config;
+-- No secondary index: rules_engine/profiler.py's only read is
+-- "WHERE active = 1 AND (project_name IS NULL OR project_name = ?)
+-- AND (process_name IS NULL OR process_name = ?)" -- an OR-NULL wildcard
+-- match a standard index can't serve well, against a low-row-count
+-- table (same reasoning as dq_anomaly_config below, which also has none).
 
 
 -- Controls anomaly-detection sensitivity per project / process / run_type.
@@ -345,7 +374,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_anomaly_config (
     alert_on_anomaly    BYTEINT DEFAULT 1,
     created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (config_id);
+UNIQUE PRIMARY INDEX (config_id);
 
 
 -- Log of detected anomalies — one row per metric per run.
@@ -366,10 +395,17 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_anomaly_log (
     severity            VARCHAR(20),    -- INFO | LOW | MEDIUM | HIGH | CRITICAL
     created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (run_id);
+UNIQUE PRIMARY INDEX (run_id, metric_name, detection_method);
+    -- Real grain is finer than the table's header comment suggests:
+    -- rules_engine/metrics.py's detect_and_log() calls evaluate_metric_drift()
+    -- once per metric with method="BOTH" by default (see dq_anomaly_config
+    -- seed data), which can return one ZSCORE row AND one IQR row for the
+    -- SAME metric_name in the SAME run -- (run_id, metric_name) alone would
+    -- collide on the second INSERT. (Was just run_id, non-unique -- didn't
+    -- enforce any of this.)
 
-CREATE INDEX dq_anomaly_log_metric_ix (metric_name, created_at)
-ON CMSUNIV_FILELAND_DEV_T.dq_anomaly_log;
+-- No secondary index: dq_anomaly_log is currently write-only (nothing
+-- reads it back yet) -- an index with no query to serve is pure overhead.
 
 
 -- ============================================================
@@ -425,10 +461,16 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_exception_dispositions (
                                                   -- (still never UPDATEs the finding itself)
     created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (exception_id);
+PRIMARY INDEX (exception_id);   -- NUPI on purpose: additive-only, a new row
+                                 -- per disposition change shares exception_id
+                                 -- with every prior one (see comment above)
 
-CREATE INDEX dq_exception_dispositions_lookup_ix (exception_id, effective_flag)
-ON CMSUNIV_FILELAND_DEV_T.dq_exception_dispositions;
+-- No secondary index: dashboard/streamlit_app.py's only read is
+-- "WHERE effective_flag = 1" inside a derived table, joined to
+-- dq_exceptions afterward by exception_id -- exception_id (this table's
+-- PI) never appears as a predicate in that query, so an index led by it
+-- wouldn't help. effective_flag alone is too low-cardinality to be a
+-- useful index key.
 
 
 -- Notification routing — decouples "who gets told what" from rule logic.
@@ -453,8 +495,10 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_notification_routes (
     active_flag       BYTEINT DEFAULT 1,
     created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (route_id);
+UNIQUE PRIMARY INDEX (route_id);
 
-CREATE INDEX dq_notification_routes_lookup_ix
-    (project_name, process_name, finding_class, audience)
-ON CMSUNIV_FILELAND_DEV_T.dq_notification_routes;
+-- No secondary index: rules_engine/reporting.py's only read is
+-- "WHERE finding_class = ? AND active_flag = 1 AND (project_name IS NULL
+-- OR project_name = ?) AND (process_name IS NULL OR process_name = ?)" --
+-- audience is SELECTed, never filtered -- against a low-row-count table
+-- (same reasoning as dq_anomaly_config and dq_profile_config above).

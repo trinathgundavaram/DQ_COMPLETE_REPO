@@ -72,6 +72,45 @@
 --    logic in rules_engine/metrics.py, rules_engine/reporting.py, and
 --    rules_engine/profiler.py for no real benefit. Left as plain nullable
 --    columns on purpose.
+--
+-- 5. Every table below is CREATE MULTISET, never SET -- deliberately.
+--    A SET table's only behavioral difference is silently discarding an
+--    INSERT that exactly duplicates an existing row (every column, not
+--    just the PI) instead of erroring or storing it. That's a foot-gun
+--    for the log/audit-style tables here (dq_run_logs, dq_rule_issues,
+--    dq_anomaly_log, ...) -- a repeated log line or a genuine second
+--    identical exception is legitimate data, not noise to swallow
+--    silently. And on every table whose PRIMARY INDEX is declared UNIQUE
+--    (see note 6), SET buys nothing at all: two rows can't be full
+--    duplicates if they already can't share a PI value. MULTISET is the
+--    only choice that's both correct and never silently drops a row.
+--
+-- 6. PRIMARY INDEX is declared UNIQUE PRIMARY INDEX everywhere the PI
+--    column(s) are meant to be a one-row-per-key identifier (an IDENTITY
+--    surrogate key, or an application-assigned natural key like
+--    dq_rules.rule_id / dq_run_control.run_id that every FK in this
+--    schema points at) -- this makes Teradata itself reject a duplicate
+--    key at INSERT time with a clear error instead of silently allowing
+--    a second row that then makes every downstream join/lookup on that
+--    key ambiguous. Left as a plain (non-unique) PRIMARY INDEX only where
+--    more than one row per PI value is the actual documented grain of
+--    the table (dq_run_logs, dq_rule_issues, dq_rule_suppressions,
+--    dq_exception_dispositions, dq_sample_selections -- each has its own
+--    real single-row identity column elsewhere, usually a
+--    GENERATED ALWAYS AS IDENTITY column, and the PI is chosen instead
+--    for AMP-distribution locality with how the table is actually
+--    queried). dq_metrics_summary is the one exception that looks like
+--    it should be a UNIQUE PI but isn't: its real uniqueness key
+--    (scope_id, run_type, batch_id, dataset_id, run_month) is wider than
+--    the PI chosen for distribution, so uniqueness is enforced by
+--    dq_metrics_summary_uix instead -- see that table's comment.
+--
+--    Secondary (CREATE INDEX) indexes are kept to the minimum that
+--    actually matches a real WHERE/JOIN in the Python code -- each one
+--    left in place has a comment saying which query it serves. An index
+--    that doesn't match any query, or duplicates what the PRIMARY INDEX
+--    already gives you for free, is worse than useless: it's maintenance
+--    overhead on every INSERT/UPDATE/DELETE with no read ever benefiting.
 -- ============================================================
 
 -- ============================================================
@@ -104,7 +143,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_scope (
     process_name  VARCHAR(100),
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (scope_id);
+UNIQUE PRIMARY INDEX (scope_id);
 
 CREATE UNIQUE INDEX dq_scope_lookup_uix (project_name, process_name)
 ON CMSUNIV_FILELAND_DEV_T.dq_scope;
