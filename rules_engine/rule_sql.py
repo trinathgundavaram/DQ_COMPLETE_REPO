@@ -45,6 +45,8 @@ build_count_query(rule, run) -> str
 build_query(rule, run, source_type) -> (sql: str, level: str)
 validate_rule_params(rule) -> str | None       (static, no DB access)
 check_dialect(rule, source_type) -> None       (raises DialectMismatchError)
+check_no_dml_ddl(rule_syntax, rule_code) -> None   (raises UnsafeRuleSQLError)
+check_query_risk(rule) -> list[str]            (advisory cost warnings, never raises)
 """
 
 import logging
@@ -146,6 +148,92 @@ def check_no_dml_ddl(rule_syntax: str, rule_code: str = "") -> None:
             f"DML/DDL keyword '{hit}'. Rules may only read data (SELECT, including "
             f"CTEs that feed a SELECT) -- they must never write to the database."
         )
+
+
+# =============================================================================
+# Query-cost heuristics (advisory, not blocking)
+# =============================================================================
+#
+# check_no_dml_ddl() above answers "is this rule SAFE to run at all".
+# check_query_risk() answers a different question: "is this rule likely to
+# be EXPENSIVE against the source system" -- an unscoped SELECT * on a
+# billion-row table is perfectly safe SQL that can still burden a shared
+# source connection for everyone else using it. These are static, no-DB
+# text heuristics (no EXPLAIN / live cost estimate -- that would need a
+# connection and a dialect-specific plan parser per source_type, which is
+# real future work -- see DESIGN.md's follow-ups). They're intentionally
+# advisory (warnings logged to dq_rule_issues, never block a run) because
+# every one of them has a legitimate use (e.g. a full scan of a genuinely
+# small reference table is fine) -- the goal is to make a rule author
+# consciously confirm that, not to guess wrong and block a valid rule.
+# The runtime backstop that actually protects the source system regardless
+# of whether a rule LOOKED risky is executor.py's query timeout
+# (DQ_QUERY_TIMEOUT_SECONDS) -- this is a second, independent layer.
+
+_IN_LIST_WARN_THRESHOLD = 500   # items in a single literal IN (...) list
+
+
+def check_query_risk(rule: dict) -> list:
+    """
+    Scan a rule's SQL text for patterns that tend to produce expensive
+    queries. Returns a list of human-readable warning strings (empty list
+    = nothing flagged). Never raises.
+
+    Checked, regardless of authoring path (raw SQL / check_type / legacy
+    fragment), since an unscoped full-table read is a real cost risk no
+    matter how the SQL was produced:
+      - no scoping filter at all (filter_sql and filter_column both empty
+        -- build_filter() would fall back to the full-table '1=1')
+
+    Checked only for raw-SQL / legacy-fragment rules (check_type-generated
+    SQL is produced by trusted, already-reviewed generator code in
+    rules_engine/check_types.py, not free-text rule authoring):
+      - SELECT * with no visible WHERE anywhere in the statement
+      - an explicit CROSS JOIN
+      - a literal IN (...) list with more than _IN_LIST_WARN_THRESHOLD items
+    """
+    warnings = []
+
+    no_filter = (
+        not (rule.get("filter_sql") or "").strip()
+        and not (rule.get("filter_column") or "").strip()
+    )
+    if no_filter:
+        warnings.append(
+            "No filter_sql or filter_column set -- this rule scans the full "
+            "table on every run with no scoping. Confirm that's intentional "
+            "(fine for a small reference table; expensive on a large fact table)."
+        )
+
+    if is_raw_sql_rule(rule) or not (rule.get("check_type") or "").strip():
+        raw = _strip_sql_noise(rule.get("rule_syntax") or "")
+        upper = raw.upper()
+
+        if re.search(r"SELECT\s+\*", upper) and "WHERE" not in upper:
+            warnings.append(
+                "SELECT * with no WHERE clause anywhere in rule_syntax -- likely "
+                "reads every row and every column. Consider selecting only the "
+                "columns the rule needs and adding a scoping condition."
+            )
+
+        if re.search(r"\bCROSS\s+JOIN\b", upper):
+            warnings.append(
+                "Explicit CROSS JOIN found -- produces a row for every "
+                "combination of both sides. Confirm that's intentional, not an "
+                "accidental cartesian product from a missing join condition."
+            )
+
+        for match in re.finditer(r"\bIN\s*\(([^()]*)\)", raw, re.IGNORECASE):
+            item_count = match.group(1).count(",") + 1
+            if item_count > _IN_LIST_WARN_THRESHOLD:
+                warnings.append(
+                    f"Literal IN (...) list with ~{item_count} items -- some "
+                    f"source DBs cap or slow down badly on very large IN lists. "
+                    f"Consider a temp/joined table of values instead."
+                )
+                break   # one warning is enough even if multiple large lists exist
+
+    return warnings
 
 
 # =============================================================================

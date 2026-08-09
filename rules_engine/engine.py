@@ -54,7 +54,7 @@ from utils.alert import send_alert
 from rules_engine import reporting
 from utils.validation import validate_table_exists
 from utils.metadata_writers import log_issue
-from rules_engine.rule_sql import check_dialect, DialectMismatchError, check_no_dml_ddl, UnsafeRuleSQLError
+from rules_engine.rule_sql import check_dialect, DialectMismatchError, check_no_dml_ddl, UnsafeRuleSQLError, check_query_risk
 
 # ── Configurable log level (DQ_LOG_LEVEL overrides; default INFO) ─────────────
 _log_level = getattr(logging, os.getenv("DQ_LOG_LEVEL", "INFO").upper(), logging.INFO)
@@ -727,6 +727,16 @@ def _pre_validate_rules(rules: list, cf, run: dict, meta_db: str, td) -> list:
             log_issue(td, run, rule, "UNSAFE_RULE_SQL",
                       f"Pre-validation failed: {exc}", str(exc), meta_db=meta_db)
             continue
+
+        # Query-cost heuristics — advisory only, never blocks the run (see
+        # rules_engine/rule_sql.py::check_query_risk's docstring for why).
+        # Logged to dq_rule_issues so it's visible without stopping anything;
+        # the actual protection against a runaway query is executor.py's
+        # per-query timeout (DQ_QUERY_TIMEOUT_SECONDS), a separate layer.
+        for warning in check_query_risk(rule):
+            log_issue(td, run, rule, "QUERY_RISK",
+                      f"Pre-validation warning: {warning}", meta_db=meta_db)
+            logger.warning("Rule %s query-risk warning: %s", code, warning)
 
         try:
             if hasattr(db_conn, "prepare"):

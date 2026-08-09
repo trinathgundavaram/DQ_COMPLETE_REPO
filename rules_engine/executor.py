@@ -19,6 +19,15 @@ with exponential back-off. Retry count is controlled by
 DQ_QUERY_MAX_RETRIES (default 3). Metadata writes are NOT retried, to
 prevent duplicate inserts.
 
+Every source query also runs under a hard wall-clock timeout
+(DQ_QUERY_TIMEOUT_SECONDS, default 300s) so one runaway rule can't hang an
+entire run or tie up a shared source connection indefinitely -- see
+QueryTimeoutError / _run_with_timeout() below. A timeout is NOT retried
+(retrying an inherently-too-slow query just re-burdens the same source
+system for another full timeout window with no reason to expect a
+different outcome) -- it fails once, fast, and is recorded like any other
+ERROR so the run continues with the remaining rules.
+
 Check-type integration:
     execute_rule():
       - passes db_conn.source_type to build_query()
@@ -36,6 +45,7 @@ in one place instead of two.
 import os
 import time
 import logging
+import concurrent.futures
 from datetime import datetime, date
 
 from rules_engine.rule_sql import build_query, build_count_query
@@ -53,21 +63,35 @@ MAX_EXCEPTIONS  = int(os.getenv("DQ_MAX_EXCEPTIONS",   "10000"))
 EXCEPTION_CHUNK = int(os.getenv("DQ_EXCEPTION_CHUNK",  "500"))
 MAX_RETRIES     = int(os.getenv("DQ_QUERY_MAX_RETRIES", "3"))
 
+# Hard wall-clock budget for a single source query (count/rule/exception-
+# fetch/syntax-check). <= 0 disables the timeout entirely -- not
+# recommended, but available for environments that already enforce this
+# at the DB/workload-management layer (e.g. Teradata TASM) and don't want
+# a second, independent limit.
+QUERY_TIMEOUT_SECONDS = int(os.getenv("DQ_QUERY_TIMEOUT_SECONDS", "300"))
+
 # ── Optional tenacity retry ───────────────────────────────────────────────────
 try:
     from tenacity import (
         retry,
         stop_after_attempt,
         wait_exponential,
-        retry_if_exception_type,
+        retry_if_not_exception_type,
     )
 
     def _source_retry(fn):
-        """Retry wrapper for transient source-DB errors."""
+        """
+        Retry wrapper for transient source-DB errors. Excludes
+        QueryTimeoutError on purpose -- see this module's docstring: a
+        timeout means the query is inherently too slow, not that the DB
+        had a momentary blip, so retrying just re-burdens the source
+        system for another full DQ_QUERY_TIMEOUT_SECONDS window for no
+        expected benefit.
+        """
         return retry(
             stop=stop_after_attempt(MAX_RETRIES),
             wait=wait_exponential(multiplier=1, min=2, max=15),
-            retry=retry_if_exception_type(Exception),
+            retry=retry_if_not_exception_type(QueryTimeoutError),
             reraise=True,
         )(fn)
 
@@ -82,27 +106,110 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Query timeout — protects the source system from a runaway rule query
+# ---------------------------------------------------------------------------
+#
+# Python threads can't be forcibly killed, so this is best-effort by
+# design: the wrapped call runs in a worker thread; if it doesn't finish
+# within QUERY_TIMEOUT_SECONDS, the CALLING thread stops waiting and this
+# raises QueryTimeoutError, which unblocks the engine (the whole point --
+# one bad rule can no longer hang an entire run). Whether the abandoned
+# query itself actually stops running against the source system depends
+# on the driver: we always attempt cursor.cancel() first (works for
+# psycopg2, pyodbc, and most DB-API 2 drivers when called from a
+# different thread than the one running .execute()), but if a driver
+# doesn't support it, the query may keep running server-side until the
+# DB's own timeout/workload-management layer (e.g. Teradata TASM) ends
+# it. That's a real limitation, not a gap in this code -- true
+# server-side cancellation guarantees would need a per-driver mechanism
+# this framework doesn't have visibility into. Threads that time out
+# repeatedly for the same rule are a signal to suppress that rule
+# (dq_rule_suppressions) and fix its query, not something to keep
+# absorbing silently.
+#
+# One shared pool (not one ThreadPoolExecutor per call) bounds thread-
+# creation overhead across a run's many rule queries.
+
+class QueryTimeoutError(Exception):
+    """Raised when a source query exceeds DQ_QUERY_TIMEOUT_SECONDS."""
+
+
+_TIMEOUT_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=int(os.getenv("DQ_MAX_WORKERS", "5")) * 2,
+    thread_name_prefix="dq-query-timeout",
+)
+
+
+def _run_with_timeout(fn, timeout_seconds: int = None):
+    """
+    Run fn() (a zero-arg callable) under a hard wall-clock timeout.
+    Returns fn()'s result, or raises QueryTimeoutError.
+
+    fn is expected to register its live cursor into fn.cancel_box (a plain
+    dict) immediately after creating it, so a timeout can attempt
+    cursor.cancel() -- see execute_query()/_fetch_failed_rows()/
+    validate_sql() below for the pattern.
+    """
+    timeout_seconds = QUERY_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        return fn()   # timeout disabled
+
+    cancel_box = getattr(fn, "cancel_box", None)
+    future = _TIMEOUT_POOL.submit(fn)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError:
+        cursor = (cancel_box or {}).get("cursor")
+        if cursor is not None:
+            try:
+                cursor.cancel()
+            except Exception:
+                logger.debug(
+                    "Best-effort cursor.cancel() failed or is unsupported "
+                    "by this driver after a query timeout.", exc_info=True,
+                )
+        raise QueryTimeoutError(
+            f"Query exceeded DQ_QUERY_TIMEOUT_SECONDS={timeout_seconds}s and "
+            "was abandoned so the run could continue. If this driver doesn't "
+            "support cancellation, the query may still be running against "
+            "the source system -- see rules_engine/executor.py's timeout "
+            "section for what this framework can and can't guarantee."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Low-level DB helpers
 # ---------------------------------------------------------------------------
 
-def execute_query(conn, query: str, params=None) -> list:
+def execute_query(conn, query: str, params=None, timeout_seconds: int = None) -> list:
     """Run a SELECT and return rows as list-of-dicts (column names lowercased).
 
     Returns an empty list if cursor.description is None (e.g. a DML statement
     was accidentally passed) rather than crashing with TypeError.
+
+    Runs under _run_with_timeout() -- see that function's docstring and
+    this module's docstring for what the timeout does and doesn't
+    guarantee.
     """
-    cursor = conn.cursor()
-    if params is not None:
-        cursor.execute(query, params)
-    else:
-        cursor.execute(query)
-    if cursor.description is None:
+    cancel_box: dict = {}
+
+    def _run():
+        cursor = conn.cursor()
+        cancel_box["cursor"] = cursor
+        if params is not None:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        if cursor.description is None:
+            cursor.close()
+            return []
+        columns = [c[0].lower() for c in cursor.description]
+        rows    = [dict(zip(columns, r)) for r in cursor.fetchall()]
         cursor.close()
-        return []
-    columns = [c[0].lower() for c in cursor.description]
-    rows    = [dict(zip(columns, r)) for r in cursor.fetchall()]
-    cursor.close()
-    return rows
+        return rows
+
+    _run.cancel_box = cancel_box
+    return _run_with_timeout(_run, timeout_seconds)
 
 
 def execute_dml(conn, query: str, params=None):
@@ -127,12 +234,26 @@ def bulk_insert(conn, sql: str, data: list):
     cursor.close()
 
 
-def validate_sql(db_conn, query: str):
-    """Dry-run a query to catch syntax errors before full execution."""
-    test   = f"SELECT * FROM ({query}) dq_syntax_check WHERE 1=0"
-    cursor = db_conn.cursor()
-    cursor.execute(test)
-    cursor.close()
+def validate_sql(db_conn, query: str, timeout_seconds: int = None):
+    """
+    Dry-run a query to catch syntax errors before full execution.
+
+    WHERE 1=0 keeps this cheap on every supported DB (no rows
+    materialize), but a genuinely pathological rule_syntax can still make
+    query PLANNING slow -- runs under the same timeout as a real query
+    execution for that reason.
+    """
+    test = f"SELECT * FROM ({query}) dq_syntax_check WHERE 1=0"
+    cancel_box: dict = {}
+
+    def _run():
+        cursor = db_conn.cursor()
+        cancel_box["cursor"] = cursor
+        cursor.execute(test)
+        cursor.close()
+
+    _run.cancel_box = cancel_box
+    _run_with_timeout(_run, timeout_seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -176,31 +297,42 @@ def _fetch_failed_rows(db_conn, query: str) -> list:
 
     Note: this count may be LESS than the true failed count when the cap is hit.
     Always use _count_failed() for the authoritative failure count.
+
+    Runs under _run_with_timeout() like every other source query -- the
+    MAX_EXCEPTIONS cap bounds how many rows get pulled back, but not how
+    long the underlying query itself takes to start returning them.
     """
-    cursor  = db_conn.cursor()
-    cursor.execute(query)
-    columns = [c[0].lower() for c in cursor.description]
+    cancel_box: dict = {}
 
-    rows = []
-    cap  = MAX_EXCEPTIONS if MAX_EXCEPTIONS > 0 else float("inf")
+    def _run():
+        cursor = db_conn.cursor()
+        cancel_box["cursor"] = cursor
+        cursor.execute(query)
+        columns = [c[0].lower() for c in cursor.description]
 
-    while True:
-        batch = cursor.fetchmany(EXCEPTION_CHUNK)
-        if not batch:
-            break
-        for r in batch:
-            rows.append(dict(zip(columns, r)))
-            if len(rows) >= cap:
-                logger.warning(
-                    "Exception cap reached (%d). Failure COUNT is still accurate "
-                    "(in dq_rule_execution) but dq_exceptions only has the first %d rows.",
-                    MAX_EXCEPTIONS, MAX_EXCEPTIONS,
-                )
-                cursor.close()
-                return rows
+        rows = []
+        cap  = MAX_EXCEPTIONS if MAX_EXCEPTIONS > 0 else float("inf")
 
-    cursor.close()
-    return rows
+        while True:
+            batch = cursor.fetchmany(EXCEPTION_CHUNK)
+            if not batch:
+                break
+            for r in batch:
+                rows.append(dict(zip(columns, r)))
+                if len(rows) >= cap:
+                    logger.warning(
+                        "Exception cap reached (%d). Failure COUNT is still accurate "
+                        "(in dq_rule_execution) but dq_exceptions only has the first %d rows.",
+                        MAX_EXCEPTIONS, MAX_EXCEPTIONS,
+                    )
+                    cursor.close()
+                    return rows
+
+        cursor.close()
+        return rows
+
+    _run.cancel_box = cancel_box
+    return _run_with_timeout(_run)
 
 
 # ---------------------------------------------------------------------------

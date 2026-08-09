@@ -41,7 +41,7 @@ from rules_engine.executor import (
     _fetch_failed_rows,
     _check_column_exists,
 )
-from rules_engine.rule_sql import build_query, build_count_query
+from rules_engine.rule_sql import build_query, build_count_query, check_query_risk
 from utils.db_helpers import resolve_table
 
 logging.basicConfig(
@@ -195,6 +195,17 @@ def test_rule(
     print("Rule SQL:")
     print(f"  {query.strip()}\n")
 
+    # ── Query-cost heuristics ────────────────────────────────────────────────
+    # Advisory only (see rules_engine/rule_sql.py::check_query_risk) --
+    # surfaced here so whoever is authoring/testing this rule sees it
+    # before it ever goes into a real run's dq_rules table.
+    risk_warnings = check_query_risk(rule)
+    if risk_warnings:
+        print("Query-cost warnings:")
+        for w in risk_warnings:
+            print(f"  ! {w}")
+        print()
+
     # ── SQL validation ─────────────────────────────────────────────────────────
     print("Validating SQL syntax...")
     try:
@@ -279,6 +290,7 @@ def test_rule(
         "elapsed_s":           elapsed,
         "query":               query,
         "failed_rows_preview": failed_preview,
+        "query_risk_warnings": risk_warnings,
     }
 
     print("NOTE: No data was written to any DQ metadata table.")
