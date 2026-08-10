@@ -53,9 +53,34 @@ _query_lock = threading.Lock()
 
 @st.cache_resource
 def _get_metadata_conn():
+    """
+    Build the connection pool and return the metadata connection.
+
+    Raises RuntimeError (never returns (cf, None)) so a failed attempt is
+    NOT cached by @st.cache_resource -- Streamlit only caches a call that
+    returns normally, so the next rerun (e.g. after fixing a missing env
+    var and hitting "R") retries from scratch instead of being stuck
+    replaying the same failure until the server process restarts.
+    """
+    meta_name = os.getenv("DQ_META_CONNECTION", "teradata")
     cf = ConnectionFactory()
     cf.load()
-    td = cf.get(os.getenv("DQ_META_CONNECTION", "teradata"))
+    td = cf.get(meta_name)
+    if td is None:
+        raise RuntimeError(
+            f"Metadata connection '{meta_name}' is unavailable. Check:\n"
+            f"  1. config/connections.yaml has an entry named '{meta_name}'\n"
+            f"  2. its DQ_{meta_name.upper()}_USER / DQ_{meta_name.upper()}_PASSWORD "
+            f"(or other required secrets) are set in the environment this "
+            f"Streamlit process was started from\n"
+            f"  3. the source DB is reachable (host/port/network)\n"
+            f"  4. the driver package for its source_type is installed "
+            f"(e.g. teradatasql, psycopg2-binary, pyodbc)\n"
+            f"The specific failure reason was already logged by "
+            f"db/connection_factory.py -- check this process's terminal/"
+            f"server log output for a 'Failed to initialise connection "
+            f"'{meta_name}'' entry with the underlying exception."
+        )
     return cf, td
 
 
@@ -65,7 +90,12 @@ def _q(td, meta_db, sql, params=None):
 
 
 def main():
-    cf, td = _get_metadata_conn()
+    try:
+        cf, td = _get_metadata_conn()
+    except RuntimeError as exc:
+        st.error(str(exc))
+        st.stop()
+        return
     meta_db = get_meta_db()
 
     st.title("Data Quality Engine — Live Dashboard")
