@@ -39,6 +39,21 @@ rules_engine/ddl.sql   -- rules-engine tables (skip if you only need sampling)
 sampling/ddl.sql       -- sampling tables (skip if you only need the rules engine)
 ```
 
+All three, plus `config/seed/*.sql`, hardcode the schema name
+`CMSUNIV_FILELAND_DEV_T` -- the DEV entry from `config/env_config.py`'s
+`CONFIG` dict, matching `.env.example`'s documented default (`DQ_ENV=DEV`).
+That's a deliberate choice, not a placeholder Python fills in for you:
+DDL/seed `.sql` files are run directly against Teradata, so there's no
+templating step at all -- `config/env_config.py`'s `{ENV}`-token
+substitution only applies to `dq_rules.src_db_name` patterns the *Python*
+code resolves at runtime (see `utils/db_helpers.py::resolve_db_name()`),
+never to the metadata schema name embedded in these `.sql` files. Promoting
+to QA/UAT/PROD means find-and-replacing `CMSUNIV_FILELAND_DEV_T` with that
+environment's schema name (see `config/env_config.py`'s `CONFIG` dict for
+the exact name) across every `.sql` file above **before** running them --
+and setting `DQ_ENV` (or `DQ_META_DB`) to match on the Python side, so the
+engine reads/writes the same schema the DDL/seed files just populated.
+
 ## 2. Configure connections
 
 Connection **metadata** (what connections exist, source_type, host, port,

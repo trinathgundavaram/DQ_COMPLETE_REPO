@@ -183,7 +183,7 @@ def _notify_engine_failure(td, run: dict, meta_db: str, engine_issue_rules: int)
     except Exception as exc:
         logger.warning("Could not load ERROR/SKIP detail rows for run %s: %s", run_id, exc)
         details = []
-    detail_lines = "\n".join(f"  {d['rule_code']} — {d['status']}" for d in details) or "  (see dq_rule_issues)"
+    detail_lines = "\n".join(f"  {d['rule_code']} — {d['status']}" for d in details) or "  (see dq_run_logs)"
 
     msg = (
         f"[ENGINE FAILURE] {project}/{process} ({run['run_type']}) — rule/engine errors, "

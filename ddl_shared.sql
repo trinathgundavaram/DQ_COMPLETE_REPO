@@ -29,7 +29,7 @@
 --    (get-or-create) at write time, or find_scope_id() (lookup-only) at
 --    read/filter time.
 --
--- 2. dq_rule_execution, dq_exceptions, dq_rule_issues, dq_column_profile,
+-- 2. dq_rule_execution, dq_exceptions, dq_run_logs, dq_column_profile,
 --    and dq_anomaly_log all carry run_id, which already maps 1:1 to a
 --    dq_run_control row that has scope_id (and, for dq_rule_execution /
 --    dq_exceptions, also run_type/run_mode/batch_id/dataset_id/dates).
@@ -77,7 +77,7 @@
 --    A SET table's only behavioral difference is silently discarding an
 --    INSERT that exactly duplicates an existing row (every column, not
 --    just the PI) instead of erroring or storing it. That's a foot-gun
---    for the log/audit-style tables here (dq_run_logs, dq_rule_issues,
+--    for the log/audit-style tables here (dq_run_logs,
 --    dq_anomaly_log, ...) -- a repeated log line or a genuine second
 --    identical exception is legitimate data, not noise to swallow
 --    silently. And on every table whose PRIMARY INDEX is declared UNIQUE
@@ -94,7 +94,7 @@
 --    a second row that then makes every downstream join/lookup on that
 --    key ambiguous. Left as a plain (non-unique) PRIMARY INDEX only where
 --    more than one row per PI value is the actual documented grain of
---    the table (dq_run_logs, dq_rule_issues, dq_rule_suppressions,
+--    the table (dq_run_logs, dq_rule_suppressions,
 --    dq_exception_dispositions, dq_sample_selections -- each has its own
 --    real single-row identity column elsewhere, usually a
 --    GENERATED ALWAYS AS IDENTITY column, and the PI is chosen instead

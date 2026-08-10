@@ -443,7 +443,8 @@ def detect_and_log(td_conn, run: dict, meta_db: str) -> List[dict]:
 
     # Load detection config (most-specific match wins) — dq_anomaly_config
     # is a low-cardinality wildcard table, still matched on raw project/
-    # process, not scope_id; see the v7 note in ddl_shared.sql.
+    # process, not scope_id; see ddl_shared.sql's header (design note 4)
+    # for why it's deliberately not normalized to scope_id.
     cfg = _load_config(td_conn, project, process, run_type, meta_db, execute_query)
 
     method    = cfg["method"].upper()
@@ -647,7 +648,6 @@ def evaluate_metric_drift(
 def _iqr_bounds(data: list, multiplier: float) -> Tuple[float, float]:
     """Return (lower_fence, upper_fence) using Tukey IQR method."""
     sorted_data = sorted(data)
-    n           = len(sorted_data)
     q1          = _percentile(sorted_data, 25)
     q3          = _percentile(sorted_data, 75)
     iqr         = q3 - q1
@@ -845,13 +845,13 @@ def _send_anomaly_alert(run: dict, anomalies: list):
     run_type = run.get("run_type", "")
 
     lines = [
-        f"DQ ANOMALY DETECTED",
-        f"",
+        "DQ ANOMALY DETECTED",
+        "",
         f"Run ID   : {run_id}",
         f"Project  : {project}",
         f"Process  : {process}",
         f"Run Type : {run_type}",
-        f"",
+        "",
         f"Anomalies ({len(anomalies)}):",
     ]
     for a in anomalies:

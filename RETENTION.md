@@ -23,8 +23,7 @@ driven by *why* a table grows, not just how fast.
 |-------------------------------|------------------------------------|-----------|
 | `dq_rule_execution`           | 1 row per rule per run             | rules_engine/     |
 | `dq_exceptions`                | up to `MAX_EXCEPTIONS` rows per failing rule per run (capped -- see `rules_engine/executor.py`) | rules_engine/ |
-| `dq_run_logs`                  | several rows per run (INFO/WARN/ERROR messages) | rules_engine/ |
-| `dq_rule_issues`                | 0-N rows per run (only on pre-validation/engine failures) | rules_engine/ |
+| `dq_run_logs`                  | several rows per run (INFO/WARN/ERROR messages; 0-N of them are triageable issues -- `issue_type IS NOT NULL` -- from pre-validation/engine failures) | rules_engine/ |
 | `dq_column_profile`             | 1 row per profiled column per run (opt-in via `dq_profile_config`) | rules_engine/ |
 | `dq_anomaly_log`                 | 0-3 rows per run (one per metric that has enough history to check) | rules_engine/ |
 | `dq_sample_selections`           | 1 row per candidate considered per sampling run (**not** just the N selected) | sampling/ |
@@ -87,15 +86,16 @@ comment on that table) and the static audit report (runbook §6):
 - `dq_sample_selections` -- already documented as 10y in `sampling/ddl.sql`.
 - `dq_run_control` -- the run-level record (status, timing, scope) that
   every audit-of-record row above joins back to via run_id/scope_id
-  (v7's normalization made this join load-bearing -- see §6.5 of
-  DESIGN.md -- so `dq_run_control` inherits the same retention floor as
+  (this join is load-bearing -- see DESIGN.md's scope_id normalization
+  section -- so `dq_run_control` inherits the same retention floor as
   the tables that depend on it).
 
 **Operational/diagnostic data** -- useful for debugging the ENGINE, not
 for proving what a rule found:
-- `dq_run_logs`, `dq_rule_issues` -- INFO/WARN/ERROR trail and
-  pre-validation/engine-failure detail. 90 days is generally enough to
-  debug a recent incident; nothing here is a compliance finding.
+- `dq_run_logs` -- INFO/WARN/ERROR trail and pre-validation/engine-failure
+  detail (`issue_type` marks the subset worth triaging as an issue rather
+  than a plain log line). 90 days is generally enough to debug a recent
+  incident; nothing here is a compliance finding.
 - `dq_anomaly_log` -- statistical drift detections. 1 year keeps enough
   history for `rules_engine/metrics.py`'s own z-score/IQR baseline calculations
   (`BASELINE_LOOKBACK = 10` runs) many times over; beyond that it's just
@@ -144,7 +144,6 @@ change or a planned maintenance window, not a live ALTER.
 | `dq_rule_execution`      | `run_date`           | Monthly (matches `run_month`, already computed at insert time) |
 | `dq_exceptions`           | `created_at`          | Monthly |
 | `dq_run_logs`              | `created_at`            | Monthly |
-| `dq_rule_issues`            | `created_at`             | Monthly |
 | `dq_column_profile`          | `profile_date`            | Monthly |
 | `dq_anomaly_log`               | `created_at`               | Monthly |
 | `dq_sample_selections`           | `sample_cycle`               | Monthly (or weekly, if sampling runs weekly and the archive/purge cadence should match) |

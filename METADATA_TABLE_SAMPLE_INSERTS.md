@@ -1,6 +1,6 @@
 # DQ Framework — sample entries for every metadata table
 
-All 18 tables live in one Teradata schema (`CMSUNIV_FILELAND_DEV_T` in dev),
+All 17 tables live in one Teradata schema (`CMSUNIV_FILELAND_DEV_T` in dev),
 split across three DDL files: `ddl_shared.sql` (`dq_scope`), `rules_engine/ddl.sql`
 (`dq_rules` through `dq_notification_routes`), and `sampling/ddl.sql`
 (`dq_sampling_config`, `dq_sample_selections`).
@@ -271,7 +271,9 @@ Upserted (not appended) — `dq_metrics_summary_uix` on
 `(scope_id, run_type, batch_id, dataset_id, run_month)` prevents a
 double-write if two runs merge concurrently into the same month's row.
 
-### 11. `dq_run_logs` — free-text run log lines
+### 11. `dq_run_logs` — run log lines, plus engine-side failures
+
+A plain run-level log line leaves `table_name`/`issue_type` `NULL`:
 
 ```sql
 INSERT INTO <your_meta_db>.dq_run_logs (
@@ -282,26 +284,32 @@ INSERT INTO <your_meta_db>.dq_run_logs (
 );
 ```
 
-`log_id` is identity. `rule_id`/`rule_code` are `NULL` for run-level
-(non-rule-specific) log lines. `log_level` is typically `INFO | WARNING | ERROR`.
-
-### 12. `dq_rule_issues` — engine-side failures (never a data finding)
+An engine-side failure (never a data finding) sets `issue_type` and
+`table_name`, marking the row as triageable:
 
 ```sql
-INSERT INTO <your_meta_db>.dq_rule_issues (
-    run_id, rule_id, rule_code, table_name, issue_type, issue_message, error_detail
+INSERT INTO <your_meta_db>.dq_run_logs (
+    run_id, rule_id, rule_code, table_name, log_level, message,
+    error_code, error_detail, issue_type
 ) VALUES (
-    'ACME_CLAIMS_MONTHLY_AUDIT_20260201_083000', 4, 'ACME-004', 'refunds',
-    'CONFIG_ERROR', 'Rule SQL build failed', 'Rule ACME-004 has no sql_dialect set.'
+    'ACME_CLAIMS_MONTHLY_AUDIT_20260201_083000', 4, 'ACME-004', 'refunds', 'ERROR',
+    'SQL build failed for rule ACME-004', 'CONFIG_ERROR',
+    'Rule ACME-004 has no sql_dialect set.', 'CONFIG_ERROR'
 );
 ```
 
+`log_id` is identity. `rule_id`/`rule_code` are `NULL` for run-level
+(non-rule-specific) log lines. `log_level` is typically `INFO | WARNING | ERROR`.
 `issue_type` values include `CONFIG_ERROR`, `DIALECT_MISMATCH`,
-`UNSAFE_RULE_SQL`, `SQL_SYNTAX`, `DATA_RUNTIME` — always paired with
-`status='ERROR'` on that rule's `dq_rule_execution` row, never written to
-`dq_exceptions`.
+`UNSAFE_RULE_SQL`, `SQL_SYNTAX`, `DATA_RUNTIME`, `UNRESOLVED_DEPENDENCY`,
+`QUERY_RISK` — a row with `issue_type` set is always paired with
+`status='ERROR'` on that rule's `dq_rule_execution` row (except the
+advisory `QUERY_RISK` warning, which never blocks a run), and is never
+written to `dq_exceptions`. `rules_engine/engine.py::_count_issues()`
+counts exactly the rows where `issue_type IS NOT NULL` for a run's
+issue_count.
 
-### 13. `dq_rule_versions` — automatic snapshot on every tracked-field change
+### 12. `dq_rule_versions` — automatic snapshot on every tracked-field change
 
 ```sql
 INSERT INTO <your_meta_db>.dq_rule_versions (
@@ -320,7 +328,7 @@ INSERT INTO <your_meta_db>.dq_rule_versions (
 (handled by `rules_engine/rule_lifecycle.py`, not something you compute by
 hand). `change_type` is `CREATED` (first version) or `MODIFIED`.
 
-### 14. `dq_column_profile` — per-column statistics (opt-in via `dq_profile_config`)
+### 13. `dq_column_profile` — per-column statistics (opt-in via `dq_profile_config`)
 
 ```sql
 INSERT INTO <your_meta_db>.dq_column_profile (
@@ -340,7 +348,7 @@ INSERT INTO <your_meta_db>.dq_column_profile (
 `profile_id` is identity. `min_value`/`max_value` are stored as text so the
 same column works for numeric, date, and string columns alike.
 
-### 15. `dq_anomaly_log` — one row per metric per detection method per run
+### 14. `dq_anomaly_log` — one row per metric per detection method per run
 
 ```sql
 INSERT INTO <your_meta_db>.dq_anomaly_log (
@@ -359,7 +367,7 @@ write both a `ZSCORE` row and an `IQR` row for the *same* `metric_name` —
 that's why the primary index is `(run_id, metric_name, detection_method)`,
 not just `(run_id, metric_name)`.
 
-### 16. `dq_sample_selections` — every candidate case a sampling run considered
+### 15. `dq_sample_selections` — every candidate case a sampling run considered
 
 ```sql
 INSERT INTO <your_meta_db>.dq_sample_selections (
@@ -382,7 +390,7 @@ per final sample.
 
 ## C. Ops writes these occasionally, outside a run
 
-### 17. `dq_rule_suppressions` — temporarily mute a known-broken rule
+### 16. `dq_rule_suppressions` — temporarily mute a known-broken rule
 
 ```sql
 INSERT INTO <your_meta_db>.dq_rule_suppressions (
@@ -405,7 +413,7 @@ SET lifted_at = CURRENT_TIMESTAMP, lifted_by = 'jsmith'
 WHERE suppression_id = 1;
 ```
 
-### 18. `dq_exception_dispositions` — case review outcome on a finding
+### 17. `dq_exception_dispositions` — case review outcome on a finding
 
 ```sql
 INSERT INTO <your_meta_db>.dq_exception_dispositions (
@@ -439,14 +447,13 @@ in the same transaction. The current state is always "most recent
 | 8 | `dq_rule_execution` | engine | # of rules × # of runs |
 | 9 | `dq_exceptions` | engine | # of violating rows found (capped) |
 | 10 | `dq_metrics_summary` | engine | # of scope × run_type × month combos |
-| 11 | `dq_run_logs` | engine | free-text log volume |
-| 12 | `dq_rule_issues` | engine | # of engine-side failures |
-| 13 | `dq_rule_versions` | engine (on rule edit) | # of rule edits |
-| 14 | `dq_column_profile` | engine (if profiling on) | # of profiled columns × runs |
-| 15 | `dq_anomaly_log` | engine (if anomaly detection on) | # of metrics × runs |
-| 16 | `dq_sample_selections` | engine (sampling) | # of candidates evaluated × cycles — largest table in the schema |
-| 17 | `dq_rule_suppressions` | ops, ad hoc | # of suppression events |
-| 18 | `dq_exception_dispositions` | ops, ad hoc | # of case reviews |
+| 11 | `dq_run_logs` | engine | free-text log volume + # of engine-side failures (`issue_type IS NOT NULL`) |
+| 12 | `dq_rule_versions` | engine (on rule edit) | # of rule edits |
+| 13 | `dq_column_profile` | engine (if profiling on) | # of profiled columns × runs |
+| 14 | `dq_anomaly_log` | engine (if anomaly detection on) | # of metrics × runs |
+| 15 | `dq_sample_selections` | engine (sampling) | # of candidates evaluated × cycles — largest table in the schema |
+| 16 | `dq_rule_suppressions` | ops, ad hoc | # of suppression events |
+| 17 | `dq_exception_dispositions` | ops, ad hoc | # of case reviews |
 
 For the full column-by-column DDL and index rationale, see
 `ddl_shared.sql`, `rules_engine/ddl.sql`, and `sampling/ddl.sql`. For a

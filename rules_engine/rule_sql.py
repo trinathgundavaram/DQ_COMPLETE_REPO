@@ -163,7 +163,7 @@ def check_no_dml_ddl(rule_syntax: str, rule_code: str = "") -> None:
 # text heuristics (no EXPLAIN / live cost estimate -- that would need a
 # connection and a dialect-specific plan parser per source_type, which is
 # real future work -- see DESIGN.md's follow-ups). They're intentionally
-# advisory (warnings logged to dq_rule_issues, never block a run) because
+# advisory (warnings logged to dq_run_logs, never block a run) because
 # every one of them has a legitimate use (e.g. a full scan of a genuinely
 # small reference table is fine) -- the goal is to make a rule author
 # consciously confirm that, not to guess wrong and block a valid rule.
@@ -351,8 +351,8 @@ def validate_rule_params(rule: dict) -> Optional[str]:
     if not dialect:
         return (
             "sql_dialect is not set. Every rule must declare sql_dialect "
-            f"('teradata' | 'postgres' | 'ansi') and a negative-SQL SELECT "
-            f"in rule_syntax."
+            "('teradata' | 'postgres' | 'ansi') and a negative-SQL SELECT "
+            "in rule_syntax."
         )
     if dialect not in VALID_DIALECTS:
         return f"sql_dialect '{dialect}' is invalid — must be one of {', '.join(sorted(VALID_DIALECTS))}."

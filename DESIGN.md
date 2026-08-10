@@ -70,7 +70,7 @@ db/                       -- shared: connector layer, used by all three folders 
   connection_factory.py   builds + caches adapters from config/connections.yaml
 utils/                    -- shared: cross-cutting helpers, used by all three folders above
   db_helpers.py           table/db name resolution + dq_scope resolver
-  metadata_writers.py     dq_run_logs / dq_rule_issues writers
+  metadata_writers.py     dq_run_logs writer (general + triageable issues)
   ids.py                  run-id + primary-key JSON helpers
   validation.py           rule-definition validation
   alert.py                low-level Teams/email senders
@@ -137,7 +137,7 @@ reaches the source database:
 
 A mismatch raises `DialectMismatchError` with the exact message shape from
 the brief ("RULE-014 is written for postgres, cannot run against a
-teradata connection") and is logged to `dq_rule_issues` with
+teradata connection") and is logged to `dq_run_logs` with
 `issue_type='DIALECT_MISMATCH'` -- never to `dq_exceptions`. The rule is
 recorded as `status='ERROR'`, never `PASS`.
 
@@ -486,7 +486,7 @@ resolves this once per run and stores it on the in-memory `run` dict as
 resolved value instead of re-resolving per rule.
 
 **Dropped entirely (not even a `scope_id`) from `dq_rule_execution`,
-`dq_exceptions`, `dq_rule_issues`, `dq_column_profile`, and
+`dq_exceptions`, `dq_run_logs`, `dq_column_profile`, and
 `dq_anomaly_log`:** all five already carry `run_id`, and `run_id` maps 1:1
 to a `dq_run_control` row that has `scope_id` (plus, for
 `dq_rule_execution`/`dq_exceptions`, `run_type`/`run_mode`/`batch_id`/

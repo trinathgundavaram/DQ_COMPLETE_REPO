@@ -32,7 +32,6 @@ import os
 import signal
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from datetime import datetime
 
 from config.env_config import get_meta_db
 from db.connection_factory import ConnectionFactory
@@ -52,8 +51,6 @@ from utils.db_helpers import get_scope_id, find_scope_id
 from utils.metadata_writers import log_message
 from utils.alert import send_alert
 from rules_engine import reporting
-from utils.validation import validate_table_exists
-from utils.metadata_writers import log_issue
 from rules_engine.rule_sql import check_dialect, DialectMismatchError, check_no_dml_ddl, UnsafeRuleSQLError, check_query_risk
 
 # ── Configurable log level (DQ_LOG_LEVEL overrides; default INFO) ─────────────
@@ -436,11 +433,12 @@ def run_engine(
                 f"different scope, or invalid rule_id)."
             )
             logger.error(msg)
-            log_issue(td, run, rule, "UNRESOLVED_DEPENDENCY", msg, meta_db=meta_db)
             log_message(
                 td, run_id, "ERROR", msg,
                 rule_id=rid, rule_code=p_code,
-                error_code="UNRESOLVED_DEPENDENCY", meta_db=meta_db,
+                error_code="UNRESOLVED_DEPENDENCY",
+                issue_type="UNRESOLVED_DEPENDENCY", table_name=rule.get("src_tbl_nm"),
+                meta_db=meta_db,
             )
             record_rule_execution(
                 td, run, rule, rule.get("src_tbl_nm", ""),
@@ -632,10 +630,12 @@ def _dry_run(cf, project, process, run_mode, batch_id, start_date, end_date, met
 
         # SQL validation
         try:
-            _q, _level = build_query(rule, run_stub,
-                                     getattr(db_conn, "source_type", "teradata"))
-            if _level != "SCHEMA":
-                validate_sql(db_conn, _q)
+            # build_query() always returns level="ROW" now (every rule is
+            # raw negative-SQL -- see rules_engine/rule_sql.py); the level is
+            # kept for API stability, not because a different branch exists.
+            sql, _level = build_query(rule, run_stub,
+                                      getattr(db_conn, "source_type", "teradata"))
+            validate_sql(db_conn, sql)
         except Exception as exc:
             logger.warning("[DRY RUN] FAIL %s — SQL error: %s", code, exc)
             failed_list.append((code, f"SQL error: {exc}"))
@@ -673,7 +673,7 @@ def _pre_validate_rules(rules: list, cf, run: dict, meta_db: str, td) -> list:
     Validate SQL syntax for every rule before execution starts.
 
     Returns a list of rule_codes that failed validation.
-    Errors are written to dq_run_logs and dq_rule_issues.
+    Errors are written to dq_run_logs (issue_type set for triageable ones).
     """
     invalid = []
     logger.info("Pre-validating %d rules...", len(rules))
@@ -695,7 +695,7 @@ def _pre_validate_rules(rules: list, cf, run: dict, meta_db: str, td) -> list:
 
         # Fix (Section 4/8): dialect mismatch must fail BEFORE execution —
         # checked first, distinct from generic SQL_SYNTAX issues so it is
-        # unambiguous in dq_rule_issues.
+        # unambiguous in dq_run_logs (issue_type='DIALECT_MISMATCH').
         try:
             check_dialect(rule, source_type_val)
         except DialectMismatchError as exc:
@@ -704,9 +704,8 @@ def _pre_validate_rules(rules: list, cf, run: dict, meta_db: str, td) -> list:
                         f"Pre-validation dialect mismatch in rule {code}: {exc}",
                         rule_id=rule.get("rule_id"), rule_code=code,
                         error_code="DIALECT_MISMATCH", error_detail=str(exc),
+                        issue_type="DIALECT_MISMATCH", table_name=rule.get("src_tbl_nm"),
                         meta_db=meta_db)
-            log_issue(td, run, rule, "DIALECT_MISMATCH",
-                      f"Pre-validation failed: {exc}", str(exc), meta_db=meta_db)
             continue
 
         # rule_syntax must be read-only — checked before it ever touches a
@@ -723,36 +722,40 @@ def _pre_validate_rules(rules: list, cf, run: dict, meta_db: str, td) -> list:
                         f"Pre-validation unsafe rule_syntax in rule {code}: {exc}",
                         rule_id=rule.get("rule_id"), rule_code=code,
                         error_code="UNSAFE_RULE_SQL", error_detail=str(exc),
+                        issue_type="UNSAFE_RULE_SQL", table_name=rule.get("src_tbl_nm"),
                         meta_db=meta_db)
-            log_issue(td, run, rule, "UNSAFE_RULE_SQL",
-                      f"Pre-validation failed: {exc}", str(exc), meta_db=meta_db)
             continue
 
         # Query-cost heuristics — advisory only, never blocks the run (see
         # rules_engine/rule_sql.py::check_query_risk's docstring for why).
-        # Logged to dq_rule_issues so it's visible without stopping anything;
-        # the actual protection against a runaway query is executor.py's
-        # per-query timeout (DQ_QUERY_TIMEOUT_SECONDS), a separate layer.
+        # Logged to dq_run_logs (issue_type='QUERY_RISK') so it's visible
+        # without stopping anything; the actual protection against a
+        # runaway query is executor.py's per-query timeout
+        # (DQ_QUERY_TIMEOUT_SECONDS), a separate layer.
         for warning in check_query_risk(rule):
-            log_issue(td, run, rule, "QUERY_RISK",
-                      f"Pre-validation warning: {warning}", meta_db=meta_db)
+            log_message(td, run["run_id"], "WARN",
+                        f"Pre-validation warning for rule {code}: {warning}",
+                        rule_id=rule.get("rule_id"), rule_code=code,
+                        issue_type="QUERY_RISK", table_name=rule.get("src_tbl_nm"),
+                        meta_db=meta_db)
             logger.warning("Rule %s query-risk warning: %s", code, warning)
 
         try:
             if hasattr(db_conn, "prepare"):
                 db_conn.prepare(rule)
-            _q, _level = build_query(rule, run, source_type_val)
-            if _level != "SCHEMA":
-                validate_sql(db_conn, _q)
+            # build_query() always returns level="ROW" now (every rule is
+            # raw negative-SQL -- see rules_engine/rule_sql.py); the level is
+            # kept for API stability, not because a different branch exists.
+            sql, _level = build_query(rule, run, source_type_val)
+            validate_sql(db_conn, sql)
         except Exception as exc:
             invalid.append(code)
             log_message(td, run["run_id"], "ERROR",
                         f"Pre-validation SQL error in rule {code}: {exc}",
                         rule_id=rule.get("rule_id"), rule_code=code,
                         error_code="PREVALIDATION", error_detail=str(exc),
+                        issue_type="SQL_SYNTAX", table_name=rule.get("src_tbl_nm"),
                         meta_db=meta_db)
-            log_issue(td, run, rule, "SQL_SYNTAX",
-                      f"Pre-validation failed: {exc}", str(exc), meta_db=meta_db)
 
     if invalid:
         logger.warning("Pre-validation: %d rule(s) failed — %s", len(invalid), invalid)
@@ -890,9 +893,13 @@ def _load_rules(td, project: str, process: str, meta_db: str) -> list:
 
 
 def _count_issues(td, run_id: str, meta_db: str) -> int:
+    # dq_rule_issues was folded into dq_run_logs (see utils/metadata_writers.py
+    # module docstring) -- a row with issue_type set is exactly the set of
+    # rows dq_rule_issues used to hold.
     rows = execute_query(
         td,
-        f"SELECT COUNT(*) AS cnt FROM {meta_db}.dq_rule_issues WHERE run_id = ?",
+        f"SELECT COUNT(*) AS cnt FROM {meta_db}.dq_run_logs "
+        f"WHERE run_id = ? AND issue_type IS NOT NULL",
         [run_id],
     )
     return rows[0]["cnt"] if rows else 0

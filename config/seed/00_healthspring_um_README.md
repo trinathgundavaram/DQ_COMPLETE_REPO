@@ -10,7 +10,7 @@ Load order:
    dq_anomaly_config (auto-determined thresholds). Connections (teradata,
    um_refdata, um_archive) are configured separately in
    config/connections.yaml, not here.
-2. `02_rules.sql`   — ~40 hand-maintained SQL rules covering every category
+2. `02_rules.sql`   — 38 hand-maintained SQL rules covering every category
    in Section 3.2 of the requirements
 
 ## Column-name assumption

@@ -158,7 +158,6 @@ def _profile_one_table(
         return
 
     profile_date = date.today()
-    run_date_str = str(profile_date)
     rows_to_insert = []
 
     for col in cols:
@@ -188,7 +187,7 @@ def _profile_one_table(
         return
 
     # project_name/process_name are NOT stored — derivable via run_id ->
-    # dq_run_control (see ddl_shared.sql v7).
+    # dq_run_control (see ddl_shared.sql's header).
     sql = f"""
         INSERT INTO {meta_db}.dq_column_profile (
             run_id, table_name, column_name,

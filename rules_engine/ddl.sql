@@ -180,35 +180,29 @@ ON CMSUNIV_FILELAND_DEV_T.dq_exceptions;
 -- with no read pattern that needs it.
 
 
+-- dq_rule_issues was folded into this table (see utils/metadata_writers.py's
+-- module docstring for the full rationale): every real call site wrote
+-- near-identical rows to both, back to back, on every error path, and
+-- dq_rule_issues was read back in exactly one place (a plain COUNT(*) for
+-- the run summary's issue_count — see rules_engine/engine.py::_count_issues).
+-- table_name/issue_type below are what dq_rule_issues used to carry; a row
+-- with issue_type set is exactly the set of rows dq_rule_issues used to hold.
+-- project_name/process_name are NOT stored — derivable via run_id -> dq_run_control.
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_run_logs (
     log_id        BIGINT GENERATED ALWAYS AS IDENTITY,
     run_id        VARCHAR(200),
     rule_id       INTEGER,
     rule_code     VARCHAR(200),
+    table_name    VARCHAR(200),
     log_level     VARCHAR(20),
     message       CLOB,
     error_code    VARCHAR(50),
     error_detail  CLOB,
+    issue_type    VARCHAR(50),
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 PRIMARY INDEX (run_id);   -- NUPI on purpose: many log lines per run.
                           -- log_id (identity) is the real per-row identifier.
-
-
--- project_name/process_name dropped — derivable via run_id -> dq_run_control.
-CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.dq_rule_issues (
-    issue_id      BIGINT GENERATED ALWAYS AS IDENTITY,
-    run_id        VARCHAR(200),
-    rule_id       INTEGER,
-    rule_code     VARCHAR(200),
-    table_name    VARCHAR(200),
-    issue_type    VARCHAR(50),
-    issue_message CLOB,
-    error_detail  CLOB,
-    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-PRIMARY INDEX (run_id);   -- NUPI on purpose: many issues per run.
-                          -- issue_id (identity) is the real per-row identifier.
 
 
 -- ── Rule suppression, versioning, profiling, anomaly detection ─────────────
@@ -395,7 +389,7 @@ UNIQUE PRIMARY INDEX (run_id, metric_name, detection_method);
 -- sql_dialect is incompatible with its target connection's source_type,
 -- both at pre-validation time (rules_engine/engine.py::_pre_validate_rules) and
 -- immediately before execution (rules_engine/executor.py::execute_rule) as a
--- defense-in-depth guard. A mismatch is logged to dq_rule_issues with
+-- defense-in-depth guard. A mismatch is logged to dq_run_logs with
 -- issue_type='DIALECT_MISMATCH' and the rule is recorded as status='ERROR'
 -- in dq_rule_execution — it NEVER writes to dq_exceptions, and it NEVER
 -- looks like a clean PASS.

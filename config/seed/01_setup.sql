@@ -13,10 +13,10 @@
 -- process (UNIVERSE_VALIDATION) and the sampling process
 -- (COMO_WEEKLY_SAMPLE) are tracked separately since they run on different
 -- cadences and are two different "processes" within the same project.
-INSERT INTO CMSUNIV_FILELAND_T.dq_scope (project_name, process_name)
+INSERT INTO CMSUNIV_FILELAND_DEV_T.dq_scope (project_name, process_name)
 VALUES ('HEALTHSPRING_UM', 'UNIVERSE_VALIDATION');
 
-INSERT INTO CMSUNIV_FILELAND_T.dq_scope (project_name, process_name)
+INSERT INTO CMSUNIV_FILELAND_DEV_T.dq_scope (project_name, process_name)
 VALUES ('HEALTHSPRING_UM', 'COMO_WEEKLY_SAMPLE');
 
 
@@ -29,7 +29,7 @@ VALUES ('HEALTHSPRING_UM', 'COMO_WEEKLY_SAMPLE');
 
 
 -- ── COMO weekly stratified sample (Section 3.4) ─────────────────────────
-INSERT INTO CMSUNIV_FILELAND_T.dq_sampling_config (
+INSERT INTO CMSUNIV_FILELAND_DEV_T.dq_sampling_config (
     config_id, scope_id, sample_name, connection_name,
     universe_table, key_columns, scope_column, target_volume,
     determination_column, determination_mix_json,
@@ -37,7 +37,7 @@ INSERT INTO CMSUNIV_FILELAND_T.dq_sampling_config (
     exclusion_sql, priority_rank_sql, schedule_cron, active_flag
 ) VALUES (
     1,
-    (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
+    (SELECT scope_id FROM CMSUNIV_FILELAND_DEV_T.dq_scope
      WHERE project_name = 'HEALTHSPRING_UM' AND process_name = 'COMO_WEEKLY_SAMPLE'),
     'COMO_WEEKLY_SAMPLE', 'teradata',
     'um_universe', 'enrollee_id, auth_or_claim_number', 'pull_date', 150,
@@ -66,14 +66,14 @@ INSERT INTO CMSUNIV_FILELAND_T.dq_sampling_config (
 
 -- ── Notification routing (Section 3.5) ──────────────────────────────────
 -- DATA VIOLATION -> ROAR gets everything.
-INSERT INTO CMSUNIV_FILELAND_T.dq_notification_routes
+INSERT INTO CMSUNIV_FILELAND_DEV_T.dq_notification_routes
     (route_id, project_name, process_name, finding_class, audience, channel_type, destination, business_correctable_only, active_flag)
 VALUES
     (1, 'HEALTHSPRING_UM', NULL, 'DATA_VIOLATION', 'ROAR', 'TEAMS',
      'https://outlook.office.com/webhook/ROAR_CHANNEL_WEBHOOK', 0, 1);
 
 -- DATA VIOLATION -> BUSINESS gets only business_correctable=1 findings.
-INSERT INTO CMSUNIV_FILELAND_T.dq_notification_routes
+INSERT INTO CMSUNIV_FILELAND_DEV_T.dq_notification_routes
     (route_id, project_name, process_name, finding_class, audience, channel_type, destination, business_correctable_only, active_flag)
 VALUES
     (2, 'HEALTHSPRING_UM', NULL, 'DATA_VIOLATION', 'BUSINESS', 'EMAIL',
@@ -82,7 +82,7 @@ VALUES
 -- ENGINE FAILURE -> ENGINEERING only. NEVER routed to ROAR/BUSINESS —
 -- this is enforced by rules_engine/reporting.py routing on finding_class, not by
 -- anything in this table; these rows just say where each class goes.
-INSERT INTO CMSUNIV_FILELAND_T.dq_notification_routes
+INSERT INTO CMSUNIV_FILELAND_DEV_T.dq_notification_routes
     (route_id, project_name, process_name, finding_class, audience, channel_type, destination, business_correctable_only, active_flag)
 VALUES
     (3, 'HEALTHSPRING_UM', NULL, 'ENGINE_FAILURE', 'ENGINEERING', 'TEAMS',
@@ -91,7 +91,7 @@ VALUES
 -- Clinical Operations QA — oversight visibility across both data findings
 -- and engine health (Section 3.1), without being the audience that acts
 -- on either.
-INSERT INTO CMSUNIV_FILELAND_T.dq_notification_routes
+INSERT INTO CMSUNIV_FILELAND_DEV_T.dq_notification_routes
     (route_id, project_name, process_name, finding_class, audience, channel_type, destination, business_correctable_only, active_flag)
 VALUES
     (4, 'HEALTHSPRING_UM', NULL, 'DATA_VIOLATION', 'QA', 'EMAIL',
@@ -101,7 +101,7 @@ VALUES
 -- ── Auto-determined thresholds (Section 3.4) ────────────────────────────
 -- z-score/IQR against each rule's OWN run history — reuses the engine's
 -- existing anomaly detector (rules_engine/metrics.py), not a new mechanism.
-INSERT INTO CMSUNIV_FILELAND_T.dq_anomaly_config
+INSERT INTO CMSUNIV_FILELAND_DEV_T.dq_anomaly_config
     (config_id, project_name, process_name, run_type, process,
      zscore_threshold, iqr_multiplier, min_history_runs, alert_on_anomaly)
 VALUES

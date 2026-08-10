@@ -40,7 +40,6 @@ from rules_engine.executor import (
     _fetch_failed_rows,
 )
 from rules_engine.rule_sql import build_query, build_count_query, check_query_risk
-from utils.db_helpers import resolve_table
 
 logging.basicConfig(
     level=logging.INFO,

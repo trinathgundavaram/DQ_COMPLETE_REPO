@@ -44,7 +44,6 @@ from rules_engine.rule_sql import build_query, build_count_query
 from utils.db_helpers import resolve_table
 from utils.validation import validate_table_exists
 from utils.ids import build_json_pk, build_pk_string
-from utils.metadata_writers import log_issue
 from utils.metadata_writers import log_message
 from rules_engine.rule_sql import check_dialect, DialectMismatchError, check_no_dml_ddl, UnsafeRuleSQLError
 
@@ -484,11 +483,12 @@ def execute_rule(rule: dict, db_conn, td_conn, run: dict, meta_db: str) -> str:
     try:
         check_dialect(rule, source_type)
     except DialectMismatchError as exc:
-        log_issue(td_conn, run, rule, "DIALECT_MISMATCH", str(exc), meta_db=meta_db)
         log_message(td_conn, run["run_id"], "ERROR",
                     f"Dialect mismatch for rule {rule.get('rule_code')}: {exc}",
                     rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
-                    error_code="DIALECT_MISMATCH", error_detail=str(exc), meta_db=meta_db)
+                    error_code="DIALECT_MISMATCH", error_detail=str(exc),
+                    issue_type="DIALECT_MISMATCH", table_name=rule.get("src_tbl_nm"),
+                    meta_db=meta_db)
         table = rule.get("src_tbl_nm", "UNKNOWN")
         record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
                               0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
@@ -502,11 +502,12 @@ def execute_rule(rule: dict, db_conn, td_conn, run: dict, meta_db: str) -> str:
     try:
         check_no_dml_ddl(rule.get("rule_syntax") or "", rule.get("rule_code"))
     except UnsafeRuleSQLError as exc:
-        log_issue(td_conn, run, rule, "UNSAFE_RULE_SQL", str(exc), meta_db=meta_db)
         log_message(td_conn, run["run_id"], "ERROR",
                     f"Unsafe rule_syntax for rule {rule.get('rule_code')}: {exc}",
                     rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
-                    error_code="UNSAFE_RULE_SQL", error_detail=str(exc), meta_db=meta_db)
+                    error_code="UNSAFE_RULE_SQL", error_detail=str(exc),
+                    issue_type="UNSAFE_RULE_SQL", table_name=rule.get("src_tbl_nm"),
+                    meta_db=meta_db)
         table = rule.get("src_tbl_nm", "UNKNOWN")
         record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
                               0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
@@ -520,12 +521,12 @@ def execute_rule(rule: dict, db_conn, td_conn, run: dict, meta_db: str) -> str:
         try:
             db_conn.prepare(rule)
         except Exception as exc:
-            log_issue(td_conn, run, rule, "CONFIG_ERROR",
-                      f"Source preparation failed: {exc}", str(exc), meta_db=meta_db)
             log_message(td_conn, run["run_id"], "ERROR",
                         f"Source preparation failed for rule {rule.get('rule_code')}",
                         rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
-                        error_code="SOURCE_PREP", error_detail=str(exc), meta_db=meta_db)
+                        error_code="SOURCE_PREP", error_detail=str(exc),
+                        issue_type="CONFIG_ERROR", table_name=rule.get("src_tbl_nm"),
+                        meta_db=meta_db)
             logger.error("Source preparation failed for rule %s: %s",
                         rule.get("rule_code"), exc, exc_info=True)
             table = rule.get("src_tbl_nm", "UNKNOWN")
@@ -534,7 +535,7 @@ def execute_rule(rule: dict, db_conn, td_conn, run: dict, meta_db: str) -> str:
             return "ERROR"
 
     # ── STEP 1: Table validation ──────────────────────────────────────────────
-    if not validate_table_exists(db_conn, td_conn, rule, run, log_issue, log_message, meta_db):
+    if not validate_table_exists(db_conn, td_conn, rule, run, log_message, meta_db):
         # Write a SKIP row so metrics counts every rule
         table = rule.get("src_tbl_nm", "UNKNOWN")
         record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
@@ -547,12 +548,12 @@ def execute_rule(rule: dict, db_conn, td_conn, run: dict, meta_db: str) -> str:
     try:
         query, level = build_query(rule, run, source_type)
     except ValueError as exc:
-        log_issue(td_conn, run, rule, "CONFIG_ERROR",
-                  f"Rule SQL build failed: {exc}", str(exc), meta_db=meta_db)
         log_message(td_conn, run["run_id"], "ERROR",
                     f"SQL build failed for rule {rule.get('rule_code')}",
                     rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
-                    error_code="CONFIG_ERROR", error_detail=str(exc), meta_db=meta_db)
+                    error_code="CONFIG_ERROR", error_detail=str(exc),
+                    issue_type="CONFIG_ERROR", table_name=rule.get("src_tbl_nm"),
+                    meta_db=meta_db)
         record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
                               0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
         return "ERROR"
@@ -578,12 +579,12 @@ def _execute_row_check(
     try:
         validate_sql(db_conn, query)
     except Exception as exc:
-        log_issue(td_conn, run, rule, "SQL_SYNTAX",
-                  "Invalid rule SQL syntax", str(exc), meta_db=meta_db)
         log_message(td_conn, run["run_id"], "ERROR",
                     f"SQL validation failed for rule {rule.get('rule_code')}",
                     rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
-                    error_code="SQL_SYNTAX", error_detail=str(exc), meta_db=meta_db)
+                    error_code="SQL_SYNTAX", error_detail=str(exc),
+                    issue_type="SQL_SYNTAX", table_name=table,
+                    meta_db=meta_db)
         logger.error("Invalid rule SQL syntax for rule %s: %s",
                      rule.get("rule_code"), exc, exc_info=True)
         record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
@@ -595,12 +596,12 @@ def _execute_row_check(
     try:
         total = _count_total(db_conn, count_query)
     except Exception as exc:
-        log_issue(td_conn, run, rule, "DATA_RUNTIME",
-                  "Count query failed", str(exc), meta_db=meta_db)
         log_message(td_conn, run["run_id"], "ERROR",
                     f"Count query failed for rule {rule.get('rule_code')}",
                     rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
-                    error_code="DATA_RUNTIME", error_detail=str(exc), meta_db=meta_db)
+                    error_code="DATA_RUNTIME", error_detail=str(exc),
+                    issue_type="DATA_RUNTIME", table_name=table,
+                    meta_db=meta_db)
         logger.error("Count query failed for rule %s: %s",
                      rule.get("rule_code"), exc, exc_info=True)
         record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
@@ -611,12 +612,12 @@ def _execute_row_check(
     try:
         failed = _count_failed(db_conn, query)
     except Exception as exc:
-        log_issue(td_conn, run, rule, "DATA_RUNTIME",
-                  "Failed-count query failed", str(exc), meta_db=meta_db)
         log_message(td_conn, run["run_id"], "ERROR",
                     f"Failed-count query failed for rule {rule.get('rule_code')}",
                     rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
-                    error_code="DATA_RUNTIME", error_detail=str(exc), meta_db=meta_db)
+                    error_code="DATA_RUNTIME", error_detail=str(exc),
+                    issue_type="DATA_RUNTIME", table_name=table,
+                    meta_db=meta_db)
         logger.error("Failed-count query failed for rule %s: %s",
                      rule.get("rule_code"), exc, exc_info=True)
         record_rule_execution(td_conn, run, rule, table, total, 0, total,
@@ -654,9 +655,13 @@ def _execute_row_check(
             failed_rows = _fetch_failed_rows(db_conn, query)
             _insert_exceptions(td_conn, run, rule, table, failed_rows, meta_db)
         except Exception as exc:
-            log_issue(td_conn, run, rule, "DATA_RUNTIME",
-                      "Exception row capture failed (counts still accurate)",
-                      str(exc), meta_db=meta_db)
+            log_message(td_conn, run["run_id"], "WARN",
+                        f"Exception row capture failed for rule {rule.get('rule_code')} "
+                        f"(counts still accurate): {exc}",
+                        rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
+                        error_code="DATA_RUNTIME", error_detail=str(exc),
+                        issue_type="DATA_RUNTIME", table_name=table,
+                        meta_db=meta_db)
             logger.warning(
                 "Exception capture failed for rule %s (counts are still accurate): %s",
                 rule.get("rule_code"), exc, exc_info=True,

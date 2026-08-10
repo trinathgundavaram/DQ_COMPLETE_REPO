@@ -100,8 +100,8 @@ def run_stratified_sampling(cf, td, config: dict, run: dict, meta_db: str) -> di
     from sampling.anomaly import detect_candidate_pool_drift
 
     # sample_name is NOT NULL on dq_sampling_config — no project_name/
-    # process_name fallback needed (config no longer carries those columns
-    # anyway; it's scope_id-keyed, see ddl_shared.sql v7).
+    # process_name fallback needed (config is scope_id-keyed instead —
+    # see ddl_shared.sql's header for why).
     sample_name = _slug(config["sample_name"])
     sample_run_id = f"{sample_name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
 
@@ -230,7 +230,7 @@ def run_stratified_sampling(cf, td, config: dict, run: dict, meta_db: str) -> di
 
     # ── Persist EVERY candidate (audit defensibility) ─────────────────────
     # project_name/process_name are NOT stored — derivable via config_id ->
-    # dq_sampling_config.scope_id (see ddl_shared.sql v7).
+    # dq_sampling_config.scope_id (see ddl_shared.sql's header).
     insert_sql = f"""
         INSERT INTO {meta_db}.dq_sample_selections (
             sample_run_id, config_id, sample_cycle,

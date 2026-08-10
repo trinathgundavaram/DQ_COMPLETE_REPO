@@ -124,7 +124,7 @@ def get_scope_id(td, project_name: str, process_name, meta_db: str) -> int:
     MERGE race: attempt the INSERT, and on a duplicate-key error just
     re-select the row the other thread already created.
     """
-    from rules_engine.executor import execute_dml, execute_query
+    from rules_engine.executor import execute_dml
 
     existing = find_scope_id(td, project_name, process_name, meta_db)
     if existing is not None:

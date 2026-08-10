@@ -54,7 +54,7 @@ import logging
 import threading
 from typing import Dict, Optional
 
-from config.connections import ConnectionConfigError, load_connections
+from config.connections import load_connections
 from db.adapters import (
     SourceAdapter, TeradataAdapter, PostgresAdapter,
     SqlServerAdapter, FileAdapter, S3Adapter,
@@ -237,9 +237,6 @@ class ConnectionFactory:
                 logger.warning("Error closing connection '%s': %s", name, exc)
         self._conns.clear()
         logger.info("All connections closed.")
-
-    def get_all(self) -> dict:
-        return dict(self._conns)
 
     # ------------------------------------------------------------------
     # Internal helpers
