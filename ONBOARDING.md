@@ -207,5 +207,8 @@ call `rules_engine/main.py` and the scheduler use.
 - **RETENTION.md** -- once you're running in production, plan
   partitioning/archival for the high-growth tables before they become a
   performance problem, not after.
+- **METADATA_TABLE_SAMPLE_INSERTS.md** -- a sample INSERT for every one of
+  the 18 metadata tables, grouped by who writes them (you, the engine, or
+  ops), all tracing one example rule through to a finding.
 - **HEALTHSPRING_UM_RUNBOOK.md** -- a complete real-world example of
   everything in this document, for one actual project.
