@@ -2,47 +2,53 @@
 rules_engine/rule_sql.py
 -------------------
 Everything involved in turning one dq_rules row into ready-to-run,
-dialect-safe SQL: the run-scope filter, the three rule-authoring paths, and
-the fail-fast dialect check. These three concerns (filter, SQL generation,
-dialect safety) always run together for every rule, so they live in one
-file that reads top to bottom as "how do we get valid SQL for this rule."
+dialect-safe SQL: the run-scope filter, raw negative-SQL assembly, and the
+fail-fast dialect check. These concerns (filter, SQL assembly, dialect
+safety) always run together for every rule, so they live in one file that
+reads top to bottom as "how do we get valid SQL for this rule."
 
-Three rule-authoring paths, checked in this order
-----------------------------------------------------
-1. RAW SQL (sql_dialect is set) — the primary/recommended path. rule_syntax
-   is a COMPLETE, self-contained negative-SQL SELECT that returns the rows
-   violating the rule (its own joins/subqueries/CTEs, any valid SQL for the
-   declared dialect) — zero rows returned means the rule passed. check_type,
-   if also set, is used ONLY as a dashboard/taxonomy classification tag
-   (see rules_engine/check_types.py) — it does not affect SQL generation here.
+Rule authoring model: raw negative SQL only
+--------------------------------------------
+Every rule declares sql_dialect ('teradata' | 'postgres' | 'ansi') and a
+COMPLETE, self-contained negative-SQL SELECT in rule_syntax that returns
+the rows violating the rule -- its own joins/subqueries/CTEs, any valid
+SQL for the declared dialect. Zero rows returned means the rule passed.
+Both fields are required (see validate_rule_params()).
 
-2. Built-in check_type (check_type set, sql_dialect NOT set) — declarative
-   generation via rules_engine/check_types.py's 23 built-in generators, which
-   already emit dialect-correct SQL per source_type. Good for simple,
-   single-table checks that don't need custom SQL.
+check_type may optionally also be set -- it is a plain free-text
+classification/taxonomy tag (e.g. for dashboard grouping/filtering) and
+never affects SQL generation or execution.
 
-3. Legacy custom fragment (neither set) — rule_syntax is treated as a
-   WHERE-clause fragment and wrapped as:
-       SELECT * FROM {table} t {join} WHERE ({fragment}) AND ({filter})
-   Kept for backward compatibility with pre-dialect-guard rule definitions.
+filter_column / filter_type / filter_sql are an optional run-scoping
+layer, independent of the rule's own SQL: they let a rule auto-scope to
+the current run's batch/date window without the rule author hand-coding
+date literals into rule_syntax every time (see build_filter() /
+_build_raw_sql() below). Set neither and the rule runs unscoped
+(full-table) every time -- see check_query_risk() for why that's flagged.
+
+An earlier version of this engine also supported a declarative
+"check_type generates the SQL for you" path and a legacy WHERE-fragment
+path (see git history / DESIGN.md if archaeology is ever needed). Both
+were removed: every rule in production use was already authored as raw
+SQL, and the declarative paths only added surface area (a whole generator
+library, extra dq_rules/dq_rule_versions columns, a dq_check_catalog
+reference table) that nothing exercised.
 
 Dialect safety
 --------------
-Every raw-SQL rule (path 1) declares sql_dialect ('teradata' | 'postgres' |
-'ansi'). check_dialect() compares it against the target connection's
-source_type (DIALECT_COMPATIBILITY below) and raises DialectMismatchError
-on a mismatch — called from rules_engine/engine.py (pre-validation, load-time) and
-rules_engine/executor.py (defense-in-depth, immediately before execution) so a
-mismatch is always caught before a query reaches the database, never as a
-confusing mid-run syntax error. 'ansi' is accepted everywhere by
-definition. Rules using path 2/3 have no sql_dialect and are exempt — the
-check_type generators can't have a dialect mismatch by construction.
+check_dialect() compares a rule's declared sql_dialect against the target
+connection's source_type (DIALECT_COMPATIBILITY below) and raises
+DialectMismatchError on a mismatch -- called from rules_engine/engine.py
+(pre-validation, load-time) and rules_engine/executor.py (defense-in-depth,
+immediately before execution) so a mismatch is always caught before a
+query reaches the database, never as a confusing mid-run syntax error.
+'ansi' is accepted everywhere by definition.
 
 Public API
 ----------
 build_filter(rule, run) -> str
 build_count_query(rule, run) -> str
-build_query(rule, run, source_type) -> (sql: str, level: str)
+build_query(rule, run, source_type) -> (sql: str, level: str)   level is always "ROW"
 validate_rule_params(rule) -> str | None       (static, no DB access)
 check_dialect(rule, source_type) -> None       (raises DialectMismatchError)
 check_no_dml_ddl(rule_syntax, rule_code) -> None   (raises UnsafeRuleSQLError)
@@ -53,21 +59,17 @@ import logging
 import re
 from typing import Optional, Tuple
 
-from rules_engine.check_types import CHECK_CATALOG, get_level, _parse_params
 from utils.db_helpers import resolve_table
 
 logger = logging.getLogger(__name__)
-
-_ALIAS = "t"
 
 
 # =============================================================================
 # Write-statement guard (rule_syntax must be read-only)
 # =============================================================================
 #
-# Raw-SQL and legacy-fragment rules (paths 1 and 3) hand rule authors a
-# free-text SQL string that ends up embedded in queries the engine executes
-# against a live connection (see _build_raw_sql / build_rule_sql below, and
+# rule_syntax is free-text SQL that ends up embedded in queries the engine
+# executes against a live connection (see _build_raw_sql below, and
 # rules_engine/executor.py's _count_failed/_fetch_failed_rows, which wrap it as
 # `SELECT COUNT(*) FROM (<rule_syntax>) x`). A bare DML/DDL statement in
 # that position is usually just a syntax error once wrapped in a subquery
@@ -134,10 +136,9 @@ def check_no_dml_ddl(rule_syntax: str, rule_code: str = "") -> None:
     never a statement that writes to the database.
 
     Called from both validate_rule_params() (load-time / pre-validation,
-    same call site as check_dialect() in rules_engine/engine.py) and directly from
-    the raw-SQL / legacy-fragment build paths below (execution-time
-    defense in depth, same pattern as check_dialect()'s second call site
-    in rules_engine/executor.py).
+    same call site as check_dialect() in rules_engine/engine.py) and directly
+    from _build_raw_sql() below (execution-time defense in depth, same
+    pattern as check_dialect()'s second call site in rules_engine/executor.py).
     """
     cleaned = _strip_sql_noise(rule_syntax or "")
     words = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", cleaned.upper())
@@ -179,15 +180,8 @@ def check_query_risk(rule: dict) -> list:
     queries. Returns a list of human-readable warning strings (empty list
     = nothing flagged). Never raises.
 
-    Checked, regardless of authoring path (raw SQL / check_type / legacy
-    fragment), since an unscoped full-table read is a real cost risk no
-    matter how the SQL was produced:
       - no scoping filter at all (filter_sql and filter_column both empty
         -- build_filter() would fall back to the full-table '1=1')
-
-    Checked only for raw-SQL / legacy-fragment rules (check_type-generated
-    SQL is produced by trusted, already-reviewed generator code in
-    rules_engine/check_types.py, not free-text rule authoring):
       - SELECT * with no visible WHERE anywhere in the statement
       - an explicit CROSS JOIN
       - a literal IN (...) list with more than _IN_LIST_WARN_THRESHOLD items
@@ -205,33 +199,32 @@ def check_query_risk(rule: dict) -> list:
             "(fine for a small reference table; expensive on a large fact table)."
         )
 
-    if is_raw_sql_rule(rule) or not (rule.get("check_type") or "").strip():
-        raw = _strip_sql_noise(rule.get("rule_syntax") or "")
-        upper = raw.upper()
+    raw = _strip_sql_noise(rule.get("rule_syntax") or "")
+    upper = raw.upper()
 
-        if re.search(r"SELECT\s+\*", upper) and "WHERE" not in upper:
+    if re.search(r"SELECT\s+\*", upper) and "WHERE" not in upper:
+        warnings.append(
+            "SELECT * with no WHERE clause anywhere in rule_syntax -- likely "
+            "reads every row and every column. Consider selecting only the "
+            "columns the rule needs and adding a scoping condition."
+        )
+
+    if re.search(r"\bCROSS\s+JOIN\b", upper):
+        warnings.append(
+            "Explicit CROSS JOIN found -- produces a row for every "
+            "combination of both sides. Confirm that's intentional, not an "
+            "accidental cartesian product from a missing join condition."
+        )
+
+    for match in re.finditer(r"\bIN\s*\(([^()]*)\)", raw, re.IGNORECASE):
+        item_count = match.group(1).count(",") + 1
+        if item_count > _IN_LIST_WARN_THRESHOLD:
             warnings.append(
-                "SELECT * with no WHERE clause anywhere in rule_syntax -- likely "
-                "reads every row and every column. Consider selecting only the "
-                "columns the rule needs and adding a scoping condition."
+                f"Literal IN (...) list with ~{item_count} items -- some "
+                f"source DBs cap or slow down badly on very large IN lists. "
+                f"Consider a temp/joined table of values instead."
             )
-
-        if re.search(r"\bCROSS\s+JOIN\b", upper):
-            warnings.append(
-                "Explicit CROSS JOIN found -- produces a row for every "
-                "combination of both sides. Confirm that's intentional, not an "
-                "accidental cartesian product from a missing join condition."
-            )
-
-        for match in re.finditer(r"\bIN\s*\(([^()]*)\)", raw, re.IGNORECASE):
-            item_count = match.group(1).count(",") + 1
-            if item_count > _IN_LIST_WARN_THRESHOLD:
-                warnings.append(
-                    f"Literal IN (...) list with ~{item_count} items -- some "
-                    f"source DBs cap or slow down badly on very large IN lists. "
-                    f"Consider a temp/joined table of values instead."
-                )
-                break   # one warning is enough even if multiple large lists exist
+            break   # one warning is enough even if multiple large lists exist
 
     return warnings
 
@@ -274,109 +267,51 @@ def build_filter(rule: dict, run: dict) -> str:
 
 def build_count_query(rule: dict, run: dict) -> str:
     """COUNT(*) with the SAME filter as the rule query, for accurate failure_pct."""
-    table       = resolve_table(rule)
-    join_clause = f"\n    {rule.get('join_sql', '').strip()}" if (rule.get("join_sql") or "").strip() else ""
+    table = resolve_table(rule)
     return (
         f"SELECT COUNT(*) AS total_count\n"
-        f"    FROM {table} t{join_clause}\n"
+        f"    FROM {table} t\n"
         f"    WHERE ({build_filter(rule, run)})"
     )
 
 
 # =============================================================================
-# SQL generation (the three authoring paths)
+# SQL generation — raw negative SQL only
 # =============================================================================
 
 def is_raw_sql_rule(rule: dict) -> bool:
-    """True when the rule is authored via the raw-SQL path (path 1)."""
+    """
+    True when sql_dialect is set. Every valid rule is a raw-SQL rule now
+    (see module docstring) -- kept as a named check because
+    validate_rule_params() and callers use it to produce a clear error
+    for a rule missing sql_dialect, rather than hardcoding the check inline.
+    """
     return bool((rule.get("sql_dialect") or "").strip())
-
-
-def get_check_level(rule: dict) -> str:
-    """"ROW" | "TABLE" | "SCHEMA" — which shape of query/result this rule produces."""
-    if is_raw_sql_rule(rule):
-        return "ROW"
-    ct = (rule.get("check_type") or "").strip().upper()
-    return get_level(ct) if ct else "ROW"
 
 
 def build_query(rule: dict, run: dict, source_type: str = "teradata") -> Tuple[str, str]:
     """
     Assemble the full query for a rule.
 
-    Returns (sql, level):
-        ROW    — ready-to-run SELECT (executor wraps in COUNT(*)/fetch subqueries)
-        TABLE  — complete SELECT; 0 rows = PASS, >=1 rows = FAIL; total_records = 1
-        SCHEMA — sql = "" ; executor queries the DB catalog directly (COLUMN_EXISTS)
+    Returns (sql, level) -- level is always "ROW" (ready-to-run SELECT;
+    executor wraps it in COUNT(*)/fetch subqueries). Kept as a tuple for
+    API stability with executor.py/rule_tester.py rather than changing
+    every call site to a bare string.
     """
-    table      = resolve_table(rule)
     filter_cnd = build_filter(rule, run)
-    join_sql   = (rule.get("join_sql") or "").strip()
-
-    sql, level = build_rule_sql(rule, table, filter_cnd, source_type)
-
-    if level == "SCHEMA":
-        return "", "SCHEMA"
-    if level == "TABLE":
-        return sql, "TABLE"
-
-    # ROW level from a check_type generator or the legacy fragment path
-    # returns a WHERE fragment that still needs the FROM/JOIN wrapped
-    # around it. Raw-SQL rules (path 1) already return a complete query
-    # via _build_raw_sql() and pass straight through unchanged.
-    if is_raw_sql_rule(rule):
-        return sql, "ROW"
-
-    if not sql:
-        raise ValueError(f"rule_id={rule.get('rule_id')} ({rule.get('rule_code')}): produced empty WHERE clause.")
-
-    join_clause = f"\n    {join_sql}" if join_sql else ""
-    row_query = f"SELECT *\n    FROM {table} t{join_clause}\n    WHERE ({sql}) AND ({filter_cnd})"
-    return row_query, "ROW"
+    return build_rule_sql(rule, filter_cnd)
 
 
-def build_rule_sql(rule: dict, table: str, filter_sql: str, source_type: str) -> Tuple[str, str]:
-    """
-    Generate SQL for one rule via whichever of the 3 authoring paths applies.
-    Returns (sql, level). Raises ValueError on missing required fields.
-    """
-    if is_raw_sql_rule(rule):
-        return _build_raw_sql(rule, filter_sql)
-
-    ct = (rule.get("check_type") or "").strip().upper()
-
-    if not ct:   # path 3: legacy fragment
-        sql = (rule.get("rule_syntax") or "").strip()
-        if not sql:
-            raise ValueError(f"Rule {rule.get('rule_code')} has no sql_dialect, check_type, or rule_syntax.")
-        check_no_dml_ddl(sql, rule.get("rule_code"))
-        return sql, "ROW"
-
-    if ct == "COLUMN_EXISTS":
-        return "", "SCHEMA"
-
-    spec = CHECK_CATALOG.get(ct)   # path 2: built-in check_type generator
-    if spec is None:
-        logger.warning("Unknown check_type '%s' for rule %s — falling back to rule_syntax.",
-                       ct, rule.get("rule_code"))
-        sql = (rule.get("rule_syntax") or "").strip()
-        if not sql:
-            raise ValueError(f"Unknown check_type '{ct}' and no rule_syntax fallback (rule_code={rule.get('rule_code')}).")
-        check_no_dml_ddl(sql, rule.get("rule_code"))
-        return sql, "ROW"
-
-    level, params, fn = spec["level"], _parse_params(rule), spec["fn"]
-    try:
-        if level == "ROW":
-            sql = fn(rule, table, _ALIAS, filter_sql, params, source_type)
-        elif level == "TABLE":
-            sql = fn(rule, table, filter_sql, params, source_type)
-        else:
-            sql = ""
-    except (ValueError, KeyError) as exc:
-        raise ValueError(f"Error generating SQL for rule {rule.get('rule_code')} (check_type={ct}): {exc}") from exc
-
-    return sql, level
+def build_rule_sql(rule: dict, filter_sql: str) -> Tuple[str, str]:
+    """Generate SQL for one rule. Returns (sql, "ROW"). Raises ValueError if malformed."""
+    if not is_raw_sql_rule(rule):
+        raise ValueError(
+            f"Rule {rule.get('rule_code')} has no sql_dialect set. Every rule must "
+            f"declare sql_dialect ('teradata' | 'postgres' | 'ansi') and a complete "
+            f"negative-SQL SELECT in rule_syntax -- see rules_engine/rule_sql.py's "
+            f"module docstring."
+        )
+    return _build_raw_sql(rule, filter_sql)
 
 
 def _build_raw_sql(rule: dict, filter_sql: str) -> Tuple[str, str]:
@@ -412,43 +347,30 @@ def validate_rule_params(rule: dict) -> Optional[str]:
     Returns an error string, or None if OK. Dialect-vs-connection
     compatibility is a separate, DB-aware check — see check_dialect() below.
     """
-    if is_raw_sql_rule(rule):
-        dialect = (rule.get("sql_dialect") or "").strip().lower()
-        if dialect not in VALID_DIALECTS:
-            return f"sql_dialect '{dialect}' is invalid — must be one of {', '.join(sorted(VALID_DIALECTS))}."
-        rule_syntax = (rule.get("rule_syntax") or "").strip()
-        if not rule_syntax:
-            return "sql_dialect is set but rule_syntax is empty."
-        if not (rule.get("primary_key_columns") or "").strip():
-            return ("Raw SQL rules must declare primary_key_columns (the key_columns "
-                   "identifying the audited entity in the rule's own SELECT).")
-        try:
-            check_no_dml_ddl(rule_syntax, rule.get("rule_code"))
-        except UnsafeRuleSQLError as exc:
-            return str(exc)
-        return None
+    dialect = (rule.get("sql_dialect") or "").strip().lower()
+    if not dialect:
+        return (
+            "sql_dialect is not set. Every rule must declare sql_dialect "
+            f"('teradata' | 'postgres' | 'ansi') and a negative-SQL SELECT "
+            f"in rule_syntax."
+        )
+    if dialect not in VALID_DIALECTS:
+        return f"sql_dialect '{dialect}' is invalid — must be one of {', '.join(sorted(VALID_DIALECTS))}."
 
-    ct = (rule.get("check_type") or "").strip().upper()
+    rule_syntax = (rule.get("rule_syntax") or "").strip()
+    if not rule_syntax:
+        return "sql_dialect is set but rule_syntax is empty."
 
-    if not ct:
-        rule_syntax = (rule.get("rule_syntax") or "").strip()
-        if not rule_syntax:
-            return "sql_dialect/check_type are not set and rule_syntax is empty."
-        try:
-            check_no_dml_ddl(rule_syntax, rule.get("rule_code"))
-        except UnsafeRuleSQLError as exc:
-            return str(exc)
-        return None
+    if not (rule.get("primary_key_columns") or "").strip():
+        return ("Rules must declare primary_key_columns (the key_columns "
+               "identifying the audited entity in the rule's own SELECT).")
 
-    if ct == "COLUMN_EXISTS":
-        return None if (rule.get("check_column") or "").strip() else "COLUMN_EXISTS requires check_column."
+    try:
+        check_no_dml_ddl(rule_syntax, rule.get("rule_code"))
+    except UnsafeRuleSQLError as exc:
+        return str(exc)
 
-    spec = CHECK_CATALOG.get(ct)
-    if spec is None:
-        return None if (rule.get("rule_syntax") or "").strip() else f"Unknown check_type '{ct}' and rule_syntax is empty."
-
-    missing = [k for k in spec.get("required", []) if k not in _parse_params(rule)]
-    return f"check_type '{ct}' requires check_params fields: {', '.join(missing)}" if missing else None
+    return None
 
 
 # =============================================================================
@@ -481,9 +403,10 @@ DIALECT_COMPATIBILITY = {
 def check_dialect(rule: dict, source_type: str) -> None:
     """
     Raise DialectMismatchError if rule['sql_dialect'] cannot run against a
-    connection reporting the given source_type. No-op for rules with no
-    sql_dialect set (path 2/3 — exempt by construction) or an
-    unrecognised source_type (let the query itself surface any real error).
+    connection reporting the given source_type. No-op for a rule with no
+    sql_dialect set (validate_rule_params() already flags that as a
+    separate, clearer config error) or an unrecognised source_type (let
+    the query itself surface any real error).
     """
     dialect = (rule.get("sql_dialect") or "").strip().lower()
     if not dialect:

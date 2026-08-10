@@ -28,14 +28,6 @@ system for another full timeout window with no reason to expect a
 different outcome) -- it fails once, fast, and is recorded like any other
 ERROR so the run continues with the remaining rules.
 
-Check-type integration:
-    execute_rule():
-      - passes db_conn.source_type to build_query()
-      - branches on the returned 'level':
-          ROW    → original path (count + failed-count + exceptions)
-          TABLE  → runs the full query; 0 rows = PASS, ≥1 = FAIL; total=1
-          SCHEMA → calls _check_column_exists() against the DB catalog
-
 evaluate_rule() (PASS/FAIL/WARN decision) lives in this file too — it has
 exactly one caller (this module) so keeping it alongside execute_rule()
 means the "run the query, then judge the result" logic reads top to bottom
@@ -281,16 +273,6 @@ def _count_failed(db_conn, rule_query: str) -> int:
 
 
 @_source_retry
-def _run_table_check(db_conn, rule_query: str) -> int:
-    """
-    Run a TABLE-level check query and return the row count.
-    0 rows → PASS, ≥1 rows → FAIL.
-    """
-    rows = execute_query(db_conn, rule_query)
-    return len(rows)
-
-
-@_source_retry
 def _fetch_failed_rows(db_conn, query: str) -> list:
     """
     Fetch failed rows for exception capture, capped at MAX_EXCEPTIONS.
@@ -333,73 +315,6 @@ def _fetch_failed_rows(db_conn, query: str) -> list:
 
     _run.cancel_box = cancel_box
     return _run_with_timeout(_run)
-
-
-# ---------------------------------------------------------------------------
-# SCHEMA check: COLUMN_EXISTS
-# ---------------------------------------------------------------------------
-
-def _check_column_exists(db_conn, source_type: str, rule: dict) -> bool:
-    """
-    Query the DB catalog to verify that check_column exists in the rule's table.
-
-    Returns True if the column is found, False if not.
-    Raises on connection/query errors (caller handles ERROR status).
-    """
-    col    = (rule.get("check_column") or "").strip()
-    table  = (rule.get("src_tbl_nm") or "").strip()
-    db_nm  = (rule.get("src_db_name") or "").strip()
-    schema = (rule.get("src_schema") or "").strip()
-
-    if not col or not table:
-        raise ValueError(
-            "COLUMN_EXISTS requires both check_column and src_tbl_nm to be set "
-            f"(rule_code={rule.get('rule_code')})."
-        )
-
-    st = (source_type or "").lower()
-
-    if st == "teradata":
-        db_part = db_nm or schema
-        sql = (
-            "SELECT COUNT(*) AS cnt FROM DBC.ColumnsV "
-            "WHERE UPPER(DatabaseName) = UPPER(?) "
-            "AND UPPER(TableName)    = UPPER(?) "
-            "AND UPPER(ColumnName)   = UPPER(?)"
-        )
-        rows = execute_query(db_conn, sql, [db_part, table, col])
-
-    elif st in ("postgresql", "postgres", "aurora"):
-        sc = schema or "public"
-        sql = (
-            "SELECT COUNT(*) AS cnt FROM information_schema.columns "
-            "WHERE LOWER(table_schema) = LOWER(%s) "
-            "AND LOWER(table_name)   = LOWER(%s) "
-            "AND LOWER(column_name)  = LOWER(%s)"
-        )
-        rows = execute_query(db_conn, sql, [sc, table, col])
-
-    elif st in ("sqlserver", "mssql"):
-        sc = schema or "dbo"
-        sql = (
-            "SELECT COUNT(*) AS cnt FROM INFORMATION_SCHEMA.COLUMNS "
-            "WHERE LOWER(TABLE_SCHEMA) = LOWER(?) "
-            "AND LOWER(TABLE_NAME)   = LOWER(?) "
-            "AND LOWER(COLUMN_NAME)  = LOWER(?)"
-        )
-        rows = execute_query(db_conn, sql, [sc, table, col])
-
-    else:
-        # DuckDB / file — query the DuckDB pragma
-        view_name = table.split(".")[-1]   # strip schema prefix if any
-        sql       = (
-            f"SELECT COUNT(*) AS cnt FROM pragma_table_info('{view_name}') "
-            f"WHERE LOWER(name) = LOWER(?)"
-        )
-        rows = execute_query(db_conn, sql, [col])
-
-    cnt = int(rows[0]["cnt"] if rows else 0)
-    return cnt > 0
 
 
 # ---------------------------------------------------------------------------
@@ -618,12 +533,6 @@ def execute_rule(rule: dict, db_conn, td_conn, run: dict, meta_db: str) -> str:
                                   0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
             return "ERROR"
 
-    # ── SCHEMA-level: COLUMN_EXISTS (no table existence check needed for this) ─
-    ct = (rule.get("check_type") or "").strip().upper()
-    if ct == "COLUMN_EXISTS":
-        return _execute_schema_check(rule, db_conn, td_conn, run, meta_db,
-                                     source_type, start)
-
     # ── STEP 1: Table validation ──────────────────────────────────────────────
     if not validate_table_exists(db_conn, td_conn, rule, run, log_issue, log_message, meta_db):
         # Write a SKIP row so metrics counts every rule
@@ -648,129 +557,18 @@ def execute_rule(rule: dict, db_conn, td_conn, run: dict, meta_db: str) -> str:
                               0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
         return "ERROR"
 
-    # ── TABLE level: aggregate / freshness / volume checks ────────────────────
-    if level == "TABLE":
-        return _execute_table_check(
-            rule, db_conn, td_conn, run, meta_db, table, query, start
-        )
-
-    # ── ROW level: standard row-by-row check ─────────────────────────────────
+    # build_query() always returns level="ROW" (raw-SQL rules only — see
+    # rules_engine/rule_sql.py); `level` is kept as a return value for API
+    # stability but there's only one path now.
     return _execute_row_check(
         rule, db_conn, td_conn, run, meta_db, table, query, start
     )
 
 
 # ---------------------------------------------------------------------------
-# Level-specific execution paths
+# Row-level execution path (the only execution path — see build_query() in
+# rules_engine/rule_sql.py, which always returns level="ROW")
 # ---------------------------------------------------------------------------
-
-def _execute_schema_check(
-    rule, db_conn, td_conn, run, meta_db, source_type, start
-) -> str:
-    """Handle COLUMN_EXISTS — checks DB catalog; no data query."""
-    table = resolve_table(rule)
-    try:
-        exists = _check_column_exists(db_conn, source_type, rule)
-    except Exception as exc:
-        log_issue(td_conn, run, rule, "SCHEMA_ERROR",
-                  f"COLUMN_EXISTS catalog query failed: {exc}", str(exc), meta_db=meta_db)
-        log_message(td_conn, run["run_id"], "ERROR",
-                    f"COLUMN_EXISTS failed for rule {rule.get('rule_code')}",
-                    rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
-                    error_code="SCHEMA_ERROR", error_detail=str(exc), meta_db=meta_db)
-        logger.error("COLUMN_EXISTS catalog query failed for rule %s: %s",
-                     rule.get("rule_code"), exc, exc_info=True)
-        record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
-                              0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
-        return "ERROR"
-
-    failed     = 0 if exists else 1
-    status     = evaluate_rule(
-        total=1, failed=failed,
-        threshold_pct=rule.get("threshold_pct"),
-        threshold_count=rule.get("threshold_count"),
-        severity=rule.get("severity"),
-        require_rows=False,
-        threshold_operator=rule.get("threshold_operator", "OR"),
-    )
-    exec_time  = round(time.time() - start, 4)
-
-    logger.info(
-        "rule=%s | SCHEMA | column_exists=%s | status=%s | %.4fs",
-        rule.get("rule_code"), exists, status, exec_time,
-    )
-    record_rule_execution(td_conn, run, rule, table, 1, failed, 1 - failed,
-                          float(failed * 100), float((1 - failed) * 100),
-                          status, exec_time, meta_db)
-    return status
-
-
-def _execute_table_check(
-    rule, db_conn, td_conn, run, meta_db, table, query, start
-) -> str:
-    """Handle TABLE-level checks (FRESHNESS, ROW_COUNT_*, AGGREGATE_RANGE, etc.)."""
-    # TABLE checks always work on a "logical property of the table" — total = 1.
-    total = 1
-
-    # ── SQL syntax validation ─────────────────────────────────────────────────
-    # (wrap in SELECT … WHERE 1=0 to force a parse-only pass)
-    try:
-        validate_sql(db_conn, query)
-    except Exception as exc:
-        log_issue(td_conn, run, rule, "SQL_SYNTAX",
-                  "Invalid TABLE-check SQL", str(exc), meta_db=meta_db)
-        log_message(td_conn, run["run_id"], "ERROR",
-                    f"SQL validation failed for rule {rule.get('rule_code')}",
-                    rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
-                    error_code="SQL_SYNTAX", error_detail=str(exc), meta_db=meta_db)
-        logger.error("Invalid TABLE-check SQL for rule %s: %s",
-                     rule.get("rule_code"), exc, exc_info=True)
-        record_rule_execution(td_conn, run, rule, table, 0, 0, 0,
-                              0.0, 0.0, "ERROR", round(time.time() - start, 4), meta_db)
-        return "ERROR"
-
-    # ── Run the TABLE-level query ─────────────────────────────────────────────
-    try:
-        row_count = _run_table_check(db_conn, query)
-    except Exception as exc:
-        log_issue(td_conn, run, rule, "DATA_RUNTIME",
-                  f"TABLE-level check query failed: {exc}", str(exc), meta_db=meta_db)
-        log_message(td_conn, run["run_id"], "ERROR",
-                    f"TABLE check failed for rule {rule.get('rule_code')}",
-                    rule_id=rule.get("rule_id"), rule_code=rule.get("rule_code"),
-                    error_code="DATA_RUNTIME", error_detail=str(exc), meta_db=meta_db)
-        logger.error("TABLE-level check query failed for rule %s: %s",
-                     rule.get("rule_code"), exc, exc_info=True)
-        record_rule_execution(td_conn, run, rule, table, total, 0, total,
-                              0.0, 100.0, "ERROR", round(time.time() - start, 4), meta_db)
-        return "ERROR"
-
-    # 0 rows returned = condition met = PASS
-    # ≥1 rows returned = condition violated = FAIL (or WARN based on severity)
-    failed = 1 if row_count > 0 else 0
-    passed = total - failed
-
-    failure_pct = float(failed * 100)
-    pass_pct    = float(passed * 100)
-
-    status    = evaluate_rule(
-        total=total, failed=failed,
-        threshold_pct=rule.get("threshold_pct"),
-        threshold_count=rule.get("threshold_count"),
-        severity=rule.get("severity"),
-        require_rows=False,   # TABLE checks don't use require_rows
-        threshold_operator=rule.get("threshold_operator", "OR"),
-    )
-    exec_time = round(time.time() - start, 4)
-
-    logger.info(
-        "rule=%s | TABLE | violation=%s | status=%s | %.4fs",
-        rule.get("rule_code"), bool(failed), status, exec_time,
-    )
-    record_rule_execution(td_conn, run, rule, table, total, failed, passed,
-                          failure_pct, pass_pct, status, exec_time, meta_db)
-    return status
-
 
 def _execute_row_check(
     rule, db_conn, td_conn, run, meta_db, table, query, start

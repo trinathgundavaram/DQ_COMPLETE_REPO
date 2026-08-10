@@ -83,34 +83,12 @@ VALUES ('ACME_CLAIMS', 'MONTHLY_AUDIT');
 
 ## 4. Author your first rules
 
-Two authoring paths, both land in `dq_rules`. Start with a couple of
-simple ones to prove the pipeline end to end before writing your full
-rule set.
-
-**Path 2 -- built-in check_type** (declarative, no SQL to write; see
-`rules_engine/check_types.py` for all 24 generators and their docstrings
-for a worked example of each):
-
-```sql
-INSERT INTO <your_meta_db>.dq_rules (
-    rule_id, rule_code, scope_id, src_tbl_nm, source_system,
-    rule_name, primary_key_columns, severity,
-    check_type, check_column, priority, active_flag
-) VALUES (
-    1, 'ACME-001',
-    (SELECT scope_id FROM <your_meta_db>.dq_scope
-     WHERE project_name = 'ACME_CLAIMS' AND process_name = 'MONTHLY_AUDIT'),
-    'claims', 'teradata',
-    'Claim amount must not be null', 'claim_id', 'HIGH',
-    'NOT_NULL', 'claim_amount', 10, 1
-);
-```
-
-**Path 1 -- raw SQL** (a complete negative-SQL SELECT -- returns the
-rows that VIOLATE the rule; zero rows = PASS; see `rules_engine/rule_sql.py`'s
-module docstring for the full authoring model, and `rules_engine/rule_sql.py`'s
-`check_no_dml_ddl()` guard, which rejects anything that isn't a
-read-only SELECT):
+Every rule lands in `dq_rules` as a complete negative-SQL SELECT --
+it returns the rows that VIOLATE the rule; zero rows = PASS. See
+`rules_engine/rule_sql.py`'s module docstring for the full authoring
+model, and its `check_no_dml_ddl()` guard, which rejects anything that
+isn't a read-only SELECT. Start with a couple of simple ones to prove
+the pipeline end to end before writing your full rule set.
 
 ```sql
 INSERT INTO <your_meta_db>.dq_rules (
@@ -118,7 +96,7 @@ INSERT INTO <your_meta_db>.dq_rules (
     rule_name, rule_syntax, primary_key_columns, severity,
     sql_dialect, priority, active_flag
 ) VALUES (
-    2, 'ACME-002',
+    1, 'ACME-001',
     (SELECT scope_id FROM <your_meta_db>.dq_scope
      WHERE project_name = 'ACME_CLAIMS' AND process_name = 'MONTHLY_AUDIT'),
     'claims', 'teradata',
@@ -133,6 +111,10 @@ INSERT INTO <your_meta_db>.dq_rules (
 `source_type` is compatible with -- see `rules_engine/rule_sql.py`'s
 `DIALECT_COMPATIBILITY` table. Mismatches are caught before any rule
 runs, not as a confusing mid-run SQL error.
+
+`check_type` is an optional free-text classification tag (e.g.
+`'NOT_NULL'`, `'RANGE_CHECK'`) -- purely for grouping/filtering findings
+on the dashboard, it never affects how the rule's SQL runs.
 
 ## 5. Dry-run before writing anything
 
@@ -219,9 +201,9 @@ call `rules_engine/main.py` and the scheduler use.
 ## 9. Where to go next
 
 - **DESIGN.md** -- full architecture: the two-framework split, every
-  extension point (`rules_engine/check_types.py` for a new check type,
-  `db/adapters.py` for a new source system), dialect enforcement, the
-  write-statement guard, `dq_scope` normalization.
+  extension point (`db/adapters.py` for a new source system -- a new
+  rule is just a new `dq_rules` row, no code change), dialect
+  enforcement, the write-statement guard, `dq_scope` normalization.
 - **RETENTION.md** -- once you're running in production, plan
   partitioning/archival for the high-growth tables before they become a
   performance problem, not after.

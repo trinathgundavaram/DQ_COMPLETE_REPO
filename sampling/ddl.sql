@@ -65,8 +65,16 @@ PRIMARY INDEX (sample_run_id);   -- NUPI on purpose: every candidate case
                                   -- sample_run_id. sample_row_id (identity)
                                   -- is the real per-row identifier.
 
--- Matches sampling/anomaly.py's "WHERE config_id = ? ... GROUP BY
--- sample_run_id" (candidate-pool history) -- config_id isn't the PI, so
--- that filter would otherwise be a full-table scan.
+-- Kept after re-evaluating every secondary index against this project's
+-- real scale: dq_sample_selections stores every CANDIDATE case considered
+-- each cycle, not just the selected sample -- for HealthSpring UM that's
+-- the full ~20k-35k-row weekly universe (see UM-VOL-001 in
+-- config/seed/02_rules.sql), retained 10 years per Section 3.7. That makes
+-- it easily the highest-volume table in this schema (tens of millions of
+-- rows over the retention window), and config_id isn't the PI, so
+-- sampling/anomaly.py's "WHERE config_id = ? ... GROUP BY sample_run_id"
+-- (candidate-pool history) would otherwise be a genuinely expensive
+-- full-table scan -- unlike the rules-engine tables (see rules_engine/
+-- ddl.sql), this is exactly the case a secondary index is for.
 CREATE INDEX dq_sample_selections_lookup_ix (config_id, sample_cycle, selected_flag)
 ON CMSUNIV_FILELAND_DEV_T.dq_sample_selections;

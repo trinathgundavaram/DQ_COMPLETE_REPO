@@ -112,9 +112,8 @@ def record_suppressed_execution(td_conn, run: dict, rule: dict, meta_db: str, re
 # =============================================================================
 
 _TRACKED_FIELDS: List[str] = [
-    "rule_syntax", "check_type", "check_column", "check_params",
-    "filter_sql", "join_sql", "threshold_pct", "threshold_count",
-    "threshold_operator", "severity", "active_flag",
+    "rule_syntax", "check_type", "filter_sql", "threshold_pct",
+    "threshold_count", "threshold_operator", "severity", "active_flag",
 ]
 
 
@@ -200,15 +199,13 @@ def _write_snapshot(td_conn, rule: dict, meta_db: str, execute_query, bulk_inser
     sql = f"""
         INSERT INTO {meta_db}.dq_rule_versions (
             rule_id, rule_code, version_num, change_type,
-            rule_syntax, check_type, check_column, check_params,
-            filter_sql, join_sql, threshold_pct, threshold_count,
-            threshold_operator, severity, active_flag, changed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            rule_syntax, check_type, filter_sql, threshold_pct,
+            threshold_count, threshold_operator, severity, active_flag, changed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     """
     bulk_insert(td_conn, sql, [(
         rule.get("rule_id"), rule.get("rule_code"), next_ver, change_type,
-        rule.get("rule_syntax"), rule.get("check_type"), rule.get("check_column"),
-        rule.get("check_params"), rule.get("filter_sql"), rule.get("join_sql"),
+        rule.get("rule_syntax"), rule.get("check_type"), rule.get("filter_sql"),
         rule.get("threshold_pct"), rule.get("threshold_count"), rule.get("threshold_operator"),
         rule.get("severity"), rule.get("active_flag"),
     )])

@@ -51,7 +51,6 @@ rules_engine/                    -- FRAMEWORK 1: the DQ rules engine
   engine.py               orchestrator: run scheduling, thread pool, pre-validation
   executor.py             query execution + rule evaluation (merged former evaluator.py)
   rule_sql.py             SQL construction, raw-SQL rules, dialect enforcement
-  check_types.py          built-in declarative check_type -> SQL generators
   rule_lifecycle.py       rule versioning + suppression
   metrics.py              run metrics + anomaly (z-score/IQR) detection
   reporting.py             notification routing + static audit report
@@ -96,8 +95,8 @@ schedule.json.example     entrypoints.py --schedule job-file shape, worked examp
 
 Each module has one job and a new capability slots into an existing file
 rather than requiring a new one: a new source is a new adapter class in
-`db/adapters.py`; a new check type is a new generator function in
-`rules_engine/check_types.py`; a new execution context is a new function in
+`db/adapters.py`; a new rule is a new row in `dq_rules` (negative SQL --
+no code change at all); a new execution context is a new function in
 `entrypoints.py`. The one-file-per-concern rule applies across the
 framework boundary too: `sampling/` is two small, single-purpose files --
 `engine.py` for the sample-selection algorithm, `anomaly.py` for the
@@ -142,17 +141,20 @@ teradata connection") and is logged to `dq_rule_issues` with
 `issue_type='DIALECT_MISMATCH'` -- never to `dq_exceptions`. The rule is
 recorded as `status='ERROR'`, never `PASS`.
 
-Legacy check_type-generated rules (no `sql_dialect`) are exempt -- the
-`check_types.py` generators already branch on `source_type` internally and
-can't have a dialect mismatch by construction.
+`sql_dialect` is required on every rule (`NOT NULL` in the DDL) -- there is
+no other rule-authoring path for it to be exempt from.
 
 This was the one genuinely new piece of correctness logic (see §4,
 Section 8 item 8) -- no dialect concept existed in the reference repo.
 
 ### 3.2 Raw-SQL rule authoring
 
-New: `_build_raw_sql()` in `rules_engine/rule_sql.py`, and a documented 3-path
-priority order (raw SQL -> check_type generation -> legacy fragment).
+New: `_build_raw_sql()` in `rules_engine/rule_sql.py`. This is now the
+*only* rule-authoring path -- an earlier declarative "check_type generates
+the SQL for you" path and a legacy WHERE-fragment path were both removed
+once it was clear every real rule was already being hand-written as raw
+SQL and neither path was pulling its weight (see git history if the
+declarative generator library is ever needed as a reference).
 
 The reference repo's existing `rule_syntax` fallback treats it as a
 WHERE-clause **fragment** that the engine wraps as
@@ -161,8 +163,8 @@ express the SHRPA / provider-contract cross-table JOIN rules the brief
 requires ("no separate join-configuration mechanism") -- a WHERE fragment
 has no FROM/JOIN of its own.
 
-So: when `sql_dialect` is set, `rule_syntax` is treated as a **complete,
-self-contained negative-SQL SELECT** -- the rule owns its own FROM/JOIN/
+So: every rule declares `sql_dialect`, and `rule_syntax` is treated as a
+**complete, self-contained negative-SQL SELECT** -- the rule owns its own FROM/JOIN/
 WHERE. The engine does not parse or rewrite it. If the rule also declares
 `filter_column`/`filter_sql` (run-scoping, e.g. `pull_date`), the engine
 wraps the *entire* query as an outer subquery: `SELECT * FROM (<rule_syntax>)
@@ -180,10 +182,9 @@ column (no new column needed) -- every raw-SQL rule's `validate_rule_params`
 now requires it, since it's what lets a two-table join rule and a
 single-table rule both produce comparable, storable exception rows.
 
-`check_type` is retained on raw-SQL rules purely as the classification
-tag -- it does not affect SQL generation for this path. That's the point:
-a taxonomy, not a code-generator, once SQL is the primary authoring
-surface.
+`check_type` is retained as an optional, plain free-text classification
+tag (surfaced as a findings column on the dashboard) -- it never affects
+SQL generation or execution. It's a taxonomy, not a code-generator.
 
 Verified end-to-end against DuckDB during development, including a
 cross-table join mirroring the SHRPA pattern. This repo doesn't bundle
@@ -533,8 +534,8 @@ columns.
 
 To onboard an unrelated second use case: add an entry to
 `config/connections.yaml` (existing `source_type`, or a new adapter class in
-`db/adapters.py`), insert rows into `dq_rules` (raw SQL + `sql_dialect` +
-`check_type` tag, or check_type-generated), optionally a
+`db/adapters.py`), insert rows into `dq_rules` (raw negative SQL +
+`sql_dialect`, optionally a `check_type` tag), optionally a
 `dq_sampling_config` row if it needs ranked sampling, and
 `dq_notification_routes` rows for its own audiences. Zero files under
 `rules_engine/` or `utils/` need to change, and `db/adapters.py` only changes if a

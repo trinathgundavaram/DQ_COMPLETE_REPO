@@ -65,9 +65,9 @@ grows at the same rate as `dq_rule_execution`'s run_id cardinality.
 
 ### Config / reference tables (essentially static)
 
-`dq_check_catalog`, `dq_profile_config`, `dq_anomaly_config`,
-`dq_notification_routes`, `dq_sampling_config` -- human-edited, low row
-count (tens to low hundreds of rows), never need a retention policy.
+`dq_profile_config`, `dq_anomaly_config`, `dq_notification_routes`,
+`dq_sampling_config` -- human-edited, low row count (tens to low
+hundreds of rows), never need a retention policy.
 (Connection catalogue metadata lives in `config/connections.yaml`, not a
 table, so it isn't part of this list at all.)
 

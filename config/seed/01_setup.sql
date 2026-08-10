@@ -108,8 +108,9 @@ VALUES
     (1, 'HEALTHSPRING_UM', 'UNIVERSE_VALIDATION', NULL, 'BOTH', 3.0, 1.5, 8, 1);
 
 -- Fixed thresholds live directly on individual dq_rules rows (see
--- 02_rules.sql — e.g. UM-VOL-001's check_params encodes the known
--- 25k-30k weekly volume band). The ~10-20/day and ~10/month flagged-error
--- volume expectations are intentionally NOT hardcoded anywhere — they're
--- judged via dq_anomaly_config above, per Section 3.4's guidance that a
--- number like that "was never reliable to begin with."
+-- 02_rules.sql — e.g. UM-VOL-001's own negative-SQL rule_syntax encodes
+-- the known 20k-35k weekly volume band directly in its HAVING clause).
+-- The ~10-20/day and ~10/month flagged-error volume expectations are
+-- intentionally NOT hardcoded anywhere — they're judged via
+-- dq_anomaly_config above, per Section 3.4's guidance that a number like
+-- that "was never reliable to begin with."

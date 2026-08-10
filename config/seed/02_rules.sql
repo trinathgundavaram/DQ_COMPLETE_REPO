@@ -5,7 +5,7 @@
 -- ============================================================
 
 -- UM-REQ-001: Beneficiary first name must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1001,
     'UM-REQ-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -21,8 +21,6 @@ WHERE beneficiary_first_name IS NULL OR TRIM(CAST(beneficiary_first_name AS VARC
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'NOT_EMPTY',
-    'beneficiary_first_name',
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -33,7 +31,7 @@ WHERE beneficiary_first_name IS NULL OR TRIM(CAST(beneficiary_first_name AS VARC
 );
 
 -- UM-REQ-002: Beneficiary last name must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1002,
     'UM-REQ-002',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -49,8 +47,6 @@ WHERE beneficiary_last_name IS NULL OR TRIM(CAST(beneficiary_last_name AS VARCHA
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'NOT_EMPTY',
-    'beneficiary_last_name',
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -61,7 +57,7 @@ WHERE beneficiary_last_name IS NULL OR TRIM(CAST(beneficiary_last_name AS VARCHA
 );
 
 -- UM-REQ-003: Enrollee ID must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1003,
     'UM-REQ-003',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -77,8 +73,6 @@ WHERE enrollee_id IS NULL OR TRIM(CAST(enrollee_id AS VARCHAR(4000))) = ''''',
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'NOT_EMPTY',
-    'enrollee_id',
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -89,7 +83,7 @@ WHERE enrollee_id IS NULL OR TRIM(CAST(enrollee_id AS VARCHAR(4000))) = ''''',
 );
 
 -- UM-REQ-004: Contract ID must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1004,
     'UM-REQ-004',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -105,8 +99,6 @@ WHERE contract_id IS NULL OR TRIM(CAST(contract_id AS VARCHAR(4000))) = ''''',
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'NOT_EMPTY',
-    'contract_id',
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -117,7 +109,7 @@ WHERE contract_id IS NULL OR TRIM(CAST(contract_id AS VARCHAR(4000))) = ''''',
 );
 
 -- UM-REQ-005: Plan Benefit Package (PBP) must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1005,
     'UM-REQ-005',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -133,8 +125,6 @@ WHERE pbp IS NULL OR TRIM(CAST(pbp AS VARCHAR(4000))) = ''''',
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'NOT_EMPTY',
-    'pbp',
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -145,7 +135,7 @@ WHERE pbp IS NULL OR TRIM(CAST(pbp AS VARCHAR(4000))) = ''''',
 );
 
 -- UM-REQ-006: Auth/claim number must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1006,
     'UM-REQ-006',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -161,8 +151,6 @@ WHERE auth_or_claim_number IS NULL OR TRIM(CAST(auth_or_claim_number AS VARCHAR(
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'NOT_EMPTY',
-    'auth_or_claim_number',
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -173,7 +161,7 @@ WHERE auth_or_claim_number IS NULL OR TRIM(CAST(auth_or_claim_number AS VARCHAR(
 );
 
 -- UM-REQ-007: Request received date/time must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1007,
     'UM-REQ-007',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -189,8 +177,6 @@ WHERE request_received_ts IS NULL OR TRIM(CAST(request_received_ts AS VARCHAR(40
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'NOT_EMPTY',
-    'request_received_ts',
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -201,7 +187,7 @@ WHERE request_received_ts IS NULL OR TRIM(CAST(request_received_ts AS VARCHAR(40
 );
 
 -- UM-REQ-008: Decision date/time must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1008,
     'UM-REQ-008',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -217,8 +203,6 @@ WHERE decision_ts IS NULL OR TRIM(CAST(decision_ts AS VARCHAR(4000))) = ''''',
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'NOT_EMPTY',
-    'decision_ts',
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -229,7 +213,7 @@ WHERE decision_ts IS NULL OR TRIM(CAST(decision_ts AS VARCHAR(4000))) = ''''',
 );
 
 -- UM-REQ-009: Service type must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1009,
     'UM-REQ-009',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -245,8 +229,6 @@ WHERE service_type IS NULL OR TRIM(CAST(service_type AS VARCHAR(4000))) = ''''',
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'NOT_EMPTY',
-    'service_type',
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -257,7 +239,7 @@ WHERE service_type IS NULL OR TRIM(CAST(service_type AS VARCHAR(4000))) = ''''',
 );
 
 -- UM-REQ-010: Member ID must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1010,
     'UM-REQ-010',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -273,8 +255,6 @@ WHERE member_id IS NULL OR TRIM(CAST(member_id AS VARCHAR(4000))) = ''''',
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'NOT_EMPTY',
-    'member_id',
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -285,7 +265,7 @@ WHERE member_id IS NULL OR TRIM(CAST(member_id AS VARCHAR(4000))) = ''''',
 );
 
 -- UM-REQ-011: Provider ID must not be blank
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1011,
     'UM-REQ-011',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -301,8 +281,6 @@ WHERE provider_id IS NULL OR TRIM(CAST(provider_id AS VARCHAR(4000))) = ''''',
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'NOT_EMPTY',
-    'provider_id',
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -313,7 +291,7 @@ WHERE provider_id IS NULL OR TRIM(CAST(provider_id AS VARCHAR(4000))) = ''''',
 );
 
 -- UM-FMT-001: Auth/claim number must not contain letters other than 'H'
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1012,
     'UM-FMT-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -330,8 +308,6 @@ WHERE auth_or_claim_number IS NOT NULL
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'REGEX_MATCH',
-    'auth_or_claim_number',
-    '{"pattern": "^[0-9H]+$"}',
     'teradata',
     1,
     'pull_date',
@@ -342,7 +318,7 @@ WHERE auth_or_claim_number IS NOT NULL
 );
 
 -- UM-FMT-002: Contract ID must match Medicare contract-number format
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1013,
     'UM-FMT-002',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -359,8 +335,6 @@ WHERE contract_id IS NOT NULL
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'REGEX_MATCH',
-    NULL,
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -371,7 +345,7 @@ WHERE contract_id IS NOT NULL
 );
 
 -- UM-FMT-003: Enrollee ID must be numeric
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1014,
     'UM-FMT-003',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -388,8 +362,6 @@ WHERE enrollee_id IS NOT NULL
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'REGEX_MATCH',
-    NULL,
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -400,7 +372,7 @@ WHERE enrollee_id IS NOT NULL
 );
 
 -- UM-VAL-001: Request disposition must be an allowed value
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1015,
     'UM-VAL-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -417,8 +389,6 @@ WHERE request_disposition NOT IN (''Approved'', ''Denied'', ''Withdrawn'', ''Dis
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'IN_LIST',
-    'request_disposition',
-    '{"values": ["Approved", "Denied", "Withdrawn", "Dismissed"]}',
     'teradata',
     1,
     'pull_date',
@@ -429,7 +399,7 @@ WHERE request_disposition NOT IN (''Approved'', ''Denied'', ''Withdrawn'', ''Dis
 );
 
 -- UM-VAL-002: Service type must be an allowed value
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1016,
     'UM-VAL-002',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -447,8 +417,6 @@ WHERE service_type NOT IN (''STANDARD_PRESERVICE'', ''PART_B_DRUG'', ''EXPEDITED
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'IN_LIST',
-    NULL,
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -459,7 +427,7 @@ WHERE service_type NOT IN (''STANDARD_PRESERVICE'', ''PART_B_DRUG'', ''EXPEDITED
 );
 
 -- UM-VAL-003: Network status must be an allowed value
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1017,
     'UM-VAL-003',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -476,8 +444,6 @@ WHERE network_status NOT IN (''In-Network'', ''Out-of-Network'')
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'IN_LIST',
-    NULL,
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -488,7 +454,7 @@ WHERE network_status NOT IN (''In-Network'', ''Out-of-Network'')
 );
 
 -- UM-COND-001: Denied requests must have a denial reason
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1018,
     'UM-COND-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -505,8 +471,6 @@ WHERE request_disposition = ''Denied''
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'CONDITIONAL',
-    NULL,
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -517,7 +481,7 @@ WHERE request_disposition = ''Denied''
 );
 
 -- UM-COND-002: Approved requests must have a real notification date
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1019,
     'UM-COND-002',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -537,8 +501,6 @@ WHERE request_disposition = ''Approved''
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'CONDITIONAL',
-    NULL,
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -549,7 +511,7 @@ WHERE request_disposition = ''Approved''
 );
 
 -- UM-COND-003: Withdrawn requests must have a withdrawal reason
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1020,
     'UM-COND-003',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -566,8 +528,6 @@ WHERE request_disposition = ''Withdrawn''
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'CONDITIONAL',
-    NULL,
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -578,7 +538,7 @@ WHERE request_disposition = ''Withdrawn''
 );
 
 -- UM-COND-004: Denied requests must carry a written notification date
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1021,
     'UM-COND-004',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -595,8 +555,6 @@ WHERE request_disposition = ''Denied''
     'enrollee_id, auth_or_claim_number',
     'Compliance Flag',
     'CONDITIONAL',
-    NULL,
-    NULL,
     'teradata',
     0,
     'pull_date',
@@ -607,7 +565,7 @@ WHERE request_disposition = ''Denied''
 );
 
 -- UM-XFIELD-001: Decision must not precede the request
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1022,
     'UM-XFIELD-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -624,8 +582,6 @@ WHERE decision_ts IS NOT NULL AND request_received_ts IS NOT NULL
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'CROSS_COLUMN',
-    NULL,
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -636,7 +592,7 @@ WHERE decision_ts IS NOT NULL AND request_received_ts IS NOT NULL
 );
 
 -- UM-XFIELD-002: Effectuation must not precede the decision
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1023,
     'UM-XFIELD-002',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -653,8 +609,6 @@ WHERE effectuation_date IS NOT NULL AND decision_ts IS NOT NULL
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'CROSS_COLUMN',
-    NULL,
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -665,7 +619,7 @@ WHERE effectuation_date IS NOT NULL AND decision_ts IS NOT NULL
 );
 
 -- UM-SLA-STD-001: Standard pre-service — 7 calendar days (no extension)
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1024,
     'UM-SLA-STD-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -684,8 +638,6 @@ WHERE service_type = ''STANDARD_PRESERVICE''
     'enrollee_id, auth_or_claim_number',
     'Timeliness',
     'CROSS_COLUMN',
-    NULL,
-    NULL,
     'teradata',
     0,
     'pull_date',
@@ -696,7 +648,7 @@ WHERE service_type = ''STANDARD_PRESERVICE''
 );
 
 -- UM-SLA-STD-002: Standard pre-service with extension — 28 days (eff. 1/1/2026)
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1025,
     'UM-SLA-STD-002',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -715,8 +667,6 @@ WHERE service_type = ''STANDARD_PRESERVICE''
     'enrollee_id, auth_or_claim_number',
     'Timeliness',
     'CROSS_COLUMN',
-    NULL,
-    NULL,
     'teradata',
     0,
     'pull_date',
@@ -727,7 +677,7 @@ WHERE service_type = ''STANDARD_PRESERVICE''
 );
 
 -- UM-SLA-PARTB-001: Part B drugs — 72 hours
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1026,
     'UM-SLA-PARTB-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -745,8 +695,6 @@ WHERE service_type = ''PART_B_DRUG''
     'enrollee_id, auth_or_claim_number',
     'Timeliness',
     'CROSS_COLUMN',
-    NULL,
-    NULL,
     'teradata',
     0,
     'pull_date',
@@ -757,7 +705,7 @@ WHERE service_type = ''PART_B_DRUG''
 );
 
 -- UM-SLA-EXP-001: Expedited — 72 hours (no extension)
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1027,
     'UM-SLA-EXP-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -776,8 +724,6 @@ WHERE service_type = ''EXPEDITED''
     'enrollee_id, auth_or_claim_number',
     'Timeliness',
     'CROSS_COLUMN',
-    NULL,
-    NULL,
     'teradata',
     0,
     'pull_date',
@@ -788,7 +734,7 @@ WHERE service_type = ''EXPEDITED''
 );
 
 -- UM-SLA-EXP-002: Expedited with extension — 17 days
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1028,
     'UM-SLA-EXP-002',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -807,8 +753,6 @@ WHERE service_type = ''EXPEDITED''
     'enrollee_id, auth_or_claim_number',
     'Timeliness',
     'CROSS_COLUMN',
-    NULL,
-    NULL,
     'teradata',
     0,
     'pull_date',
@@ -819,7 +763,7 @@ WHERE service_type = ''EXPEDITED''
 );
 
 -- UM-SLA-EXPPARTB-001: Expedited Part B — 24 hours
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1029,
     'UM-SLA-EXPPARTB-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -837,8 +781,6 @@ WHERE service_type = ''EXPEDITED_PART_B''
     'enrollee_id, auth_or_claim_number',
     'Timeliness',
     'CROSS_COLUMN',
-    NULL,
-    NULL,
     'teradata',
     0,
     'pull_date',
@@ -849,7 +791,7 @@ WHERE service_type = ''EXPEDITED_PART_B''
 );
 
 -- UM-SLA-DSNP-001: DSNP-AIP — 3-day written notice rule
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1030,
     'UM-SLA-DSNP-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -871,8 +813,6 @@ WHERE service_type = ''DSNP_AIP''
     'enrollee_id, auth_or_claim_number',
     'Compliance Flag',
     'CONDITIONAL',
-    NULL,
-    NULL,
     'teradata',
     0,
     'pull_date',
@@ -883,7 +823,7 @@ WHERE service_type = ''DSNP_AIP''
 );
 
 -- UM-BIZHRS-001: Decision time must fall within business hours
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1031,
     'UM-BIZHRS-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -901,8 +841,6 @@ WHERE decision_ts IS NOT NULL
     'enrollee_id, auth_or_claim_number',
     'Data Validation Error',
     'CROSS_COLUMN',
-    NULL,
-    NULL,
     'teradata',
     1,
     'pull_date',
@@ -913,7 +851,7 @@ WHERE decision_ts IS NOT NULL
 );
 
 -- UM-DUP-001: Reopened case within 65 days of a prior denial
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1032,
     'UM-DUP-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -935,8 +873,6 @@ JOIN um_universe prior
     'enrollee_id, auth_or_claim_number',
     'Compliance Flag',
     'CROSS_COLUMN',
-    NULL,
-    NULL,
     'teradata',
     0,
     'pull_date',
@@ -947,7 +883,7 @@ JOIN um_universe prior
 );
 
 -- UM-XTAB-SHRPA-001: Approved determinations requiring SHRPA clinical review
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1033,
     'UM-XTAB-SHRPA-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -966,8 +902,6 @@ WHERE u.request_disposition = ''Approved''
     'enrollee_id, auth_or_claim_number',
     'Compliance Flag',
     'REFERENTIAL_INTEGRITY',
-    NULL,
-    NULL,
     'teradata',
     0,
     'pull_date',
@@ -978,7 +912,7 @@ WHERE u.request_disposition = ''Approved''
 );
 
 -- UM-XTAB-PROV-001: Provider must have an active contract at time of decision
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1034,
     'UM-XTAB-PROV-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -997,8 +931,6 @@ WHERE u.provider_id IS NOT NULL
     'enrollee_id, auth_or_claim_number',
     'Compliance Flag',
     'REFERENTIAL_INTEGRITY',
-    NULL,
-    NULL,
     'teradata',
     0,
     'pull_date',
@@ -1009,7 +941,14 @@ WHERE u.provider_id IS NOT NULL
 );
 
 -- UM-FRESH-001: Universe pull must occur every Friday (even on holidays)
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+-- Negative SQL: returns one summary row (the violation) when the most recent
+-- pull is older than 96 hours (4 days); zero rows = fresh = PASS. Formerly a
+-- declarative FRESHNESS check_type/check_column/check_params generator rule
+-- (max_age_hours=96, check_column=pull_date) -- rewritten as raw SQL so the
+-- engine has exactly one authoring path (see rules_engine/rule_sql.py).
+-- Self-contained: no filter_column/filter_type -- it always evaluates
+-- MAX(pull_date) across the whole table, not a run-supplied date window.
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1035,
     'UM-FRESH-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -1018,14 +957,14 @@ INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_n
     NULL,
     'teradata',
     'Universe pull must occur every Friday (even on holidays)',
-    'The weekly ODAG1 universe pull must have landed within the expected window — MAX(pull_date) must be within 4 days of the run date.',
-    NULL,
-    'enrollee_id',
+    'The weekly ODAG1 universe pull must have landed within the expected window — MAX(pull_date) must be within 4 days (96 hours) of the run date.',
+    'SELECT MAX(pull_date) AS last_pull_date
+FROM um_universe
+HAVING MAX(pull_date) < CURRENT_TIMESTAMP - 96 * INTERVAL ''1'' HOUR',
+    'last_pull_date',
     'Data Validation Error',
     'FRESHNESS',
-    'pull_date',
-    '{"max_age_hours": 96}',
-    NULL,
+    'teradata',
     1,
     NULL,
     NULL,
@@ -1035,7 +974,19 @@ INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_n
 );
 
 -- UM-VOL-001: Weekly universe volume must be in the expected range
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+-- Negative SQL: returns one summary row (the violation) when the latest
+-- pull's row count falls outside [20000, 35000]; zero rows = in-range =
+-- PASS. Formerly a declarative ROW_COUNT_RANGE check_type/check_params
+-- generator rule (min_rows=20000, max_rows=35000) -- rewritten as raw SQL,
+-- same reason as UM-FRESH-001 above. Self-contained: scopes to the latest
+-- pull via MAX(pull_date) directly in the rule's own SQL rather than the
+-- run's filter_column/filter_type window, since this check is always about
+-- "the pull that just landed," not an arbitrary run-supplied date range --
+-- filter_column/filter_type are NULL here for the same reason as
+-- UM-FRESH-001 (aggregating HAVING queries can't be re-filtered by an outer
+-- WHERE the way row-level rules can; see rules_engine/rule_sql.py's
+-- _build_raw_sql()).
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1036,
     'UM-VOL-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -1044,24 +995,25 @@ INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_n
     NULL,
     'teradata',
     'Weekly universe volume must be in the expected range',
-    'Expected weekly volume is ~25,000-30,000 cases; a count far outside this range indicates a truncated or duplicated pull.',
-    NULL,
-    'enrollee_id',
+    'Expected weekly volume is ~25,000-30,000 cases (alert band 20,000-35,000); a count far outside this range indicates a truncated or duplicated pull.',
+    'SELECT COUNT(*) AS actual_count
+FROM um_universe
+WHERE pull_date = (SELECT MAX(pull_date) FROM um_universe)
+HAVING COUNT(*) < 20000 OR COUNT(*) > 35000',
+    'actual_count',
     'Data Validation Error',
     'ROW_COUNT_RANGE',
-    NULL,
-    '{"min_rows": 20000, "max_rows": 35000}',
-    NULL,
+    'teradata',
     1,
-    'pull_date',
-    'DATE',
+    NULL,
+    NULL,
     10,
     'UM_AUDIT',
     1
 );
 
 -- UM-REFDATA-PG-001: SHRPA reference rows must have a non-blank auth number
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1037,
     'UM-REFDATA-PG-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -1077,8 +1029,6 @@ WHERE authorization_number IS NULL OR TRIM(authorization_number) = ''''',
     'authorization_number',
     'Data Validation Error',
     'NOT_EMPTY',
-    NULL,
-    NULL,
     'postgres',
     1,
     NULL,
@@ -1089,7 +1039,7 @@ WHERE authorization_number IS NULL OR TRIM(authorization_number) = ''''',
 );
 
 -- UM-ARCHIVE-S3-001: Archived weekly snapshot must be present in S3
-INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, check_column, check_params, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
+INSERT INTO CMSUNIV_FILELAND_T.dq_rules (rule_id, rule_code, scope_id, src_tbl_nm, src_db_name, source_system, rule_name, rule_description, rule_syntax, primary_key_columns, severity, check_type, sql_dialect, business_correctable, filter_column, filter_type, priority, rule_group, active_flag) VALUES (
     1038,
     'UM-ARCHIVE-S3-001',
     (SELECT scope_id FROM CMSUNIV_FILELAND_T.dq_scope
@@ -1105,8 +1055,6 @@ WHERE pull_date < CURRENT_DATE - 10',
     'enrollee_id',
     'Data Validation Error',
     'FRESHNESS',
-    NULL,
-    NULL,
     'ansi',
     1,
     NULL,

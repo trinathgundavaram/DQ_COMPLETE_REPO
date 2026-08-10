@@ -37,9 +37,7 @@ from rules_engine.executor import (
     evaluate_rule,
     _count_total,
     _count_failed,
-    _run_table_check,
     _fetch_failed_rows,
-    _check_column_exists,
 )
 from rules_engine.rule_sql import build_query, build_count_query, check_query_risk
 from utils.db_helpers import resolve_table
@@ -152,46 +150,16 @@ def test_rule(
 
     source_type = getattr(db_conn, "source_type", "teradata")
 
-    # ── Build SQL + determine level ────────────────────────────────────────────
+    # ── Build SQL ──────────────────────────────────────────────────────────────
+    # build_query() always returns level="ROW" (raw-SQL rules only — see
+    # rules_engine/rule_sql.py); level is kept in the returned dict below for
+    # API stability but there's only one execution path now.
     try:
         query, level = build_query(rule, run_stub, source_type)
     except ValueError as exc:
         print(f"  SQL build error: {exc}\n")
         return {"rule_code": rule_code, "status": "ERROR", "error": str(exc)}
 
-    # ── SCHEMA: COLUMN_EXISTS ──────────────────────────────────────────────────
-    if level == "SCHEMA":
-        print(f"Check type : COLUMN_EXISTS (schema check — no SQL query)\n")
-        start = time.time()
-        try:
-            exists  = _check_column_exists(db_conn, source_type, rule)
-            elapsed = round(time.time() - start, 4)
-            status  = evaluate_rule(
-                total=1, failed=0 if exists else 1,
-                threshold_pct=rule.get("threshold_pct"),
-                threshold_count=rule.get("threshold_count"),
-                severity=rule.get("severity"),
-                require_rows=False,
-                threshold_operator=rule.get("threshold_operator", "OR"),
-            )
-            print(f"{'─'*40}")
-            print(f"  STATUS      : {status}")
-            print(f"  Column found: {exists}")
-            print(f"  Elapsed     : {elapsed}s")
-            print(f"{'─'*40}\n")
-            print("NOTE: No data was written to any DQ metadata table.")
-            return {
-                "rule_code":   rule_code,
-                "status":      status,
-                "level":       "SCHEMA",
-                "column_exists": exists,
-                "elapsed_s":   elapsed,
-            }
-        except Exception as exc:
-            print(f"  COLUMN_EXISTS error: {exc}")
-            return {"rule_code": rule_code, "status": "ERROR", "error": str(exc)}
-
-    print(f"Level : {level}")
     print("Rule SQL:")
     print(f"  {query.strip()}\n")
 
@@ -222,28 +190,18 @@ def test_rule(
     # ── Execute ────────────────────────────────────────────────────────────────
     start = time.time()
 
-    if level == "TABLE":
-        print("Running TABLE-level check...")
-        row_count   = _run_table_check(db_conn, query)
-        failed      = 1 if row_count > 0 else 0
-        total       = 1
-        passed      = 1 - failed
-        failure_pct = float(failed * 100)
-        pass_pct    = float(passed * 100)
-        print(f"  Violation rows returned: {row_count} ({'FAIL' if row_count else 'PASS'})\n")
-    else:
-        count_query = build_count_query(rule, run_stub)
-        print("Counting total records...")
-        total = _count_total(db_conn, count_query)
-        print(f"  Total in scope : {total:,}\n")
+    count_query = build_count_query(rule, run_stub)
+    print("Counting total records...")
+    total = _count_total(db_conn, count_query)
+    print(f"  Total in scope : {total:,}\n")
 
-        print("Counting failed records...")
-        failed = _count_failed(db_conn, query)
-        print(f"  Failed records : {failed:,}\n")
+    print("Counting failed records...")
+    failed = _count_failed(db_conn, query)
+    print(f"  Failed records : {failed:,}\n")
 
-        passed      = max(total - failed, 0)
-        failure_pct = round((failed / total * 100), 6) if total else 0.0
-        pass_pct    = round(100.0 - failure_pct, 6)
+    passed      = max(total - failed, 0)
+    failure_pct = round((failed / total * 100), 6) if total else 0.0
+    pass_pct    = round(100.0 - failure_pct, 6)
 
     elapsed = round(time.time() - start, 4)
 
@@ -252,7 +210,7 @@ def test_rule(
         rule.get("threshold_pct"),
         rule.get("threshold_count"),
         rule.get("severity"),
-        require_rows=bool(rule.get("require_rows", 0)) if level == "ROW" else False,
+        require_rows=bool(rule.get("require_rows", 0)),
         threshold_operator=rule.get("threshold_operator", "OR"),
     )
 
@@ -265,9 +223,9 @@ def test_rule(
     print(f"  Elapsed     : {elapsed}s")
     print(f"{'─'*40}\n")
 
-    # ── Failed-row preview (ROW level only) ───────────────────────────────────
+    # ── Failed-row preview ─────────────────────────────────────────────────────
     failed_preview = []
-    if level == "ROW" and failed > 0 and show_rows > 0:
+    if failed > 0 and show_rows > 0:
         print(f"Failed row preview (first {show_rows}):")
         try:
             rows = _fetch_failed_rows(db_conn, query)
