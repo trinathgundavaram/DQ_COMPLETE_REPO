@@ -15,7 +15,7 @@ import gre.executor as gre_executor
 from gre.executor import (
     evaluate_threshold, build_natural_key, _substitute_batch_id,
     execute_rule, execute_query, bulk_insert, bulk_insert_or_skip,
-    check_dialect, DialectMismatchError, _compute_total,
+    check_dialect, DialectMismatchError, _compute_total, _scan_violations,
 )
 
 META_DB = "main"
@@ -32,6 +32,25 @@ class _SourceTypeWrapper:
         self.source_type = source_type
 
     def cursor(self):
+        return self._conn.cursor()
+
+    def commit(self):
+        self._conn.commit()
+
+
+class _CursorCountingWrapper:
+    """
+    Wraps a DuckDB connection and counts how many times .cursor() is
+    called on it -- one call per distinct query execution issued through
+    this connection -- so a test can prove a code path issues exactly the
+    number of source-side queries it claims to, not more.
+    """
+    def __init__(self, conn):
+        self._conn = conn
+        self.cursor_calls = 0
+
+    def cursor(self):
+        self.cursor_calls += 1
         return self._conn.cursor()
 
     def commit(self):
@@ -475,3 +494,48 @@ def test_compute_total_cache_is_keyed_by_source_connection_and_query():
     assert _compute_total(conn, rule_b1, "B1", total_cache=cache) == 4
     assert _compute_total(conn, rule_b2, "B2", total_cache=cache) == 1   # only C5 is in B2
     assert len(cache) == 2   # different batch_id -> different cache key, not collapsed together
+
+
+# ── single-scan evaluation (_scan_violations) ────────────────────────────
+
+def test_scan_violations_returns_true_count_and_all_rows_uncapped():
+    conn = _conn()
+    query = "SELECT claim_id, denial_reason FROM claims WHERE denial_reason IS NULL AND batch_id = 'B1'"
+    failed, rows = _scan_violations(conn, query)
+    assert failed == 2
+    assert len(rows) == 2   # default MAX_EXCEPTIONS (10000) doesn't cap 2 rows
+    assert {r["claim_id"] for r in rows} == {"C1", "C3"}
+
+
+def test_scan_violations_keeps_true_count_exact_past_the_cap(monkeypatch):
+    conn = _conn()
+    monkeypatch.setattr(gre_executor, "MAX_EXCEPTIONS", 1)
+    query = "SELECT claim_id, denial_reason FROM claims WHERE denial_reason IS NULL AND batch_id = 'B1'"
+    failed, rows = _scan_violations(conn, query)
+    assert failed == 2      # true count, uncapped
+    assert len(rows) == 1   # detail rows capped
+
+
+def test_scan_violations_issues_exactly_one_query():
+    conn = _conn()
+    wrapped = _CursorCountingWrapper(conn)
+    query = "SELECT claim_id, denial_reason FROM claims WHERE denial_reason IS NULL AND batch_id = 'B1'"
+    failed, rows = _scan_violations(wrapped, query)
+    assert failed == 2
+    assert wrapped.cursor_calls == 1   # ONE execution -- not a separate COUNT query plus a fetch query
+
+
+def test_execute_rule_issues_two_source_queries_not_three():
+    # Old design per rule: a COUNT(*)-wrapped query + a detail-row fetch
+    # query (both running rule_sql) + the total-record query = 3 source-side
+    # queries. New design: one merged scan (_scan_violations) + the total
+    # query = 2. (A rule_group with several rules sharing the same table
+    # drops this further via total_cache -- see test_gre_runner.py's
+    # shared-cache test -- but for a single rule on its own, 2 is the count.)
+    conn = _conn()
+    wrapped_db = _CursorCountingWrapper(conn)
+    rule = _rule(threshold_pct=25)
+
+    status = execute_rule(rule, wrapped_db, conn, "RUN1", "B1", META_DB)
+    assert status == "SUCCESS"
+    assert wrapped_db.cursor_calls == 2

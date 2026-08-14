@@ -82,14 +82,21 @@ Two things in `gre/executor.py` are specifically shaped for a rule that
 matches a very large number of rows, mirroring `core/executor.py`'s
 proven fix #1 pattern rather than inventing a new one:
 
-- **`failed_records` is a TRUE source-side count**, from a
-  `SELECT COUNT(*) FROM (rule_sql) AS sub` query (`_count_failed`), run
-  BEFORE any row-level detail capture. This means the PASS/FAIL/WARN
-  verdict and `gre_results.failed_records` are exact no matter how many
-  rows `rule_sql` actually returns.
-- **`gre_exceptions` detail-row capture is capped and streamed**, not one
-  unbounded `fetchall()`. `_fetch_violating_rows` pulls rows in
-  `GRE_EXCEPTION_CHUNK`-sized batches via `fetchmany()` and stops once
+- **`rule_sql` is scanned ONCE per rule, not twice.** `_scan_violations`
+  streams the rule's own query via `fetchmany()` a single time, producing
+  BOTH the true failed count (every row is counted, even past any cap) AND
+  a capped row list for detail capture from that same pass — replacing the
+  earlier two-query design (a separate `COUNT(*)`-wrapped query, then
+  `rule_sql` run again in full to fetch rows), which scanned the identical
+  predicate against the identical rows twice per rule. This roughly halves
+  read load against the source table for every rule, with no change to how
+  rules are written. One trade-off: since count and capture now share one
+  query, a failure during that scan fails the whole rule (there's no
+  longer an independently-obtained count to fall back on if only the
+  detail-fetch half had failed) — see `_scan_violations`'s docstring.
+- **`gre_exceptions` detail-row capture is capped**, not one unbounded
+  `fetchall()`. `_scan_violations` pulls rows in `GRE_EXCEPTION_CHUNK`-
+  sized batches and stops *storing* (though not counting) once
   `GRE_MAX_EXCEPTIONS` rows have been collected (`0`/negative = unlimited).
   A rule matching 10 million rows still gets an exact `failed_records`, and
   `gre_exceptions` gets a bounded, configurable number of detail rows
