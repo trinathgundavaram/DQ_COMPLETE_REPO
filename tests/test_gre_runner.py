@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import duckdb
 
+import gre.executor as gre_executor
 from gre.runner import run_rule_group
 from gre.executor import execute_query
 
@@ -192,3 +193,41 @@ def test_no_rules_returns_no_rules_status():
     cf = _FakeConnectionFactory(conn)
     summary = run_rule_group("empty_group", "B1", cf, meta_conn=conn, meta_db=META_DB)
     assert summary["status"] == "NO_RULES"
+
+
+def test_shared_total_cache_avoids_redundant_count_queries_across_rules(monkeypatch):
+    # Two rules in the same group, same table/batch_id_column/batch_id, no
+    # scope_sql override -- they ask _compute_total() the identical
+    # question, so within one run_rule_group() call that COUNT(*) should
+    # only actually run once.
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10)
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20)
+    # Force a gre_results row for both rules (any failure breaches), so the
+    # cached total_records is actually observable below.
+    conn.execute("UPDATE gre_rules SET threshold_pct = 0")
+
+    calls = {"n": 0}
+    original = gre_executor._run_source_query
+
+    def counting(db_conn, sql):
+        calls["n"] += 1
+        return original(db_conn, sql)
+
+    monkeypatch.setattr(gre_executor, "_run_source_query", counting)
+
+    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+
+    assert summary["status"] == "COMPLETED"
+    assert summary["results"][1] == "SUCCESS"
+    assert summary["results"][2] == "SUCCESS"
+    # _run_source_query is only used by _compute_total() in this flow (the
+    # rule_sql/failed-count path uses execute_query/_count_failed directly)
+    # -- one call total proves the second rule's total was served from cache.
+    assert calls["n"] == 1
+
+    # Both rules should still report the correct total, proving the cached
+    # value is being reused correctly, not just skipped.
+    results = execute_query(conn, "SELECT rule_id, total_records FROM gre_results WHERE batch_id = 'B1'")
+    assert {r["rule_id"]: r["total_records"] for r in results} == {1: 4, 2: 4}

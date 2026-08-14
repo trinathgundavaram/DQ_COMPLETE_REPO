@@ -21,6 +21,7 @@ import pytest
 
 from gre.sampling import (
     _target_for_bucket, _select, _stratify, run_sampling, load_sampling_config,
+    _pull_candidates,
 )
 
 META_DB = "main"
@@ -261,6 +262,45 @@ def test_shortfall_topup_ranked_pulls_from_remaining_pool():
     levels = [{"strata_id": 1, "mix": {"A": 0.5}}]   # target*0.5 only
     selected = _stratify(candidates, levels, 50, "RANKED", "FLOOR", random_module.Random(1))
     assert len(selected) < 50   # confirms the shortfall actually exists pre-topup
+
+
+# ── _pull_candidates: SQL-side priority rank ─────────────────────────────
+
+def test_pull_candidates_computes_priority_rank_in_sql_for_ranked():
+    conn = _conn()
+    _build_universe(conn, n=50)
+    config = {
+        "config_id": 1, "universe_table": "case_universe", "key_columns": "case_id",
+        "scope_sql": "pull_date = '{batch_id}'", "exclusion_sql": "auto_closed = 1",
+        "sampling_method": "RANKED", "priority_rank_sql": "revision DESC, case_id ASC",
+    }
+    candidates = _pull_candidates(conn, config, [], "2026-08-01")
+    assert len(candidates) > 0
+
+    # _priority_rank is sequential and DB-computed (ROW_NUMBER()), not a
+    # Python enumerate() loop over the fetched rows.
+    ranks = [c["_priority_rank"] for c in candidates]
+    assert ranks == list(range(1, len(candidates) + 1))
+
+    # Matches the same ORDER BY run independently against the source table.
+    expected_order = [r[0] for r in conn.execute(
+        "SELECT case_id FROM case_universe WHERE pull_date = '2026-08-01' AND NOT (auto_closed = 1) "
+        "ORDER BY revision DESC, case_id ASC"
+    ).fetchall()]
+    assert [c["case_id"] for c in candidates] == expected_order
+
+
+def test_pull_candidates_random_gets_null_priority_rank():
+    conn = _conn()
+    _build_universe(conn, n=50)
+    config = {
+        "config_id": 1, "universe_table": "case_universe", "key_columns": "case_id",
+        "scope_sql": "pull_date = '{batch_id}'", "exclusion_sql": "auto_closed = 1",
+        "sampling_method": "RANDOM", "priority_rank_sql": None,
+    }
+    candidates = _pull_candidates(conn, config, [], "2026-08-01")
+    assert len(candidates) > 0
+    assert all(c["_priority_rank"] is None for c in candidates)
 
 
 # ── run_sampling end-to-end ───────────────────────────────────────────

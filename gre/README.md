@@ -61,6 +61,16 @@ Insert one row into `gre_rules`. Key fields:
   rules in the group for this run; already-committed findings are never
   rolled back). `independent` (default) runs every rule regardless of
   another rule's outcome.
+- `sql_dialect` — `'teradata'` | `'postgres'` | `'ansi'` (NOT NULL). Checked
+  against the target connection's `source_type` (see
+  `db/adapters.py::SourceAdapter.source_type`) before `rule_sql` ever runs
+  — `gre/executor.py::check_dialect()`. `'ansi'` is accepted everywhere;
+  a genuine mismatch (e.g. a `'teradata'`-dialect rule pointed at a
+  `postgresql` connection) fails fast with a clear `DIALECT_MISMATCH`
+  `gre_errors` row instead of a confusing mid-run SQL syntax error. A
+  connection whose `source_type` isn't in `DIALECT_COMPATIBILITY`
+  (currently `databricks`/`sqlserver` — see the comment there) skips the
+  check with a warning rather than guessing.
 
 Zero engine code changes are needed to onboard a new rule or a whole new
 use case — see `tests/test_gre_executor.py` / `test_gre_runner.py` for
@@ -102,6 +112,23 @@ proven fix #1 pattern rather than inventing a new one:
   is reused by `gre/sampling.py` for `gre_sample_selections` /
   `gre_sample_selection_attrs`, which are append-only with no unique index
   and so need no duplicate-key fallback.
+- **`_compute_total`'s COUNT(*) is memoized across a whole `run_rule_group()`
+  call.** Several rules in a group very often ask the same "how many rows
+  are in this batch" question — same `table_name`/`batch_id_column`, or an
+  intentionally shared `scope_sql` — so `runner.py` threads one dict
+  (keyed by `source_connection` + the resolved query text) through every
+  `execute_rule()` call in the run, and a repeat query is served from that
+  cache instead of re-scanning the same rows once per rule. Scoped to a
+  single run (a fresh cache every call) since the source isn't expected to
+  change mid-run — the same assumption `gre_exceptions`' idempotency
+  already relies on. Direct `execute_rule()` calls that don't pass a
+  `total_cache` (e.g. in tests) get the old always-fresh-query behavior.
+- **`gre/sampling.py`'s `_priority_rank` is computed by the database**, via
+  `ROW_NUMBER() OVER (ORDER BY priority_rank_sql)` selected alongside the
+  rest of the candidate pull, instead of a Python `enumerate()` loop over
+  the fetched rows in `_pull_candidates`. For a candidate pool in the
+  millions this moves that O(n) pass into the source engine, which is
+  already doing the `ORDER BY` for the query itself.
 
 Both env vars default to and mean the same thing as their `dq_*` engine
 counterparts (`DQ_EXCEPTION_CHUNK` / `DQ_MAX_EXCEPTIONS`), just

@@ -92,6 +92,80 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Dialect safety
+# ---------------------------------------------------------------------------
+# gre_rules.sql_dialect is NOT NULL in schema.sql -- every rule declares
+# which SQL flavor rule_sql/scope_sql are written in. Fresh implementation
+# here (not imported from core/rule_sql.py -- see this module's docstring
+# on the scope boundary) but the same shape/behavior as the proven dq_*
+# pattern: 'ansi' is accepted everywhere, an unrecognised source_type is
+# skipped with a warning rather than guessed at, and the check runs BEFORE
+# any query reaches the database (execute_rule()'s STEP 0) so a mismatch
+# is always a clear, fast, pre-execution error -- never a confusing
+# mid-run syntax error from the wrong SQL dialect hitting the wrong engine.
+
+class DialectMismatchError(Exception):
+    """Raised when a rule's declared sql_dialect cannot run against its target connection."""
+
+
+VALID_DIALECTS = {"teradata", "postgres", "ansi"}
+
+# source_type (SourceAdapter.source_type, see db/adapters.py) -> set of
+# sql_dialect values safe to execute against it. 'ansi' is always accepted
+# by definition. databricks/sqlserver are deliberately NOT listed --
+# db/adapters.py itself notes they're "included and fully functional, but
+# not catalogued/tested for the current use case," so guessing a dialect
+# compatibility for them would be worse than the unrecognised-source_type
+# skip-with-warning path below.
+DIALECT_COMPATIBILITY = {
+    "teradata":   {"teradata", "ansi"},
+    "postgresql": {"postgres", "ansi"},
+    "postgres":   {"postgres", "ansi"},   # alias
+    "aurora":     {"postgres", "ansi"},   # Aurora PG-compatible
+    # FileAdapter/S3Adapter are both DuckDB-backed, which implements a
+    # Postgres-flavoured SQL surface -- 'postgres'-dialect rules run
+    # unmodified against either.
+    "file":       {"postgres", "ansi"},
+    "s3":         {"postgres", "ansi"},
+    "duckdb":     {"postgres", "ansi"},   # alias, in case an adapter reports this directly
+}
+
+
+def check_dialect(rule: dict, source_type: str) -> None:
+    """
+    Raise DialectMismatchError if rule['sql_dialect'] cannot run against a
+    connection reporting `source_type`. No-op for a rule with no
+    sql_dialect set (defensive only -- gre_rules.sql_dialect is NOT NULL)
+    or an unrecognised source_type (logged, not raised -- let the query
+    itself surface any real incompatibility rather than guessing).
+    """
+    dialect = (rule.get("sql_dialect") or "").strip().lower()
+    if not dialect:
+        return
+
+    if dialect not in VALID_DIALECTS:
+        raise DialectMismatchError(
+            f"rule_id={rule.get('rule_id')}: invalid sql_dialect '{dialect}'. "
+            f"Must be one of: {', '.join(sorted(VALID_DIALECTS))}."
+        )
+
+    st = (source_type or "").strip().lower()
+    allowed = DIALECT_COMPATIBILITY.get(st)
+    if allowed is None:
+        logger.warning(
+            "Dialect check skipped for rule_id=%s -- unrecognised source_type '%s'.",
+            rule.get("rule_id"), source_type,
+        )
+        return
+
+    if dialect not in allowed:
+        raise DialectMismatchError(
+            f"rule_id={rule.get('rule_id')} is written for sql_dialect='{dialect}', cannot run "
+            f"against a '{st}' connection. Allowed dialects for '{st}': {', '.join(sorted(allowed))}."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Low-level DB helpers
 # ---------------------------------------------------------------------------
 
@@ -592,12 +666,26 @@ def _log_error(meta_conn, meta_db: str, run_id: str, rule: dict, batch_id: str,
 # Total in-scope record count
 # ---------------------------------------------------------------------------
 
-def _compute_total(db_conn, rule: dict, batch_id: str) -> int:
+def _compute_total(db_conn, rule: dict, batch_id: str, total_cache: dict = None) -> int:
     """
     total_records = scope_sql result if the rule defines one, else
     COUNT(*) on table_name scoped to the current batch via batch_id_column
     (default 'batch_id'). Both paths go through the same {batch_id}
     substitution as rule_sql.
+
+    total_cache: an optional dict shared across every rule in one
+    run_rule_group() call (see runner.py), keyed by
+    (source_connection, effective query text). Multiple rules in a group
+    very often ask the identical question -- same table_name/
+    batch_id_column, or an intentionally shared scope_sql -- so caching by
+    the actual resolved query (not just table_name) reuses the COUNT(*)
+    result across every rule that would otherwise re-run the exact same
+    scan, without needing to special-case scope_sql vs. the default path.
+    A fresh cache per run means this never sees stale data across runs;
+    within one run the source isn't expected to change mid-run anyway
+    (the same assumption gre_exceptions' idempotency already relies on).
+    Callers that don't pass a cache (e.g. direct execute_rule() calls in
+    tests) get the old always-fresh-query behavior unchanged.
     """
     scope_sql = (rule.get("scope_sql") or "").strip()
     if scope_sql:
@@ -609,32 +697,48 @@ def _compute_total(db_conn, rule: dict, batch_id: str) -> int:
             batch_id,
         )
 
+    cache_key = (rule.get("source_connection"), query)
+    if total_cache is not None and cache_key in total_cache:
+        return total_cache[cache_key]
+
     rows = _run_source_query(db_conn, query)
     if not rows:
-        return 0
-    first_row = rows[0]
-    first_value = next(iter(first_row.values()))
-    return int(first_value or 0)
+        total = 0
+    else:
+        first_row = rows[0]
+        first_value = next(iter(first_row.values()))
+        total = int(first_value or 0)
+
+    if total_cache is not None:
+        total_cache[cache_key] = total
+    return total
 
 
 # ---------------------------------------------------------------------------
 # Rule execution
 # ---------------------------------------------------------------------------
 
-def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, batch_id: str, meta_db: str) -> str:
+def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, batch_id: str, meta_db: str,
+                  total_cache: dict = None) -> str:
     """
-    Execute one rule end-to-end: run rule_sql, write every violating row to
+    Execute one rule end-to-end: check its declared dialect against the
+    source connection, run rule_sql, write every violating row to
     gre_exceptions, evaluate the rule-level threshold, upsert gre_results,
     and log the attempt.
 
     Parameters
     ----------
-    rule      : one row from gre_rules (dict)
-    db_conn   : SourceAdapter for rule['source_connection'] -- READS ONLY
-    meta_conn : SourceAdapter for the gre_ metadata store -- all writes go here
-    run_id    : id for this run (assigned by gre/runner.py)
-    batch_id  : the batch being evaluated
-    meta_db   : schema name the gre_ tables live in
+    rule        : one row from gre_rules (dict)
+    db_conn     : SourceAdapter for rule['source_connection'] -- READS ONLY
+    meta_conn   : SourceAdapter for the gre_ metadata store -- all writes go here
+    run_id      : id for this run (assigned by gre/runner.py)
+    batch_id    : the batch being evaluated
+    meta_db     : schema name the gre_ tables live in
+    total_cache : optional dict, shared across every rule in one
+                  run_rule_group() call, that memoizes _compute_total()'s
+                  COUNT(*) result -- see _compute_total()'s docstring.
+                  None (the default) disables caching, e.g. for direct
+                  single-rule calls in tests.
 
     Returns
     -------
@@ -661,9 +765,22 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, batch_id: str, met
     _fetch_violating_rows() rather than one unbounded fetchall(); a
     capture/write failure there is logged to gre_errors but does NOT flip
     this rule to ERROR, since the PASS/FAIL/WARN verdict only depends on
-    the counts computed in STEP 1/2.
+    the counts computed in STEP 1/2. total_cache (STEP 2) similarly avoids
+    a redundant COUNT(*) scan when several rules in a group ask the same
+    question.
     """
     start = time.time()
+
+    # ── STEP 0: dialect guard -- fail fast, never mid-run ─────────────────────
+    source_type = getattr(db_conn, "source_type", "unknown")
+    try:
+        check_dialect(rule, source_type)
+    except DialectMismatchError as exc:
+        logger.error("Rule %s: dialect check failed: %s", rule.get("rule_id"), exc)
+        _log_error(meta_conn, meta_db, run_id, rule, batch_id, "DIALECT_MISMATCH", str(exc))
+        _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, start, str(exc))
+        return "ERROR"
+
     query = _substitute_batch_id(rule["rule_sql"], batch_id)
 
     # ── STEP 1: TRUE failed-record count (source-side COUNT(*)) ──────────────
@@ -675,9 +792,9 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, batch_id: str, met
         _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, start, str(exc))
         return "ERROR"
 
-    # ── STEP 2: total in-scope record count ───────────────────────────────────
+    # ── STEP 2: total in-scope record count (memoized across the run_group) ──
     try:
-        total = _compute_total(db_conn, rule, batch_id)
+        total = _compute_total(db_conn, rule, batch_id, total_cache=total_cache)
     except Exception as exc:
         logger.error("Rule %s: scope/count query failed: %s", rule.get("rule_id"), exc, exc_info=True)
         _log_error(meta_conn, meta_db, run_id, rule, batch_id, "SCOPE_QUERY_FAILURE", str(exc))

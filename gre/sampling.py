@@ -247,9 +247,16 @@ def _stratify(candidates: list, levels: list, target: int, method: str, rounding
 # ---------------------------------------------------------------------------
 
 def _pull_candidates(db_conn, config: dict, levels: list, batch_id: str) -> list:
+    """
+    Pull the candidate universe, with _priority_rank computed by the
+    DATABASE (ROW_NUMBER() OVER (ORDER BY priority_rank_sql)) rather than a
+    Python loop over the fetched rows. For a candidate pool in the
+    millions this pushes an O(n) pass down to the source engine -- which
+    is already doing the ORDER BY for the SELECT itself -- instead of a
+    second O(n) pass in this process after the full fetch.
+    """
     key_cols = [c.strip() for c in config["key_columns"].split(",") if c.strip()]
     strata_select = [f"{lvl['stratify_expr']} AS {_bucket_key(lvl['strata_id'])}" for lvl in levels]
-    select_cols = ", ".join(key_cols + strata_select) if strata_select else ", ".join(key_cols)
 
     scope = (config.get("scope_sql") or "").strip() or "1=1"
     scope = _substitute_batch_id(scope, batch_id)
@@ -269,28 +276,23 @@ def _pull_candidates(db_conn, config: dict, levels: list, batch_id: str) -> list
             f"(config_id={config.get('config_id')})."
         )
 
-    if priority_sql:
-        order_clause = f"ORDER BY {priority_sql}"
-    elif method == "SYSTEMATIC":
-        # No priority given but SYSTEMATIC still needs a stable order to walk
-        # an interval across -- fall back to key-column order.
-        order_clause = f"ORDER BY {', '.join(key_cols)}"
+    # RANKED/SYSTEMATIC always have priority_sql here (validated above);
+    # RANDOM may or may not -- if it does, the pull is still ordered by it
+    # (unchanged from the prior behavior), but the rank itself stays NULL
+    # below since RANDOM's own selection is a shuffle, not a rank read.
+    order_clause = f"ORDER BY {priority_sql}" if priority_sql else ""
+
+    if method in _METHODS_REQUIRING_PRIORITY:
+        rank_select = f"ROW_NUMBER() OVER (ORDER BY {priority_sql}) AS _priority_rank"
     else:
-        order_clause = ""
+        rank_select = "NULL AS _priority_rank"
+
+    select_cols = ", ".join(key_cols + strata_select + [rank_select])
 
     query = f"SELECT {select_cols} FROM {config['universe_table']} WHERE {where_clause} {order_clause}"
     logger.info("Sampling candidate pull (config_id=%s):\n%s", config.get("config_id"), query)
 
-    candidates = _run_source_query(db_conn, query)
-
-    if method in _METHODS_REQUIRING_PRIORITY:
-        for i, row in enumerate(candidates, start=1):
-            row["_priority_rank"] = i
-    else:
-        for row in candidates:
-            row["_priority_rank"] = None   # meaningless for RANDOM
-
-    return candidates
+    return _run_source_query(db_conn, query)
 
 
 def _case_key(row: dict, key_cols: list) -> str:

@@ -15,9 +15,27 @@ import gre.executor as gre_executor
 from gre.executor import (
     evaluate_threshold, build_natural_key, _substitute_batch_id,
     execute_rule, execute_query, bulk_insert, bulk_insert_or_skip,
+    check_dialect, DialectMismatchError, _compute_total,
 )
 
 META_DB = "main"
+
+
+class _SourceTypeWrapper:
+    """
+    Wraps a DuckDB connection so it reports a specific `.source_type`, for
+    testing the dialect guard without needing a real db/adapters.py
+    adapter (a raw duckdb.Connection has no source_type attribute at all).
+    """
+    def __init__(self, conn, source_type):
+        self._conn = conn
+        self.source_type = source_type
+
+    def cursor(self):
+        return self._conn.cursor()
+
+    def commit(self):
+        self._conn.commit()
 
 
 def _conn():
@@ -357,3 +375,103 @@ def test_max_exceptions_cap_keeps_failed_records_true_but_caps_detail_rows(monke
 
     logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND batch_id = 'B1'")
     assert logs[0]["rowcount"] == 1   # "rows written to gre_exceptions this attempt" == the capped count
+
+
+# ── dialect guard ─────────────────────────────────────────────────────────
+
+def test_check_dialect_ansi_accepted_everywhere():
+    check_dialect({"rule_id": 1, "sql_dialect": "ansi"}, "postgresql")
+    check_dialect({"rule_id": 1, "sql_dialect": "ansi"}, "teradata")
+    check_dialect({"rule_id": 1, "sql_dialect": "ansi"}, "some_future_adapter")
+
+
+def test_check_dialect_matching_dialect_passes():
+    check_dialect({"rule_id": 1, "sql_dialect": "teradata"}, "teradata")
+    check_dialect({"rule_id": 1, "sql_dialect": "postgres"}, "postgresql")
+    check_dialect({"rule_id": 1, "sql_dialect": "postgres"}, "s3")   # DuckDB-backed
+
+
+def test_check_dialect_mismatch_raises():
+    with pytest.raises(DialectMismatchError):
+        check_dialect({"rule_id": 1, "sql_dialect": "teradata"}, "postgresql")
+
+
+def test_check_dialect_invalid_value_raises():
+    with pytest.raises(DialectMismatchError):
+        check_dialect({"rule_id": 1, "sql_dialect": "mysql"}, "teradata")
+
+
+def test_check_dialect_unrecognised_source_type_is_a_no_op():
+    # databricks/sqlserver are deliberately not in DIALECT_COMPATIBILITY --
+    # skip with a warning rather than guess.
+    check_dialect({"rule_id": 1, "sql_dialect": "teradata"}, "databricks")
+
+
+def test_execute_rule_dialect_mismatch_routes_to_errors_before_any_query():
+    conn = _conn()
+    db_conn = _SourceTypeWrapper(conn, "postgresql")
+    rule = _rule(sql_dialect="teradata", threshold_pct=25)
+
+    status = execute_rule(rule, db_conn, conn, "RUN1", "B1", META_DB)
+    assert status == "ERROR"
+
+    errors = execute_query(conn, "SELECT * FROM gre_errors WHERE rule_id = 1")
+    assert len(errors) == 1
+    assert errors[0]["error_type"] == "DIALECT_MISMATCH"
+
+    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1")
+    assert len(logs) == 1 and logs[0]["status"] == "ERROR"
+
+    # Caught before ANY query ran -- nothing written to gre_exceptions/gre_results.
+    assert execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1") == []
+    assert execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1") == []
+
+
+def test_execute_rule_ansi_dialect_runs_against_any_source():
+    conn = _conn()
+    db_conn = _SourceTypeWrapper(conn, "postgresql")
+    rule = _rule(sql_dialect="ansi", threshold_pct=25)
+
+    status = execute_rule(rule, db_conn, conn, "RUN1", "B1", META_DB)
+    assert status == "SUCCESS"
+
+
+def test_execute_rule_unrecognised_source_type_skips_dialect_check():
+    conn = _conn()
+    db_conn = _SourceTypeWrapper(conn, "some_future_adapter")
+    rule = _rule(sql_dialect="teradata", threshold_pct=25)
+
+    status = execute_rule(rule, db_conn, conn, "RUN1", "B1", META_DB)
+    assert status == "SUCCESS"   # unrecognised source_type -> warn and skip, not a hard failure
+
+
+# ── _compute_total memoization ───────────────────────────────────────────
+
+def test_compute_total_is_memoized_within_a_shared_cache():
+    conn = _conn()
+    rule = _rule()   # scope_sql=None, batch_id_column='batch_id', table_name='claims'
+    cache = {}
+
+    total1 = _compute_total(conn, rule, "B1", total_cache=cache)
+    assert total1 == 4
+    assert len(cache) == 1
+
+    # Mutate the underlying table -- a fresh (uncached) count would change.
+    conn.execute("INSERT INTO claims VALUES ('C99', NULL, 'B1')")
+
+    total2 = _compute_total(conn, rule, "B1", total_cache=cache)
+    assert total2 == 4   # served from cache, not re-queried -- proves memoization
+
+    total3 = _compute_total(conn, rule, "B1", total_cache=None)
+    assert total3 == 5   # no cache passed -> fresh query, reflects the mutation
+
+
+def test_compute_total_cache_is_keyed_by_source_connection_and_query():
+    conn = _conn()
+    cache = {}
+    rule_b1 = _rule()
+    rule_b2 = _rule(batch_id_column="batch_id")   # same query shape, different batch_id below
+
+    assert _compute_total(conn, rule_b1, "B1", total_cache=cache) == 4
+    assert _compute_total(conn, rule_b2, "B2", total_cache=cache) == 1   # only C5 is in B2
+    assert len(cache) == 2   # different batch_id -> different cache key, not collapsed together

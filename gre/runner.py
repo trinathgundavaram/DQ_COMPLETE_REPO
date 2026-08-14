@@ -159,6 +159,14 @@ def run_rule_group(
     errored = 0
     halted = False
 
+    # Shared for the whole run: several rules in a group often ask the
+    # identical "how many rows are in this batch" question (same
+    # table_name/batch_id_column, or a shared scope_sql) -- one dict here,
+    # threaded into every execute_rule() call, lets _compute_total() reuse
+    # that COUNT(*) result instead of re-scanning the same rows once per
+    # rule. See gre/executor.py::_compute_total()'s docstring.
+    total_cache = {}
+
     for rule in pending:
         db_conn = cf.get(rule["source_connection"])
         if db_conn is None:
@@ -172,7 +180,8 @@ def run_rule_group(
                         f"No connection '{rule['source_connection']}'")
             status = "ERROR"
         else:
-            status = execute_rule(rule, db_conn, meta_conn, run_id, batch_id, meta_db)
+            status = execute_rule(rule, db_conn, meta_conn, run_id, batch_id, meta_db,
+                                  total_cache=total_cache)
 
         results[rule["rule_id"]] = status
 
