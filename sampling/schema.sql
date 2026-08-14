@@ -1,0 +1,137 @@
+-- ============================================================
+-- GENERIC STRATIFIED SAMPLING -- 5 tables, a separate concern from rule
+-- evaluation (see rules_engine/schema.sql). Generalizes
+-- core/stratified_sampling.py's proven shape (filter -> bucket -> quota ->
+-- select -> persist), which hardcodes exactly two stratification levels
+-- and one selection method (ranked top-N), to: any number of levels and
+-- three selection methods. See sampling/sampling.py's module docstring for
+-- the algorithm; see sampling/seed/um_sample.sql for the existing dq_*
+-- dq_sampling_config config_id=1 (COMO weekly UM sample) re-expressed in
+-- this shape, proving the redesign reproduces it.
+--
+-- Schema : CMSUNIV_FILELAND_DEV_T  (DEV)  -- same metadata store as dq_*
+-- DB     : Teradata  (metadata store)
+-- ============================================================
+-- Deploy AFTER shared/schema.sql -- gre_audit (written to via
+-- sampling/sampling.py::_write_audit) and gre_errors (written to via
+-- shared/db_ops.py::log_error) are both defined there, not here.
+--
+-- Standalone from ddl.sql and rules_engine/schema.sql on purpose: this
+-- file creates ONLY gre_sampling_*/gre_sample_*-prefixed objects. It
+-- never touches, renames, or alters a single dq_* or rules_engine table,
+-- index, or column.
+-- ============================================================
+
+-- ── 1. gre_sampling_config -- one row per sampling definition ─────────────
+CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_config (
+    config_id            INTEGER NOT NULL,
+    project_name         VARCHAR(100) NOT NULL,
+    process_name         VARCHAR(100) NOT NULL,
+    sample_name          VARCHAR(100) NOT NULL,
+    connection_name      VARCHAR(100) NOT NULL,   -- see db/connection_factory.py
+    universe_table       VARCHAR(200) NOT NULL,
+    key_columns          VARCHAR(500) NOT NULL,   -- entity key column(s), CSV
+    scope_sql            CLOB,                    -- WHERE-fragment; may embed a literal
+                                                    -- {batch_id} token, substituted the same
+                                                    -- way rules_engine's rule_sql is -- see
+                                                    -- shared/db_ops.py::_substitute_batch_id.
+                                                    -- Defaults to '1=1' (whole table) if unset.
+                                                    -- NOTE: unlike gre_rules.scope_sql (a COUNT
+                                                    -- query), this scope_sql is a WHERE-fragment
+                                                    -- -- same field name, different shape,
+                                                    -- because it answers a different question
+                                                    -- here ("which rows are this cycle's
+                                                    -- candidates" vs. "what's the denominator").
+    exclusion_sql        CLOB,                    -- WHERE-fragment; matching rows are EXCLUDED
+    target_volume        INTEGER NOT NULL DEFAULT 150,
+    sampling_method       VARCHAR(20) DEFAULT 'RANKED',  -- 'RANKED'|'RANDOM'|'SYSTEMATIC'
+    priority_rank_sql     CLOB,                    -- required for RANKED/SYSTEMATIC; ORDER BY
+                                                    -- expression, lowest = highest priority
+    rounding_mode          VARCHAR(10) DEFAULT 'FLOOR',  -- 'FLOOR'|'ROUND'|'CEIL'
+    schedule_cron            VARCHAR(50),
+    active_flag                BYTEINT DEFAULT 1,
+    created_at                   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+PRIMARY INDEX (config_id);
+
+
+-- ── 2. gre_sampling_strata -- one row per stratification LEVEL, in order ──
+-- Replaces dq_sampling_config's two hardcoded columns (determination_column,
+-- functional_area_column) with however many levels a project needs. Zero
+-- rows for a config = no stratification -- straight to select() on the
+-- whole candidate pool.
+CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_strata (
+    strata_id            INTEGER NOT NULL,
+    config_id            INTEGER NOT NULL,
+    level_order           INTEGER NOT NULL,        -- recursion order, 0-based
+    level_name             VARCHAR(100),            -- e.g. 'request_disposition'
+    stratify_expr             VARCHAR(1000) NOT NULL   -- column name OR any SQL expression
+                                                    -- (e.g. a CASE statement) -- a bucket
+                                                    -- doesn't have to already exist as a column
+)
+PRIMARY INDEX (strata_id);
+
+CREATE INDEX gre_sampling_strata_config_ix (config_id, level_order)
+ON CMSUNIV_FILELAND_DEV_T.gre_sampling_strata;
+
+
+-- ── 3. gre_sampling_mix -- one row per named bucket value, per level ─────
+-- Replaces dq_sampling_config's JSON mix columns. A bucket_value present in
+-- the data but NOT listed here for that level absorbs the remainder
+-- fraction (1 - sum(named fractions)) -- same rule as the proven dq_*
+-- pattern (core/stratified_sampling.py::_target_for_bucket), just as rows.
+CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_mix (
+    mix_id               INTEGER NOT NULL,
+    strata_id            INTEGER NOT NULL,
+    bucket_value          VARCHAR(200) NOT NULL,
+    target_fraction         FLOAT NOT NULL
+)
+PRIMARY INDEX (mix_id);
+
+CREATE INDEX gre_sampling_mix_strata_ix (strata_id)
+ON CMSUNIV_FILELAND_DEV_T.gre_sampling_mix;
+
+
+-- ── 4. gre_sample_selections -- one row per candidate CONSIDERED ─────────
+-- Every candidate, selected or not (audit defensibility). Never updated
+-- after the run -- a rerun uses a fresh sample_run_id, unlike
+-- rules_engine's gre_exceptions/gre_results which DO get updated on
+-- rerun: a sample is a point-in-time draw, not a re-evaluated verdict.
+CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selections (
+    sample_run_id         VARCHAR(200) NOT NULL,
+    config_id             INTEGER,
+    project_name          VARCHAR(100),
+    process_name          VARCHAR(100),
+    sample_cycle           DATE,
+    case_key                 VARCHAR(500) NOT NULL,   -- entity key, matches key_columns
+    priority_rank              INTEGER,                -- 1 = highest priority; NULL for RANDOM
+                                                        -- (meaningless for that method)
+    excluded_flag                 BYTEINT DEFAULT 0,
+    exclusion_reason                 VARCHAR(500),
+    selected_flag                       BYTEINT DEFAULT 0,
+    created_at                             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+PRIMARY INDEX (sample_run_id);
+
+CREATE INDEX gre_sample_selections_lookup_ix (project_name, process_name, sample_cycle, selected_flag)
+ON CMSUNIV_FILELAND_DEV_T.gre_sample_selections;
+
+
+-- ── 5. gre_sample_selection_attrs -- which bucket, at each level ─────────
+-- One row per (sample_run_id, case_key, strata_id) -- deliberately keyed by
+-- this natural composite rather than a fetched-back gre_sample_selections
+-- surrogate id: Teradata has no RETURNING clause, so getting an
+-- identity value back from the gre_sample_selections insert to use as a
+-- foreign key here would need an extra round-trip query per row. case_key
+-- is already unique within one sample_run_id, so this composite is just as
+-- precise a join key. Replaces a JSON snapshot column with plain rows,
+-- same no-JSON rule as everywhere else in this schema.
+CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selection_attrs (
+    sample_run_id         VARCHAR(200) NOT NULL,
+    case_key              VARCHAR(500) NOT NULL,
+    strata_id             INTEGER NOT NULL,
+    level_order            INTEGER,          -- denormalized for ordered reads without a join
+    bucket_value              VARCHAR(200),
+    created_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+PRIMARY INDEX (sample_run_id, case_key);

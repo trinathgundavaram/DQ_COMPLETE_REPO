@@ -1,0 +1,350 @@
+"""
+shared/db_ops.py
+-----------------
+Low-level DB helpers used by BOTH rules_engine/ and sampling/ -- the one
+place either package goes for cursor/commit mechanics, dialect safety, and
+error logging, instead of each keeping its own copy.
+
+What lives here vs. what doesn't
+---------------------------------
+Everything below is genuinely dialect/table-agnostic or writes to a table
+BOTH packages write to (gre_errors). Anything that only makes sense for
+one side -- rule-level threshold evaluation, the single-scan rule
+optimization, gre_exceptions/gre_results writers -- lives in
+rules_engine/executor.py instead, even though it's built on top of these
+same primitives. See shared/README.md for the full split rationale.
+
+execute_query/execute_dml and the tenacity retry decorator are written
+fresh in this file rather than imported from core/executor.py -- importing
+anything under core/ would violate this project's scope boundary (only
+db/adapters.py and db/connection_factory.py are reusable from the dq_*
+engine this sits alongside). The patterns are intentionally the same; the
+code is not shared.
+"""
+
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+# ── Tunable constants ───────────────────────────────────────────────────────
+MAX_RETRIES = int(os.getenv("GRE_QUERY_MAX_RETRIES", "3"))
+
+# Chunk size for all executemany()-based bulk writes across both packages
+# (rules_engine's gre_exceptions writer, sampling's gre_sample_selections /
+# gre_sample_selection_attrs writers). Mirrors DQ_EXCEPTION_CHUNK's role in
+# core/executor.py.
+EXCEPTION_CHUNK = int(os.getenv("GRE_EXCEPTION_CHUNK", "500"))
+
+# ── Optional tenacity retry (mirrors core/executor.py's _source_retry) ─────
+try:
+    from tenacity import (
+        retry,
+        stop_after_attempt,
+        wait_exponential,
+        retry_if_exception_type,
+    )
+
+    def _source_retry(fn):
+        return retry(
+            stop=stop_after_attempt(MAX_RETRIES),
+            wait=wait_exponential(multiplier=1, min=2, max=15),
+            retry=retry_if_exception_type(Exception),
+            reraise=True,
+        )(fn)
+
+except ImportError:
+    logger.warning("tenacity not installed -- source query retries disabled.")
+
+    def _source_retry(fn):
+        return fn
+
+
+# ---------------------------------------------------------------------------
+# Dialect safety
+# ---------------------------------------------------------------------------
+# gre_rules.sql_dialect is NOT NULL in rules_engine/schema.sql -- every rule
+# declares which SQL flavor rule_sql/scope_sql are written in. Fresh
+# implementation here (not imported from core/rule_sql.py -- see this
+# module's docstring on the scope boundary) but the same shape/behavior as
+# the proven dq_* pattern: 'ansi' is accepted everywhere, an unrecognised
+# source_type is skipped with a warning rather than guessed at, and the
+# check is meant to run BEFORE any query reaches the database, so a
+# mismatch is always a clear, fast, pre-execution error -- never a
+# confusing mid-run syntax error from the wrong SQL dialect hitting the
+# wrong engine.
+
+class DialectMismatchError(Exception):
+    """Raised when a rule's declared sql_dialect cannot run against its target connection."""
+
+
+VALID_DIALECTS = {"teradata", "postgres", "ansi"}
+
+# source_type (SourceAdapter.source_type, see db/adapters.py) -> set of
+# sql_dialect values safe to execute against it. 'ansi' is always accepted
+# by definition. databricks/sqlserver are deliberately NOT listed --
+# db/adapters.py itself notes they're "included and fully functional, but
+# not catalogued/tested for the current use case," so guessing a dialect
+# compatibility for them would be worse than the unrecognised-source_type
+# skip-with-warning path below.
+DIALECT_COMPATIBILITY = {
+    "teradata":   {"teradata", "ansi"},
+    "postgresql": {"postgres", "ansi"},
+    "postgres":   {"postgres", "ansi"},   # alias
+    "aurora":     {"postgres", "ansi"},   # Aurora PG-compatible
+    # FileAdapter/S3Adapter are both DuckDB-backed, which implements a
+    # Postgres-flavoured SQL surface -- 'postgres'-dialect rules run
+    # unmodified against either.
+    "file":       {"postgres", "ansi"},
+    "s3":         {"postgres", "ansi"},
+    "duckdb":     {"postgres", "ansi"},   # alias, in case an adapter reports this directly
+}
+
+
+def check_dialect(rule: dict, source_type: str) -> None:
+    """
+    Raise DialectMismatchError if rule['sql_dialect'] cannot run against a
+    connection reporting `source_type`. No-op for a rule with no
+    sql_dialect set (defensive only -- gre_rules.sql_dialect is NOT NULL)
+    or an unrecognised source_type (logged, not raised -- let the query
+    itself surface any real incompatibility rather than guessing).
+    """
+    dialect = (rule.get("sql_dialect") or "").strip().lower()
+    if not dialect:
+        return
+
+    if dialect not in VALID_DIALECTS:
+        raise DialectMismatchError(
+            f"rule_id={rule.get('rule_id')}: invalid sql_dialect '{dialect}'. "
+            f"Must be one of: {', '.join(sorted(VALID_DIALECTS))}."
+        )
+
+    st = (source_type or "").strip().lower()
+    allowed = DIALECT_COMPATIBILITY.get(st)
+    if allowed is None:
+        logger.warning(
+            "Dialect check skipped for rule_id=%s -- unrecognised source_type '%s'.",
+            rule.get("rule_id"), source_type,
+        )
+        return
+
+    if dialect not in allowed:
+        raise DialectMismatchError(
+            f"rule_id={rule.get('rule_id')} is written for sql_dialect='{dialect}', cannot run "
+            f"against a '{st}' connection. Allowed dialects for '{st}': {', '.join(sorted(allowed))}."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Low-level DB helpers
+# ---------------------------------------------------------------------------
+
+def execute_query(conn, query: str, params=None) -> list:
+    """Run a SELECT and return rows as list-of-dicts (column names lowercased)."""
+    cursor = conn.cursor()
+    if params is not None:
+        cursor.execute(query, params)
+    else:
+        cursor.execute(query)
+    if cursor.description is None:
+        cursor.close()
+        return []
+    columns = [c[0].lower() for c in cursor.description]
+    rows = [dict(zip(columns, r)) for r in cursor.fetchall()]
+    cursor.close()
+    return rows
+
+
+def execute_dml(conn, query: str, params=None):
+    """Execute one DML statement and commit immediately -- every call is its own transaction."""
+    cursor = conn.cursor()
+    if params is not None:
+        cursor.execute(query, params)
+    else:
+        cursor.execute(query)
+    conn.commit()
+    cursor.close()
+
+
+_DUPLICATE_KEY_MARKERS = (
+    "unique", "duplicate", "already exists", "constraint",
+)
+
+
+def _is_duplicate_key_error(exc: Exception) -> bool:
+    """
+    Best-effort, driver-agnostic detection of a unique-constraint violation.
+
+    Different drivers (teradatasql, psycopg2, duckdb) raise different
+    exception classes for this, so this checks the message text rather than
+    a fixed set of classes -- crude, but it's the same "catch the
+    duplicate-key error" mechanism dq_metrics_summary_uix relies on,
+    generalised across dialects instead of hardcoded to one.
+    """
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _DUPLICATE_KEY_MARKERS)
+
+
+def _insert_or_skip(conn, sql: str, params: list) -> bool:
+    """
+    INSERT one row; commit on success. On a duplicate-key error, roll back
+    and treat it as "already committed by an earlier attempt" -- skip,
+    don't overwrite. Any other error is re-raised.
+
+    This -- not delete-then-insert -- is the idempotency mechanism, modeled
+    on dq_metrics_summary_uix: a crash mid-write never leaves a half-deleted
+    row, because nothing is ever deleted here.
+    """
+    cursor = conn.cursor()
+    try:
+        cursor.execute(sql, params)
+        conn.commit()
+        return True
+    except Exception as exc:
+        try:
+            conn.commit()   # release the aborted statement so the connection stays usable
+        except Exception:
+            pass
+        if _is_duplicate_key_error(exc):
+            logger.debug("Duplicate key on insert -- already recorded, skipping. (%s)", exc)
+            return False
+        raise
+    finally:
+        cursor.close()
+
+
+def bulk_insert(conn, sql: str, rows: list, chunk_size: int = None) -> None:
+    """
+    Plain chunked executemany() -- no duplicate-key handling. Use only for
+    append-only writes where a unique-index collision is not expected (e.g.
+    sampling/sampling.py's gre_sample_selections / gre_sample_selection_attrs,
+    which have no unique index and always write under a fresh
+    sample_run_id). One commit per chunk instead of one per row, cutting
+    round trips by ~chunk_size on a large candidate/exception set.
+
+    `rows` is a list of positional param sequences (list/tuple), matching
+    DB-API cursor.executemany()'s convention -- the same shape
+    core/executor.py::bulk_insert expects.
+    """
+    if not rows:
+        return
+    size = chunk_size or EXCEPTION_CHUNK
+    cursor = conn.cursor()
+    try:
+        for i in range(0, len(rows), size):
+            cursor.executemany(sql, rows[i:i + size])
+            conn.commit()
+    finally:
+        cursor.close()
+
+
+def bulk_insert_or_skip(conn, sql: str, rows: list, chunk_size: int = None) -> int:
+    """
+    Chunked executemany() with duplicate-key tolerance -- the bulk analog of
+    _insert_or_skip(), used by rules_engine/executor.py for gre_exceptions
+    where gre_exceptions_uix (rule_id, batch_id, natural_key_value) is what
+    makes a rerun idempotent.
+
+    Tries each chunk as one executemany() batch first (cheap: one round
+    trip for up to `chunk_size` rows). If a chunk raises -- in practice
+    almost always because one row in it collides with a natural key
+    committed by an EARLIER attempt on this batch_id -- it falls back to
+    row-by-row _insert_or_skip() for JUST that chunk, so one stale
+    duplicate never costs the other rows in the same batch. Any non
+    duplicate-key error still propagates (same contract as
+    _insert_or_skip()).
+
+    Returns the number of rows actually inserted this call (excludes
+    skipped duplicates). Note: on a chunk that contains BOTH a new row and
+    a duplicate, some drivers (e.g. DuckDB) apply rows before the one that
+    fails rather than rolling the whole executemany() back, so that new row
+    is already committed by the time the row-by-row fallback re-attempts
+    it -- the fallback then sees it as "already there" and doesn't count
+    it. Data-wise this is harmless (the row exists exactly once, which is
+    all a unique index promises); the only effect is this return value can
+    slightly undercount in that specific mixed-chunk case. Accepted
+    trade-off for avoiding a much more expensive per-row existence check on
+    every chunk.
+    """
+    if not rows:
+        return 0
+    size = chunk_size or EXCEPTION_CHUNK
+    inserted = 0
+    for i in range(0, len(rows), size):
+        chunk = rows[i:i + size]
+        cursor = conn.cursor()
+        try:
+            cursor.executemany(sql, chunk)
+            conn.commit()
+            inserted += len(chunk)
+        except Exception as exc:
+            try:
+                conn.commit()   # release the aborted statement, mirrors _insert_or_skip
+            except Exception:
+                pass
+            if not _is_duplicate_key_error(exc):
+                raise
+            logger.debug(
+                "Duplicate key within a %d-row bulk chunk -- retrying that chunk row-by-row.",
+                len(chunk),
+            )
+            for params in chunk:
+                if _insert_or_skip(conn, sql, list(params)):
+                    inserted += 1
+        finally:
+            cursor.close()
+    return inserted
+
+
+# ---------------------------------------------------------------------------
+# Batch-id token substitution (v1 batch-scoping mechanism -- see
+# rules_engine/schema.sql / sampling/schema.sql headers for why there's no
+# filter_column system)
+# ---------------------------------------------------------------------------
+
+def _substitute_batch_id(sql: str, batch_id: str) -> str:
+    """
+    Replace every literal "{batch_id}" token in `sql` with the escaped
+    batch_id value. Rule/config authors are responsible for their own
+    quoting (e.g. `WHERE batch_id = '{batch_id}'`) -- this only does the
+    swap.
+    """
+    return sql.replace("{batch_id}", (batch_id or "").replace("'", "''"))
+
+
+# ---------------------------------------------------------------------------
+# Retry-wrapped source query
+# ---------------------------------------------------------------------------
+
+@_source_retry
+def _run_source_query(db_conn, sql: str) -> list:
+    return execute_query(db_conn, sql)
+
+
+# ---------------------------------------------------------------------------
+# gre_errors -- shared error log
+# ---------------------------------------------------------------------------
+
+def log_error(meta_conn, meta_db: str, run_id, rule_id, rule_group, batch_id,
+              error_type: str, message: str, detail: str = None) -> None:
+    """
+    Insert one gre_errors row from explicit scalar fields. Never raises --
+    an errors-table failure must not mask the real error.
+
+    This is the ONE shared gre_errors write path for the whole engine:
+    rule execution (via rules_engine/executor.py's rule-dict convenience
+    wrapper _log_error()) and sampling/sampling.py's sampling runs (which
+    have no rule_id/rule dict to key off of -- see
+    sampling.py::_log_sampling_error()) both go through this function
+    instead of each keeping its own INSERT+try/except copy. gre_errors
+    itself lives in shared/schema.sql for the same reason.
+    """
+    sql = f"""
+        INSERT INTO {meta_db}.gre_errors (
+            run_id, rule_id, rule_group, batch_id, error_type, error_message, error_detail
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    """
+    try:
+        execute_dml(meta_conn, sql, [run_id, rule_id, rule_group, batch_id, error_type, message, detail])
+    except Exception as exc:
+        logger.error("Failed to write gre_errors row (run_id=%s rule_id=%s): %s", run_id, rule_id, exc)
