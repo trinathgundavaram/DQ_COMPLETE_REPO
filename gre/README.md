@@ -10,12 +10,14 @@ or renames any `dq_*` object or any file under `core/`, `utils/`, or
 
 | File | Responsibility |
 |---|---|
-| `schema.sql` | DDL for the 7 `gre_*` tables + the two idempotency unique indexes |
+| `schema.sql` | DDL for the 12 `gre_*` tables + idempotency unique indexes |
 | `config.py` | Metadata connection/schema resolution; batch-readiness extension point |
 | `rules.py` | Loads active rules for a `rule_group` from `gre_rules` |
 | `executor.py` | Runs one rule, writes findings, evaluates threshold, upserts `gre_results` |
 | `runner.py` | Orchestrates a rule_group run: readiness gate, checkpoint/resume, sequencing |
 | `reporting.py` | `get_breaches()` / `get_records_for_result()` — a report is just a query |
+| `sampling.py` | Config-driven stratified sampling — a separate concern, N-level generalization of `core/stratified_sampling.py` |
+| `seed/um_sample.sql` | The real `dq_sampling_config.config_id=1` UM sample re-expressed as `gre_sampling_config`/`_strata`/`_mix` rows |
 
 ## Setup
 
@@ -72,14 +74,69 @@ cf.load()
 summary = run_rule_group(rule_group="claims_dq", batch_id="2026-08-13", cf=cf)
 ```
 
+## Sampling
+
+Stratified sampling is a fully separate concern from rule evaluation — it
+can run with zero `gre_rules` rows defined. Three separable questions map
+to three separable config pieces:
+
+- **What gets filtered out** — `gre_sampling_config.exclusion_sql`, a plain
+  WHERE-fragment.
+- **What gets sampled** — `gre_sampling_strata` (one row per stratification
+  level, in `level_order`) + `gre_sampling_mix` (one row per named bucket
+  value within a level; any bucket value present in the data but not
+  listed absorbs the remainder fraction). Zero `gre_sampling_strata` rows
+  for a config means no stratification — straight to selection on the
+  whole candidate pool. This is what makes the level count configurable:
+  `gre/sampling.py::_stratify()` recurses one level at a time and doesn't
+  know or care how many levels deep it is, so a third (or tenth) level is
+  one more `gre_sampling_strata` row, never a code change.
+- **How it gets sampled** — `gre_sampling_config.sampling_method`:
+  `RANKED` (top-N by `priority_rank_sql`, deterministic), `RANDOM`
+  (uniform draw), or `SYSTEMATIC` (fixed interval with a random start
+  offset). `priority_rank_sql` is required for `RANKED`/`SYSTEMATIC`,
+  ignored for `RANDOM`.
+
+```python
+from db.connection_factory import ConnectionFactory
+from gre.sampling import run_sampling
+
+cf = ConnectionFactory()
+cf.load()
+result = run_sampling(config_id=1, batch_id="2026-08-14", cf=cf)
+```
+
+**Reproducibility for `RANDOM`/`SYSTEMATIC`**: one seed is generated (or
+passed explicitly) per `sample_run_id` and persisted on the `gre_audit`
+row (`random_seed`). Buckets are always processed in a fixed, deterministic
+order (sorted bucket values) through a single seeded `Random()` instance,
+so re-running `_stratify()` with the same seed reproduces every bucket's
+draw exactly — `SYSTEMATIC`'s interval is arithmetic on the data itself
+(`floor(bucket_size / n)`), not random, so it doesn't need separate
+persistence. This was a deliberate choice over persisting interval/offset
+per bucket in a companion table: simpler schema, at the cost of needing a
+replay (not a single-row lookup) to answer "what were bucket B's exact
+draw parameters."
+
+Every candidate considered — selected or not — is persisted to
+`gre_sample_selections`, with one `gre_sample_selection_attrs` row per
+candidate per stratification level, keyed by `(sample_run_id, case_key)`
+rather than a fetched-back surrogate id (Teradata has no `RETURNING`
+clause, and `case_key` is already unique within one `sample_run_id`).
+Never updated after the run — a rerun uses a fresh `sample_run_id`, unlike
+`gre_exceptions`/`gre_results`.
+
 ## Tests
 
 ```
-pytest tests/test_gre_executor.py tests/test_gre_runner.py -v
+pytest tests/test_gre_executor.py tests/test_gre_runner.py tests/test_gre_sampling.py -v
 ```
 
 DuckDB stands in for every connection (same convention as
-`tests/test_core.py`) — no live DB needed.
+`tests/test_core.py`) — no live DB needed. `test_gre_sampling.py` includes
+a direct regression check: the same fixture universe run through both
+`core/stratified_sampling.py` and `gre/sampling.py` with equivalent config,
+asserting matching per-bucket selected counts.
 
 ## Deliberately deferred / documented assumptions
 
@@ -104,3 +161,18 @@ DuckDB stands in for every connection (same convention as
   `db/adapters.py`'s calls if/when this runs on Glue.
 - **`gre_case`** is pure reference data (rules join out to it to correlate
   findings across tables); the engine itself never reads or writes it.
+- **`gre_audit` was extended, not left alone**, to add the sampling
+  module: `rule_group`/`batch_id` are now nullable, and a `run_type`
+  discriminator (`'RULE_GROUP'`/`'SAMPLING'`) plus nullable
+  sampling-specific columns were added, per the prompt's explicit "reuse
+  gre_audit rather than inventing a parallel run-log table." Nothing has
+  been deployed against this schema yet, so this is a straight edit of the
+  v3 DDL, not a live migration — if `schema.sql` has already been run
+  against a real schema by the time you read this, you'll need an `ALTER
+  TABLE` instead.
+- **`gre_sampling_config.scope_sql` is a WHERE-fragment**, not a COUNT
+  query — same field name as `gre_rules.scope_sql`, different shape,
+  because it answers a different question here ("which rows are this
+  cycle's candidates" vs. "what's the denominator for a threshold %").
+  Flagging this explicitly since the name reuse could otherwise read as
+  the same mechanism.
