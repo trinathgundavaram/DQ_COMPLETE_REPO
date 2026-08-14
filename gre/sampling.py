@@ -56,7 +56,10 @@ import random
 import time
 from datetime import datetime
 
-from gre.executor import execute_query, execute_dml, _run_source_query, _substitute_batch_id
+from gre.executor import (
+    execute_query, execute_dml, bulk_insert, log_error,
+    _run_source_query, _substitute_batch_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -301,6 +304,14 @@ def _case_key(row: dict, key_cols: list) -> str:
 def _persist_selections(meta_conn, meta_db: str, sample_run_id: str, config: dict,
                         levels: list, key_cols: list, candidates: list, selected_keys: set,
                         sample_cycle) -> None:
+    """
+    Persist every candidate considered (selected or not), plus one attrs
+    row per candidate per stratification level, via bulk_insert() --
+    batched executemany() instead of one INSERT+commit per row per table.
+    Both tables are append-only with no unique index (a rerun always uses
+    a fresh sample_run_id), so no duplicate-key fallback is needed here,
+    unlike executor.py::_write_exceptions()'s bulk_insert_or_skip().
+    """
     sel_sql = f"""
         INSERT INTO {meta_db}.gre_sample_selections (
             sample_run_id, config_id, project_name, process_name, sample_cycle,
@@ -312,19 +323,23 @@ def _persist_selections(meta_conn, meta_db: str, sample_run_id: str, config: dic
             sample_run_id, case_key, strata_id, level_order, bucket_value
         ) VALUES (?, ?, ?, ?, ?)
     """
+
+    sel_params = []
+    attr_params = []
     for row in candidates:
         key = _case_key(row, key_cols)
         is_selected = key in selected_keys
-        execute_dml(meta_conn, sel_sql, [
+        sel_params.append([
             sample_run_id, config.get("config_id"), config.get("project_name"),
             config.get("process_name"), sample_cycle, key, row.get("_priority_rank"),
             1 if is_selected else 0,
         ])
         for lvl in levels:
             bval = row.get(_bucket_key(lvl["strata_id"]))
-            execute_dml(meta_conn, attr_sql, [
-                sample_run_id, key, lvl["strata_id"], lvl["level_order"], str(bval),
-            ])
+            attr_params.append([sample_run_id, key, lvl["strata_id"], lvl["level_order"], str(bval)])
+
+    bulk_insert(meta_conn, sel_sql, sel_params)
+    bulk_insert(meta_conn, attr_sql, attr_params)
 
 
 def _write_audit(meta_conn, meta_db: str, sample_run_id: str, config: dict, method: str,
@@ -345,14 +360,14 @@ def _write_audit(meta_conn, meta_db: str, sample_run_id: str, config: dict, meth
 
 def _log_sampling_error(meta_conn, meta_db: str, sample_run_id: str, config: dict,
                         error_type: str, message: str) -> None:
-    try:
-        execute_dml(meta_conn, f"""
-            INSERT INTO {meta_db}.gre_errors (
-                run_id, rule_id, rule_group, batch_id, error_type, error_message, error_detail
-            ) VALUES (?, NULL, ?, NULL, ?, ?, NULL)
-        """, [sample_run_id, config.get("process_name"), error_type, message])
-    except Exception as exc:
-        logger.error("Failed to write gre_errors row for sampling run %s: %s", sample_run_id, exc)
+    """
+    Thin wrapper over executor.py's shared log_error(): a sampling run has
+    no rule_id/rule_group, so process_name is carried in the rule_group
+    column for triage (same as the prior standalone implementation), just
+    without a second copy of the INSERT+try/except body.
+    """
+    log_error(meta_conn, meta_db, sample_run_id, None, config.get("process_name"), None,
+              error_type, message)
 
 
 # ---------------------------------------------------------------------------

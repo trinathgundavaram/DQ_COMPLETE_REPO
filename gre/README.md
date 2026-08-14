@@ -13,10 +13,10 @@ or renames any `dq_*` object or any file under `core/`, `utils/`, or
 | `schema.sql` | DDL for the 12 `gre_*` tables + idempotency unique indexes |
 | `config.py` | Metadata connection/schema resolution; batch-readiness extension point |
 | `rules.py` | Loads active rules for a `rule_group` from `gre_rules` |
-| `executor.py` | Runs one rule, writes findings, evaluates threshold, upserts `gre_results` |
+| `executor.py` | Runs one rule, writes findings (batched), evaluates threshold, upserts `gre_results`. Also the ONE place in `gre/` with `execute_query`/`execute_dml`/`bulk_insert`/`bulk_insert_or_skip`/`log_error` — `rules.py`, `runner.py`, `reporting.py`, and `sampling.py` all import these rather than re-implementing them |
 | `runner.py` | Orchestrates a rule_group run: readiness gate, checkpoint/resume, sequencing |
 | `reporting.py` | `get_breaches()` / `get_records_for_result()` — a report is just a query |
-| `sampling.py` | Config-driven stratified sampling — a separate concern, N-level generalization of `core/stratified_sampling.py` |
+| `sampling.py` | Config-driven stratified sampling — a separate concern, N-level generalization of `core/stratified_sampling.py`; reuses `executor.py`'s `bulk_insert`/`log_error`/`_run_source_query`/`_substitute_batch_id` |
 | `seed/um_sample.sql` | The real `dq_sampling_config.config_id=1` UM sample re-expressed as `gre_sampling_config`/`_strata`/`_mix` rows |
 
 ## Setup
@@ -30,6 +30,9 @@ or renames any `dq_*` object or any file under `core/`, `utils/`, or
    plumbing is needed.
 3. `GRE_META_CONNECTION` (default `"teradata"`) picks which of those
    connections holds the `gre_*` tables.
+4. Optional tuning for large rule/candidate volumes (see "Running big
+   datasets" below): `GRE_EXCEPTION_CHUNK` (default `500`) and
+   `GRE_MAX_EXCEPTIONS` (default `10000`).
 
 ## Authoring a rule
 
@@ -62,6 +65,47 @@ Insert one row into `gre_rules`. Key fields:
 Zero engine code changes are needed to onboard a new rule or a whole new
 use case — see `tests/test_gre_executor.py` / `test_gre_runner.py` for
 worked examples.
+
+## Running big datasets
+
+Two things in `gre/executor.py` are specifically shaped for a rule that
+matches a very large number of rows, mirroring `core/executor.py`'s
+proven fix #1 pattern rather than inventing a new one:
+
+- **`failed_records` is a TRUE source-side count**, from a
+  `SELECT COUNT(*) FROM (rule_sql) AS sub` query (`_count_failed`), run
+  BEFORE any row-level detail capture. This means the PASS/FAIL/WARN
+  verdict and `gre_results.failed_records` are exact no matter how many
+  rows `rule_sql` actually returns.
+- **`gre_exceptions` detail-row capture is capped and streamed**, not one
+  unbounded `fetchall()`. `_fetch_violating_rows` pulls rows in
+  `GRE_EXCEPTION_CHUNK`-sized batches via `fetchmany()` and stops once
+  `GRE_MAX_EXCEPTIONS` rows have been collected (`0`/negative = unlimited).
+  A rule matching 10 million rows still gets an exact `failed_records`, and
+  `gre_exceptions` gets a bounded, configurable number of detail rows
+  instead of trying to hold everything in memory. As with the dq_* engine,
+  **a capped rule still reports SUCCESS/PASS-FAIL-WARN correctly** — only
+  the *detail* rows are truncated, and a later rerun of the same
+  `batch_id` will NOT retroactively backfill the rows that got dropped by
+  the cap (there's nothing to trigger that rerun automatically).
+- **Writes are batched, not one row at a time.** `_write_exceptions` first
+  de-duplicates violating rows by natural key within the current pull (so
+  a rule that legitimately returns the same natural key twice in one
+  result set — e.g. a join fan-out — doesn't cost a wasted duplicate-key
+  round trip per repeat), then writes via `bulk_insert_or_skip`: one
+  `executemany()` per `GRE_EXCEPTION_CHUNK`-sized chunk instead of one
+  `INSERT` + commit per row, falling back to row-by-row only for a chunk
+  that actually collides with a natural key committed by an earlier
+  attempt on this `batch_id` (i.e. a genuine rerun). `gre_log.rowcount`
+  reflects rows actually written *this* attempt, not the cumulative total
+  on file. The plain (no duplicate-handling) counterpart, `bulk_insert`,
+  is reused by `gre/sampling.py` for `gre_sample_selections` /
+  `gre_sample_selection_attrs`, which are append-only with no unique index
+  and so need no duplicate-key fallback.
+
+Both env vars default to and mean the same thing as their `dq_*` engine
+counterparts (`DQ_EXCEPTION_CHUNK` / `DQ_MAX_EXCEPTIONS`), just
+independently configurable per engine.
 
 ## Running it
 

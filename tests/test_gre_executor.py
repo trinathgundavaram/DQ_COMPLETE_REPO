@@ -11,9 +11,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import duckdb
 import pytest
 
+import gre.executor as gre_executor
 from gre.executor import (
     evaluate_threshold, build_natural_key, _substitute_batch_id,
-    execute_rule, execute_query,
+    execute_rule, execute_query, bulk_insert, bulk_insert_or_skip,
 )
 
 META_DB = "main"
@@ -266,3 +267,93 @@ def test_execute_rule_sql_error_routes_to_errors_and_logs():
 
     logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1")
     assert len(logs) == 1 and logs[0]["status"] == "ERROR"
+
+
+# ── big-dataset path: bulk writes, dedup, and the true-count/capped-fetch split ──
+
+def test_bulk_insert_batches_across_multiple_chunks():
+    conn = _conn()
+    rows = [["RUN", i, "t", "e", "s", f"issue {i}", "B1", f"claim_id=C{i}"] for i in range(7)]
+    sql = """
+        INSERT INTO gre_exceptions (
+            run_id, rule_id, table_name, element_name, source_name,
+            issue_desc, batch_id, natural_key_value
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    bulk_insert(conn, sql, rows, chunk_size=2)   # 7 rows, chunk_size=2 -> 4 chunks
+    written = execute_query(conn, "SELECT COUNT(*) AS cnt FROM gre_exceptions")[0]["cnt"]
+    assert written == 7
+
+
+def test_bulk_insert_or_skip_chunk_falls_back_on_duplicate():
+    conn = _conn()
+    sql = """
+        INSERT INTO gre_exceptions (
+            run_id, rule_id, table_name, element_name, source_name,
+            issue_desc, batch_id, natural_key_value
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    first = [["RUN1", 1, "t", "e", "s", "d", "B1", "claim_id=C1"],
+             ["RUN1", 1, "t", "e", "s", "d", "B1", "claim_id=C2"]]
+    inserted1 = bulk_insert_or_skip(conn, sql, first, chunk_size=10)
+    assert inserted1 == 2
+
+    # One brand-new key plus one duplicate of an already-committed key, in
+    # the SAME chunk -- the whole-chunk executemany collides, exercising
+    # the row-by-row fallback path rather than the happy-path executemany.
+    # (DuckDB applies C3 before hitting the C1 collision, so the fallback's
+    # own count of "newly inserted" can undercount here -- see
+    # bulk_insert_or_skip()'s docstring; what must hold is the DATA: no
+    # duplicate row, no dropped row, and no exception escaping.)
+    second = [["RUN2", 1, "t", "e", "s", "d", "B1", "claim_id=C3"],
+              ["RUN2", 1, "t", "e", "s", "d", "B1", "claim_id=C1"]]
+    bulk_insert_or_skip(conn, sql, second, chunk_size=10)
+
+    total = execute_query(conn, "SELECT COUNT(*) AS cnt FROM gre_exceptions")[0]["cnt"]
+    assert total == 3   # C1, C2, C3 -- no duplicate row, no lost row
+    keys = {r["natural_key_value"] for r in execute_query(conn, "SELECT natural_key_value FROM gre_exceptions")}
+    assert keys == {"claim_id=C1", "claim_id=C2", "claim_id=C3"}
+
+
+def test_write_exceptions_dedupes_natural_key_within_one_pull():
+    conn = _conn()
+    # A rule_sql that returns the SAME claim_id twice in one pull (e.g. a
+    # join fan-out) should still only write ONE gre_exceptions row per
+    # natural key. The true failed_records count (a COUNT(*) on rule_sql
+    # itself) legitimately counts every row rule_sql returns, duplicates
+    # included -- it's the exception-DETAIL rows that get deduplicated.
+    rule = _rule(
+        rule_sql="SELECT claim_id, denial_reason FROM claims "
+                 "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' "
+                 "UNION ALL "
+                 "SELECT claim_id, denial_reason FROM claims "
+                 "WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
+    )
+    status = execute_rule(rule, conn, conn, "RUN1", "B1", META_DB)
+    assert status == "SUCCESS"
+
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
+    assert len(exceptions) == 2   # C1, C3 -- deduped, not 4, even though the pull returned each twice
+    assert {r["natural_key_value"] for r in exceptions} == {"claim_id=C1", "claim_id=C3"}
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND batch_id = 'B1'")
+    assert len(results) == 1
+    assert results[0]["failed_records"] == 4   # true COUNT(*) on rule_sql counts every returned row
+
+
+def test_max_exceptions_cap_keeps_failed_records_true_but_caps_detail_rows(monkeypatch):
+    conn = _conn()
+    monkeypatch.setattr(gre_executor, "MAX_EXCEPTIONS", 1)
+    rule = _rule(threshold_pct=0)   # any failure breaches -> a gre_results row is written
+
+    status = execute_rule(rule, conn, conn, "RUN1", "B1", META_DB)
+    assert status == "SUCCESS"
+
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
+    assert len(exceptions) == 1   # capped at MAX_EXCEPTIONS=1
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND batch_id = 'B1'")
+    assert results[0]["failed_records"] == 2   # true count stays exact -- 2 of 4 actually failed
+
+    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND batch_id = 'B1'")
+    assert logs[0]["rowcount"] == 1   # "rows written to gre_exceptions this attempt" == the capped count

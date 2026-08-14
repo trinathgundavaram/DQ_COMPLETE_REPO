@@ -14,7 +14,31 @@ decorator are written fresh in this file rather than imported from
 core/executor.py -- importing anything under core/ would violate this
 project's scope boundary (only db/adapters.py and db/connection_factory.py
 are reusable). The patterns are intentionally the same; the code is not
-shared.
+shared. Everything else in gre/ (rules.py, runner.py, reporting.py,
+sampling.py) DOES import from this module rather than re-implementing any
+of it -- this is the one low-level DB-helper module for the whole engine.
+
+Big-dataset path (bulk writes + true-count/capped-fetch split)
+----------------------------------------------------------------
+Two things do NOT scale to a rule matching millions of rows in the
+original v1 shape, and both are fixed here the same way
+core/executor.py's proven fix #1 fixes them for the dq_* engine:
+
+  1. Writing violating rows one INSERT-plus-commit at a time
+     (_insert_or_skip per row) means one network round trip per row.
+     bulk_insert() / bulk_insert_or_skip() below batch this into
+     GRE_EXCEPTION_CHUNK-sized executemany() calls -- see _write_exceptions().
+  2. Fetching every violating row with one unbounded fetchall(), then
+     deriving failed_records from a COUNT(*) against the *destination*
+     table after the write, ties the accuracy of failed_records to
+     whatever exception-detail capture happens to write. _count_failed()
+     runs a true source-side COUNT(*) subquery independent of any cap, and
+     _fetch_violating_rows() streams rows via fetchmany() capped at
+     GRE_MAX_EXCEPTIONS -- so a rule that matches 10 million rows still
+     gets an exact failed_records/threshold verdict, with gre_exceptions
+     detail capture bounded to a safe, configurable ceiling instead of
+     trying to hold every row in memory. See execute_rule()'s docstring
+     for how the two counts are kept independent.
 """
 
 import logging
@@ -26,6 +50,17 @@ logger = logging.getLogger(__name__)
 
 # ── Tunable constants ───────────────────────────────────────────────────────
 MAX_RETRIES = int(os.getenv("GRE_QUERY_MAX_RETRIES", "3"))
+
+# Chunk size for all executemany()-based bulk writes in this module (both
+# gre_exceptions and, via gre/sampling.py's reuse of bulk_insert(), the
+# sampling tables). Mirrors DQ_EXCEPTION_CHUNK's role in core/executor.py.
+EXCEPTION_CHUNK = int(os.getenv("GRE_EXCEPTION_CHUNK", "500"))
+
+# Cap on how many violating rows get a gre_exceptions detail row per rule
+# execution attempt. 0 or negative = unlimited. failed_records itself is
+# ALWAYS the true source-side count (_count_failed), never capped -- only
+# the row-level detail capture is bounded. Mirrors DQ_MAX_EXCEPTIONS.
+MAX_EXCEPTIONS = int(os.getenv("GRE_MAX_EXCEPTIONS", "10000"))
 
 # Severity values (case-insensitive) that resolve a breach to WARN rather
 # than FAIL -- same convention as core/executor.py's _SOFT_SEVERITIES, so a
@@ -134,6 +169,88 @@ def _insert_or_skip(conn, sql: str, params: list) -> bool:
         cursor.close()
 
 
+def bulk_insert(conn, sql: str, rows: list, chunk_size: int = None) -> None:
+    """
+    Plain chunked executemany() -- no duplicate-key handling. Use only for
+    append-only writes where a unique-index collision is not expected (e.g.
+    gre/sampling.py's gre_sample_selections / gre_sample_selection_attrs,
+    which have no unique index and always write under a fresh
+    sample_run_id). One commit per chunk instead of one per row, cutting
+    round trips by ~chunk_size on a large candidate/exception set.
+
+    `rows` is a list of positional param sequences (list/tuple), matching
+    DB-API cursor.executemany()'s convention -- the same shape
+    core/executor.py::bulk_insert expects.
+    """
+    if not rows:
+        return
+    size = chunk_size or EXCEPTION_CHUNK
+    cursor = conn.cursor()
+    try:
+        for i in range(0, len(rows), size):
+            cursor.executemany(sql, rows[i:i + size])
+            conn.commit()
+    finally:
+        cursor.close()
+
+
+def bulk_insert_or_skip(conn, sql: str, rows: list, chunk_size: int = None) -> int:
+    """
+    Chunked executemany() with duplicate-key tolerance -- the bulk analog of
+    _insert_or_skip(), used for gre_exceptions where gre_exceptions_uix
+    (rule_id, batch_id, natural_key_value) is what makes a rerun idempotent.
+
+    Tries each chunk as one executemany() batch first (cheap: one round
+    trip for up to `chunk_size` rows). If a chunk raises -- in practice
+    almost always because one row in it collides with a natural key
+    committed by an EARLIER attempt on this batch_id -- it falls back to
+    row-by-row _insert_or_skip() for JUST that chunk, so one stale
+    duplicate never costs the other rows in the same batch. Any non
+    duplicate-key error still propagates (same contract as
+    _insert_or_skip()).
+
+    Returns the number of rows actually inserted this call (excludes
+    skipped duplicates) -- used as gre_log.rowcount. Note: on a chunk that
+    contains BOTH a new row and a duplicate, some drivers (e.g. DuckDB)
+    apply rows before the one that fails rather than rolling the whole
+    executemany() back, so that new row is already committed by the time
+    the row-by-row fallback re-attempts it -- the fallback then sees it as
+    "already there" and doesn't count it. Data-wise this is harmless (the
+    row exists exactly once, which is all gre_exceptions_uix promises);
+    the only effect is this return value can slightly undercount in that
+    specific mixed-chunk case. Accepted trade-off for avoiding a much more
+    expensive per-row existence check on every chunk.
+    """
+    if not rows:
+        return 0
+    size = chunk_size or EXCEPTION_CHUNK
+    inserted = 0
+    for i in range(0, len(rows), size):
+        chunk = rows[i:i + size]
+        cursor = conn.cursor()
+        try:
+            cursor.executemany(sql, chunk)
+            conn.commit()
+            inserted += len(chunk)
+        except Exception as exc:
+            try:
+                conn.commit()   # release the aborted statement, mirrors _insert_or_skip
+            except Exception:
+                pass
+            if not _is_duplicate_key_error(exc):
+                raise
+            logger.debug(
+                "Duplicate key within a %d-row bulk chunk -- retrying that chunk row-by-row.",
+                len(chunk),
+            )
+            for params in chunk:
+                if _insert_or_skip(conn, sql, list(params)):
+                    inserted += 1
+        finally:
+            cursor.close()
+    return inserted
+
+
 # ---------------------------------------------------------------------------
 # Batch-id token substitution (v1 batch-scoping mechanism -- see
 # gre/schema.sql header for why there's no filter_column system)
@@ -155,6 +272,57 @@ def _substitute_batch_id(sql: str, batch_id: str) -> str:
 @_source_retry
 def _run_source_query(db_conn, sql: str) -> list:
     return execute_query(db_conn, sql)
+
+
+@_source_retry
+def _count_failed(db_conn, rule_query: str) -> int:
+    """
+    TRUE count of violating rows via COUNT(*) on the rule_sql subquery --
+    the authoritative failed_records value, independent of anything
+    MAX_EXCEPTIONS caps in _fetch_violating_rows(). Mirrors
+    core/executor.py's fix #1 (_count_failed).
+    """
+    sql = f"SELECT COUNT(*) AS cnt FROM ({rule_query}) gre_failed_sub"
+    rows = execute_query(db_conn, sql)
+    return int(rows[0]["cnt"]) if rows else 0
+
+
+@_source_retry
+def _fetch_violating_rows(db_conn, query: str) -> list:
+    """
+    Fetch violating rows for gre_exceptions capture, capped at
+    MAX_EXCEPTIONS (0/negative = unlimited), streamed via a fetchmany()
+    loop instead of one unbounded fetchall() -- keeps memory bounded when
+    rule_sql matches millions of rows. This count may be LESS than the
+    true failed count when the cap is hit; _count_failed() is always the
+    authoritative one used for failed_records/threshold math.
+    """
+    cursor = db_conn.cursor()
+    cursor.execute(query)
+    if cursor.description is None:
+        cursor.close()
+        return []
+    columns = [c[0].lower() for c in cursor.description]
+    cap = MAX_EXCEPTIONS if MAX_EXCEPTIONS > 0 else float("inf")
+
+    rows = []
+    while True:
+        batch = cursor.fetchmany(EXCEPTION_CHUNK)
+        if not batch:
+            break
+        for r in batch:
+            rows.append(dict(zip(columns, r)))
+            if len(rows) >= cap:
+                logger.warning(
+                    "gre_exceptions capture cap reached (%d rows) -- failed_records in "
+                    "gre_results stays exact (separate COUNT query); gre_exceptions only "
+                    "gets the first %d rows from this attempt.",
+                    MAX_EXCEPTIONS, MAX_EXCEPTIONS,
+                )
+                cursor.close()
+                return rows
+    cursor.close()
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -288,22 +456,35 @@ def evaluate_threshold(
 
 def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, batch_id: str, rows: list) -> int:
     """
-    Write every violating row to gre_exceptions via the one shared path.
-    Rows whose natural key already exists for this (rule_id, batch_id) are
-    silently skipped -- see _insert_or_skip(). Returns how many NEW rows
-    were inserted this call (not the total on file).
+    Write every violating row to gre_exceptions via one shared, batched
+    path. Rows are de-duplicated by natural key WITHIN this call first (a
+    rule_sql that legitimately returns the same natural key twice in one
+    pull would otherwise cost a wasted duplicate-key round trip per
+    repeat), then written with bulk_insert_or_skip() -- one executemany()
+    per GRE_EXCEPTION_CHUNK-sized chunk instead of one INSERT+commit per
+    row, falling back to row-by-row only for a chunk that collides with a
+    natural key already committed by an earlier attempt on this batch_id.
+    Returns how many NEW rows were inserted this call (not the total on
+    file).
     """
+    if not rows:
+        return 0
+
     sql = f"""
         INSERT INTO {meta_db}.gre_exceptions (
             run_id, rule_id, table_name, element_name, source_name,
             issue_desc, batch_id, natural_key_value
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
-    inserted = 0
+    seen = set()
+    params = []
     for row in rows:
         nk = build_natural_key(rule, row)
+        if nk in seen:
+            continue
+        seen.add(nk)
         issue_desc = f"Rule '{rule.get('rule_name')}' violated (natural_key={nk})"
-        params = [
+        params.append([
             run_id,
             rule.get("rule_id"),
             rule.get("table_name"),
@@ -312,25 +493,9 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, batch_id
             issue_desc,
             batch_id,
             nk,
-        ]
-        if _insert_or_skip(meta_conn, sql, params):
-            inserted += 1
-    return inserted
+        ])
 
-
-def _count_exceptions(meta_conn, meta_db: str, rule_id, batch_id: str) -> int:
-    """
-    Authoritative failed_records: a fresh COUNT(*) against gre_exceptions
-    for this (rule_id, batch_id), taken AFTER the write step. This is what
-    makes a rerun correct -- rows skipped as duplicates are still counted
-    exactly once, whether they were written this attempt or a prior one.
-    """
-    rows = execute_query(
-        meta_conn,
-        f"SELECT COUNT(*) AS cnt FROM {meta_db}.gre_exceptions WHERE rule_id = ? AND batch_id = ?",
-        [rule_id, batch_id],
-    )
-    return int(rows[0]["cnt"]) if rows else 0
+    return bulk_insert_or_skip(meta_conn, sql, params)
 
 
 def _upsert_result(meta_conn, meta_db: str, row: dict) -> None:
@@ -393,20 +558,34 @@ def _log_attempt(meta_conn, meta_db: str, run_id: str, rule: dict, batch_id: str
         logger.error("Failed to write gre_log row for rule_id=%s: %s", rule.get("rule_id"), exc)
 
 
-def _log_error(meta_conn, meta_db: str, run_id: str, rule: dict, batch_id: str,
-                error_type: str, message: str, detail: str = None) -> None:
-    """Insert one gre_errors row. Never raises -- an errors-table failure must not mask the real error."""
+def log_error(meta_conn, meta_db: str, run_id, rule_id, rule_group, batch_id,
+              error_type: str, message: str, detail: str = None) -> None:
+    """
+    Insert one gre_errors row from explicit scalar fields. Never raises --
+    an errors-table failure must not mask the real error.
+
+    This is the ONE shared gre_errors write path for the whole engine: rule
+    execution (via the rule-dict convenience wrapper _log_error() below)
+    and gre/sampling.py's sampling runs (which have no rule_id/rule dict to
+    key off of -- see sampling.py::_log_sampling_error()) both go through
+    this function instead of each keeping its own INSERT+try/except copy.
+    """
     sql = f"""
         INSERT INTO {meta_db}.gre_errors (
             run_id, rule_id, rule_group, batch_id, error_type, error_message, error_detail
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
     """
     try:
-        execute_dml(meta_conn, sql, [
-            run_id, rule.get("rule_id"), rule.get("rule_group"), batch_id, error_type, message, detail,
-        ])
+        execute_dml(meta_conn, sql, [run_id, rule_id, rule_group, batch_id, error_type, message, detail])
     except Exception as exc:
-        logger.error("Failed to write gre_errors row for rule_id=%s: %s", rule.get("rule_id"), exc)
+        logger.error("Failed to write gre_errors row (run_id=%s rule_id=%s): %s", run_id, rule_id, exc)
+
+
+def _log_error(meta_conn, meta_db: str, run_id: str, rule: dict, batch_id: str,
+                error_type: str, message: str, detail: str = None) -> None:
+    """Rule-dict convenience wrapper around log_error(), for gre_rules-keyed callers."""
+    log_error(meta_conn, meta_db, run_id, rule.get("rule_id"), rule.get("rule_group"),
+              batch_id, error_type, message, detail)
 
 
 # ---------------------------------------------------------------------------
@@ -465,40 +644,61 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, batch_id: str, met
 
     Commit model
     ------------
-    Every violating row commits independently (_insert_or_skip). The
-    gre_results upsert and the gre_log attempt row are their own separate
-    commits too. Nothing here is wrapped in one transaction, by design --
-    a crash after row 500 of 1000 leaves the first 500 committed, and a
-    rerun of this same rule/batch picks up exactly where it left off
-    because of the gre_exceptions_uix natural-key uniqueness.
+    Every violating row commits independently, in GRE_EXCEPTION_CHUNK-sized
+    batches (bulk_insert_or_skip). The gre_results upsert and the gre_log
+    attempt row are their own separate commits too. Nothing here is
+    wrapped in one transaction, by design -- a crash mid-write leaves
+    whatever chunks already committed in place, and a rerun of this same
+    rule/batch picks up exactly where it left off because of the
+    gre_exceptions_uix natural-key uniqueness.
+
+    Big-dataset path
+    -----------------
+    failed_records comes from _count_failed() -- a source-side COUNT(*) on
+    rule_sql -- BEFORE any row-level capture happens, so it's exact no
+    matter how many rows rule_sql actually matches. Row-level capture
+    (STEP 3 below) is capped at MAX_EXCEPTIONS and streamed via
+    _fetch_violating_rows() rather than one unbounded fetchall(); a
+    capture/write failure there is logged to gre_errors but does NOT flip
+    this rule to ERROR, since the PASS/FAIL/WARN verdict only depends on
+    the counts computed in STEP 1/2.
     """
     start = time.time()
+    query = _substitute_batch_id(rule["rule_sql"], batch_id)
 
+    # ── STEP 1: TRUE failed-record count (source-side COUNT(*)) ──────────────
     try:
-        query = _substitute_batch_id(rule["rule_sql"], batch_id)
-        violating_rows = _run_source_query(db_conn, query)
+        failed = _count_failed(db_conn, query)
     except Exception as exc:
-        logger.error("Rule %s: rule_sql failed: %s", rule.get("rule_id"), exc, exc_info=True)
+        logger.error("Rule %s: rule_sql count failed: %s", rule.get("rule_id"), exc, exc_info=True)
         _log_error(meta_conn, meta_db, run_id, rule, batch_id, "SQL_RUNTIME", str(exc))
         _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, start, str(exc))
         return "ERROR"
 
-    try:
-        _write_exceptions(meta_conn, meta_db, rule, run_id, batch_id, violating_rows)
-        failed = _count_exceptions(meta_conn, meta_db, rule.get("rule_id"), batch_id)
-    except Exception as exc:
-        logger.error("Rule %s: writing exceptions failed: %s", rule.get("rule_id"), exc, exc_info=True)
-        _log_error(meta_conn, meta_db, run_id, rule, batch_id, "WRITE_FAILURE", str(exc))
-        _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, start, str(exc))
-        return "ERROR"
-
+    # ── STEP 2: total in-scope record count ───────────────────────────────────
     try:
         total = _compute_total(db_conn, rule, batch_id)
     except Exception as exc:
         logger.error("Rule %s: scope/count query failed: %s", rule.get("rule_id"), exc, exc_info=True)
         _log_error(meta_conn, meta_db, run_id, rule, batch_id, "SCOPE_QUERY_FAILURE", str(exc))
-        _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", failed, start, str(exc))
+        _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, start, str(exc))
         return "ERROR"
+
+    # ── STEP 3: capped, batched exception-row capture -- best effort ─────────
+    # A failure here is logged but never fails the rule: `failed`/`total`
+    # above are already correct and independent of whether detail rows get
+    # captured.
+    written = 0
+    if failed > 0:
+        try:
+            violating_rows = _fetch_violating_rows(db_conn, query)
+            written = _write_exceptions(meta_conn, meta_db, rule, run_id, batch_id, violating_rows)
+        except Exception as exc:
+            logger.warning(
+                "Rule %s: exception-row capture/write failed (failed_records is still accurate): %s",
+                rule.get("rule_id"), exc, exc_info=True,
+            )
+            _log_error(meta_conn, meta_db, run_id, rule, batch_id, "WRITE_FAILURE", str(exc))
 
     verdict = evaluate_threshold(
         total, failed,
@@ -527,12 +727,17 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, batch_id: str, met
         except Exception as exc:
             logger.error("Rule %s: gre_results upsert failed: %s", rule.get("rule_id"), exc, exc_info=True)
             _log_error(meta_conn, meta_db, run_id, rule, batch_id, "RESULTS_WRITE_FAILURE", str(exc))
-            _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", failed, start, str(exc))
+            _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", written, start, str(exc))
             return "ERROR"
 
     logger.info(
-        "rule_id=%s | total=%d failed=%d | verdict=%s (write_result=%s) | %.3fs",
-        rule.get("rule_id"), total, failed, verdict["status"], verdict["write_result"], time.time() - start,
+        "rule_id=%s | total=%d failed=%d written=%d | verdict=%s (write_result=%s) | %.3fs",
+        rule.get("rule_id"), total, failed, written, verdict["status"], verdict["write_result"], time.time() - start,
     )
-    _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "SUCCESS", failed, start)
+    # gre_log.rowcount is "violating rows written to gre_exceptions THIS
+    # attempt" per the schema comment -- `written` (bulk_insert_or_skip's
+    # actual insert count, excluding skipped duplicates), not `failed`
+    # (the true total, which double-counts rows already on file from a
+    # prior attempt on a rerun).
+    _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "SUCCESS", written, start)
     return "SUCCESS"
