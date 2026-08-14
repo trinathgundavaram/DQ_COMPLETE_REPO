@@ -3,6 +3,8 @@ __pycache__/
 *.pyo
 .env
 .env.*
+dev.env
+!dev.env.example
 *.egg-info/
 dist/
 build/

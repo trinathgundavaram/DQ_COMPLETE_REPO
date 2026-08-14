@@ -11,7 +11,8 @@ or renames any `dq_*` object or any file under `core/`, `utils/`, or
 | File | Responsibility |
 |---|---|
 | `schema.sql` | DDL for the 12 `gre_*` tables + idempotency unique indexes |
-| `config.py` | Metadata connection/schema resolution; batch-readiness extension point |
+| `schema_drop.sql` | Drops all 12 `gre_*` tables, for redeploying `schema.sql` cleanly (see "Redeploying / changing the schema" below) |
+| `config.py` | Metadata connection/schema resolution; local `.env` credential loading; batch-readiness extension point |
 | `rules.py` | Loads active rules for a `rule_group` from `gre_rules` |
 | `executor.py` | Runs one rule, writes findings (batched), evaluates threshold, upserts `gre_results`. Also the ONE place in `gre/` with `execute_query`/`execute_dml`/`bulk_insert`/`bulk_insert_or_skip`/`log_error` — `rules.py`, `runner.py`, `reporting.py`, and `sampling.py` all import these rather than re-implementing them |
 | `runner.py` | Orchestrates a rule_group run: readiness gate, checkpoint/resume, sequencing |
@@ -23,16 +24,48 @@ or renames any `dq_*` object or any file under `core/`, `utils/`, or
 
 1. Run `schema.sql` against your Teradata metadata schema (defaults to
    `CMSUNIV_FILELAND_DEV_T`, same schema `dq_*` uses — set `GRE_META_DB` to
-   point elsewhere without a code change).
-2. Make sure `DQ_CONNECTION_NAMES` (and the matching `DQ_<NAME>_*` env
-   vars) already includes every connection your rules will query, per
+   point elsewhere without a code change). This repo's first deployment of
+   `gre_*` has no live data in it yet, so any future schema change is made
+   by editing `schema.sql`'s `CREATE TABLE` statements directly and
+   redeploying with `schema_drop.sql` (see "Redeploying / changing the
+   schema" below) rather than writing `ALTER TABLE` migrations — revisit
+   this once real data exists in these tables.
+2. **Local credentials**: copy `dev.env.example` (repo root) to `dev.env`
+   and fill in real values — `dev.env` is gitignored, never commit it.
+   `gre/config.py` loads it automatically (via `python-dotenv`) the first
+   time `gre.config` is imported, using the exact same env var names
+   `db/adapters.py`/`db/connection_factory.py` already read at connect
+   time (`DQ_CONNECTION_NAMES`, `DQ_<NAME>_TYPE`, `DQ_<NAME>_HOST`, etc.)
+   — so neither reused file needed any change; they just see
+   already-populated env vars either way. The file is entirely optional
+   (a real deployment, or a later Secrets Manager-backed loader, would
+   just have these env vars set some other way) — see `config.py`'s
+   docstring for the exact mechanics, and its "pivoting to Secrets
+   Manager" note for the intended next step.
+3. Make sure `DQ_CONNECTION_NAMES` (and the matching `DQ_<NAME>_*` env
+   vars — from `dev.env` locally, or however your deployment sets them)
+   already includes every connection your rules will query, per
    `db/connection_factory.py`'s existing convention. No new connector
    plumbing is needed.
-3. `GRE_META_CONNECTION` (default `"teradata"`) picks which of those
+4. `GRE_META_CONNECTION` (default `"teradata"`) picks which of those
    connections holds the `gre_*` tables.
-4. Optional tuning for large rule/candidate volumes (see "Running big
+5. Optional tuning for large rule/candidate volumes (see "Running big
    datasets" below): `GRE_EXCEPTION_CHUNK` (default `500`) and
    `GRE_MAX_EXCEPTIONS` (default `10000`).
+
+## Redeploying / changing the schema
+
+Because no `gre_*` table has live data in it yet, the policy for any
+schema change is **drop and recreate, not `ALTER TABLE`**: edit the
+relevant `CREATE TABLE` statement(s) directly in `schema.sql`, then run
+`schema_drop.sql` followed by `schema.sql` again. `schema_drop.sql` is a
+plain, destructive set of `DROP TABLE` statements for all 12 objects (no
+`IF EXISTS` — Teradata has no such clause here; an error on a table that
+doesn't exist yet is expected and harmless, just keep going). In
+Teradata, dropping a table also drops every index defined on it, so
+there's no separate index-drop step. **This policy needs revisiting once
+real data lands in these tables** — at that point, schema changes go back
+to needing real migrations, the same as any other production table.
 
 ## Authoring a rule
 
@@ -232,22 +265,25 @@ asserting matching per-bucket selected counts.
   as the extension point for a future soft-retraction/versioning pass if
   your actual usage reruns a batch_id after correcting data; it isn't
   wired into engine logic in this v1.
-- **Glue/Secrets Manager credentials**: the legacy `maa-compliance-rules-engine`
-  code that pattern would be mirrored from isn't in this repo, so it
-  wasn't copied. `db/adapters.py`'s existing env-var-at-call-time pattern
-  is used as-is; add a Secrets-Manager-backed env var loader ahead of
-  `db/adapters.py`'s calls if/when this runs on Glue.
+- **Local dev credentials load from `dev.env`, Secrets Manager is a future pivot**:
+  `gre/config.py::_load_env_file()` loads `dev.env` (see `dev.env.example`)
+  into the process env at import time, using the exact `DQ_<NAME>_*` names
+  `db/adapters.py`/`db/connection_factory.py` already read via their
+  existing env-var-at-call-time pattern — neither file was touched.
+  Pivoting to AWS Secrets Manager later only means changing
+  `_load_env_file()` to populate those same env var names from Secrets
+  Manager instead of a file; nothing else in the engine needs to change.
 - **`gre_case`** is pure reference data (rules join out to it to correlate
   findings across tables); the engine itself never reads or writes it.
 - **`gre_audit` was extended, not left alone**, to add the sampling
   module: `rule_group`/`batch_id` are now nullable, and a `run_type`
   discriminator (`'RULE_GROUP'`/`'SAMPLING'`) plus nullable
   sampling-specific columns were added, per the prompt's explicit "reuse
-  gre_audit rather than inventing a parallel run-log table." Nothing has
-  been deployed against this schema yet, so this is a straight edit of the
-  v3 DDL, not a live migration — if `schema.sql` has already been run
-  against a real schema by the time you read this, you'll need an `ALTER
-  TABLE` instead.
+  gre_audit rather than inventing a parallel run-log table." This is a
+  straight edit of the v3 DDL, not a live migration — per this engine's
+  first-deployment policy (see "Redeploying / changing the schema"
+  above), pick it up by running `schema_drop.sql` then re-running
+  `schema.sql`, not an `ALTER TABLE`.
 - **`gre_sampling_config.scope_sql` is a WHERE-fragment**, not a COUNT
   query — same field name as `gre_rules.scope_sql`, different shape,
   because it answers a different question here ("which rows are this

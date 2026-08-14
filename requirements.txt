@@ -42,3 +42,9 @@ pandas>=2.0.0           # already listed above (file adapter) — reused by the 
 
 # ── Testing ──────────────────────────────────────────────────────────────
 pytest>=7.4.0
+
+# ── Local dev credentials (gre/) ──────────────────────────────────────────
+# Loads dev.env (see dev.env.example) into the process env at import time;
+# db/adapters.py / db/connection_factory.py are unmodified and unaware of
+# this -- they just see already-populated DQ_<NAME>_* env vars either way.
+python-dotenv>=1.0.0
