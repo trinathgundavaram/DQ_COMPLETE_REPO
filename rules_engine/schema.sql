@@ -22,18 +22,29 @@
 -- Design notes (see rules_engine/config usage via shared/config.py,
 -- rules_engine/executor.py docstrings for the code that relies on these
 -- shapes):
---   * rule_sql / scope_sql may embed any number of "{key}" tokens (e.g.
---     "{batch_id}", "{year}", "{run_type}"). The engine string-substitutes
---     each one (quoted, escaped) from the run_params dict passed to this
---     run -- see shared/db_ops.py::_substitute_params() /
---     build_run_params(). batch_id is always present in run_params (it's
---     still the tracking/idempotency key -- gre_exceptions_uix, gre_log,
+--   * rule_sql may embed any number of "{key}" tokens (e.g. "{batch_id}",
+--     "{year}", "{run_type}"). The engine string-substitutes each one
+--     (quoted, escaped) from the run_params dict passed to this run --
+--     see shared/db_ops.py::_substitute_params() / build_run_params().
+--     batch_id is always present in run_params (it's still the
+--     tracking/idempotency key -- gre_exceptions_uix, gre_log,
 --     gre_results, gre_audit), but a rule can reference any other key the
 --     caller supplies. There is no filter_column/filter_sql system like
 --     dq_rules has; SQL-authoring rules are expected to be fully
 --     self-contained -- an unresolved "{token}" fails the rule attempt
 --     immediately (PARAM_SUBSTITUTION_ERROR) rather than reaching the
 --     source database as a syntax error.
+--   * database_name + table_name give the auto-generated total-record
+--     count query (see below) a fully-qualified FROM. There is no
+--     separate scope_sql column: the run_params dict that scopes rule_sql
+--     already IS the definition of what's in scope for this run, so a
+--     second, independently hand-written WHERE clause was pure
+--     duplication (and a real drift risk -- the two could silently
+--     disagree). Every key present in run_params (batch_id included) is
+--     applied as an equality filter against database_name.table_name,
+--     AND'd together -- see rules_engine/executor.py::_build_total_query().
+--     A project whose table doesn't carry a column for one of its
+--     run_params keys should not pass that key for rules on this table.
 --   * source_connection names a connection already configured via
 --     DQ_CONNECTION_NAMES / db/connection_factory.py -- the SAME connector
 --     layer dq_* uses, imported directly, not reimplemented.
@@ -44,12 +55,6 @@
 --     (UNIQUE INDEX below), mirroring the dq_metrics_summary_uix pattern:
 --     catch the duplicate-key error and skip/update rather than
 --     delete-then-insert, which leaves a crash-mid-delete window.
---   * scope_sql is optional; when NULL the engine's default total-record
---     count is an unfiltered "SELECT COUNT(*) AS total_count FROM
---     {table_name}" (whole table) -- there is no default filter column.
---     A project whose total needs scoping (by batch_id, a date range, or
---     anything else) sets scope_sql explicitly, using whichever {key}
---     tokens its run_params supplies.
 --   * rule_variant adds ONE additional generic level on top of
 --     project/table (rule_group) for selecting which rules run: NULL
 --     means the rule always applies within its rule_group; a non-NULL
@@ -67,11 +72,12 @@
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_rules (
     rule_id              INTEGER NOT NULL,
     rule_name            VARCHAR(500) NOT NULL,
+    database_name        VARCHAR(200) NOT NULL,    -- schema the table below lives in; combined with
+                                                    -- table_name for the auto total-record count query
     table_name           VARCHAR(200) NOT NULL,
     source_connection    VARCHAR(100) NOT NULL,   -- named connection, see db/connection_factory.py
     sql_dialect          VARCHAR(20)  NOT NULL,   -- 'teradata' | 'postgres' | 'ansi'
     rule_sql             CLOB NOT NULL,            -- the negative SELECT; never mutates data
-    scope_sql            CLOB,                     -- optional override for the total-record count
     rule_group           VARCHAR(100) NOT NULL,    -- groups rules for one use case / table pipeline
     rule_variant         VARCHAR(100),             -- optional extra selection level within rule_group;
                                                     -- NULL = always applies, see design notes above

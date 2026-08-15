@@ -128,16 +128,17 @@ def _rule(**overrides):
     rule = {
         "rule_id": 1,
         "rule_name": "Denied claim missing denial_reason",
+        "database_name": "main",   # DuckDB's default schema -- see _conn()
         "table_name": "claims",
         "source_connection": "duckdb_test",
         "sql_dialect": "ansi",
         "rule_sql": "SELECT claim_id, denial_reason FROM claims "
                     "WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
-        # Explicit scope_sql -- there is no more batch_id_column fallback,
-        # so a rule whose total should be scoped to the batch (as most of
-        # these tests assume) has to say so; see the dedicated
-        # whole-table-default tests below for the scope_sql=None path.
-        "scope_sql": "SELECT COUNT(*) AS total_count FROM claims WHERE batch_id = '{batch_id}'",
+        # No scope_sql column anymore -- _compute_total() auto-builds the
+        # total-record count from database_name.table_name filtered by
+        # every key in run_params (batch_id included), so passing
+        # run_params={"batch_id": "B1"} alone is enough to batch-scope the
+        # total the same way the old explicit scope_sql override used to.
         "rule_group": "claims_dq",
         "rule_variant": None,
         "seq_no": 10,
@@ -397,56 +398,86 @@ def test_execute_rule_unrecognised_source_type_skips_dialect_check():
     assert status == "SUCCESS"   # unrecognised source_type -> warn and skip, not a hard failure
 
 
-# ── _compute_total: whole-table default + scope_sql override ────────────
+# ── _compute_total: auto-derived from database_name.table_name + run_params ──
 
-def test_compute_total_defaults_to_unfiltered_whole_table_count():
-    # scope_sql=None -> no batch_id_column fallback anymore (that column is
-    # gone) -- the default is an unfiltered COUNT(*) over the whole table.
+def test_compute_total_auto_filters_by_every_run_params_key():
+    # No scope_sql anywhere -- _compute_total() builds
+    # "SELECT COUNT(*) FROM main.claims WHERE batch_id = '...'" straight
+    # from database_name/table_name + run_params, same as the old explicit
+    # scope_sql override used to, with nothing hand-written.
     conn = _conn()
-    rule = _rule(scope_sql=None)   # table_name='claims' -- all 5 seed rows (B1 x4 + B2 x1)
-    total = _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=None)
-    assert total == 5
-
-
-def test_compute_total_scope_sql_scopes_by_whatever_run_params_key_it_names():
-    conn = _conn()
-    rule = _rule(scope_sql="SELECT COUNT(*) AS total_count FROM claims WHERE batch_id = '{batch_id}'")
+    rule = _rule()
     assert _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=None) == 4
     assert _compute_total(conn, rule, {"batch_id": "B2"}, total_cache=None) == 1
 
 
+def test_compute_total_multiple_run_params_keys_are_anded_together():
+    conn = _conn()
+    rule = _rule()
+    # denial_reason isn't a real scoping dimension for this fixture, but
+    # proves every key in run_params becomes its own AND'd equality filter,
+    # not just batch_id.
+    assert _compute_total(conn, rule, {"batch_id": "B1", "denial_reason": "X"}, total_cache=None) == 1
+    assert _compute_total(conn, rule, {"batch_id": "B1", "claim_id": "C1"}, total_cache=None) == 1
+    assert _compute_total(conn, rule, {"batch_id": "B1", "claim_id": "NO_SUCH_ID"}, total_cache=None) == 0
+
+
+def test_compute_total_uses_database_name_and_table_name():
+    conn = _conn()
+    rule = _rule(database_name="main", table_name="claims")
+    assert _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=None) == 4
+
+    # A wrong database_name/table_name should surface as a real query
+    # failure, not silently return something -- proves the auto-built
+    # query actually uses the fields, not a hardcoded table reference.
+    bad_rule = _rule(database_name="main", table_name="no_such_table")
+    with pytest.raises(Exception):
+        _compute_total(conn, bad_rule, {"batch_id": "B1"}, total_cache=None)
+
+
 def test_compute_total_is_memoized_within_a_shared_cache():
     conn = _conn()
-    rule = _rule(scope_sql=None)   # table_name='claims' -- whole-table default
+    rule = _rule()
     cache = {}
 
     total1 = _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=cache)
-    assert total1 == 5
+    assert total1 == 4
     assert len(cache) == 1
 
     # Mutate the underlying table -- a fresh (uncached) count would change.
     conn.execute("INSERT INTO claims VALUES ('C99', NULL, 'B1')")
 
     total2 = _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=cache)
-    assert total2 == 5   # served from cache, not re-queried -- proves memoization
+    assert total2 == 4   # served from cache, not re-queried -- proves memoization
 
     total3 = _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=None)
-    assert total3 == 6   # no cache passed -> fresh query, reflects the mutation
+    assert total3 == 5   # no cache passed -> fresh query, reflects the mutation
 
 
 def test_compute_total_cache_is_keyed_by_source_connection_and_query():
-    # Whole-table default has no batch_id in its query text at all, so two
-    # different batches would share one cache entry -- to prove the cache
-    # key really does track the resolved QUERY (not just source_connection
-    # or rule_id), use a rule whose scope_sql embeds {batch_id}, so two
-    # different run_params values resolve to two different query strings.
+    # Different run_params -> different auto-built query text -> different
+    # cache key, not collapsed together.
     conn = _conn()
     cache = {}
-    rule = _rule(scope_sql="SELECT COUNT(*) AS total_count FROM claims WHERE batch_id = '{batch_id}'")
+    rule = _rule()
 
     assert _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=cache) == 4
     assert _compute_total(conn, rule, {"batch_id": "B2"}, total_cache=cache) == 1   # only C5 is in B2
     assert len(cache) == 2   # different resolved query -> different cache key, not collapsed together
+
+
+def test_compute_total_query_text_is_deterministic_regardless_of_dict_order():
+    # sorted(run_params) inside _build_total_query() means the SAME
+    # cache_key is produced no matter what order the caller's dict was
+    # built in -- otherwise two logically-identical calls could miss the
+    # cache purely because of dict insertion order.
+    conn = _conn()
+    rule = _rule()
+    cache = {}
+
+    _compute_total(conn, rule, {"batch_id": "B1", "claim_id": "C1"}, total_cache=cache)
+    _compute_total(conn, rule, {"claim_id": "C1", "batch_id": "B1"}, total_cache=cache)
+    assert len(cache) == 1   # same effective filters, same cache entry
 
 
 # ── single-scan evaluation (_scan_violations) ────────────────────────────
@@ -498,10 +529,15 @@ def test_execute_rule_issues_two_source_queries_not_three():
 
 def test_execute_rule_uses_extra_run_params_key_beyond_batch_id():
     conn = _conn()
+    # run_type must be a REAL column: every key in run_params also becomes
+    # an equality filter for the auto-generated total-record count (see
+    # _build_total_query()), so an extra run_params key has to name an
+    # actual column on the rule's table, not just something rule_sql
+    # happens to reference inline.
+    conn.execute("ALTER TABLE claims ADD COLUMN run_type VARCHAR DEFAULT 'MONTHLY'")
     rule = _rule(
         rule_sql="SELECT claim_id, denial_reason FROM claims "
                  "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' AND '{run_type}' = 'MONTHLY'",
-        scope_sql=None,
     )
     status = execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1", "run_type": "MONTHLY"}, META_DB)
     assert status == "SUCCESS"

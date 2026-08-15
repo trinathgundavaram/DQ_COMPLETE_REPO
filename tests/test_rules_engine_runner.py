@@ -40,9 +40,9 @@ def _conn():
 
     conn.execute("""
         CREATE TABLE gre_rules (
-            rule_id INTEGER, rule_name VARCHAR, table_name VARCHAR,
+            rule_id INTEGER, rule_name VARCHAR, database_name VARCHAR, table_name VARCHAR,
             source_connection VARCHAR, sql_dialect VARCHAR, rule_sql VARCHAR,
-            scope_sql VARCHAR, rule_group VARCHAR, rule_variant VARCHAR,
+            rule_group VARCHAR, rule_variant VARCHAR,
             seq_no INTEGER, sequencing_mode VARCHAR, on_failure VARCHAR,
             threshold_pct DOUBLE, threshold_count INTEGER, threshold_operator VARCHAR,
             severity VARCHAR, natural_key_columns VARCHAR, element_name VARCHAR,
@@ -107,10 +107,10 @@ def _insert_rule(conn, rule_id, rule_sql, seq_no, sequencing_mode="independent",
                   on_failure="skip_and_continue", rule_group="claims_dq", rule_variant=None):
     conn.execute("""
         INSERT INTO gre_rules (
-            rule_id, rule_name, table_name, source_connection, sql_dialect, rule_sql,
+            rule_id, rule_name, database_name, table_name, source_connection, sql_dialect, rule_sql,
             rule_group, rule_variant, seq_no, sequencing_mode, on_failure, natural_key_columns,
             active_flag
-        ) VALUES (?, ?, 'claims', 'duckdb_test', 'ansi', ?, ?, ?, ?, ?, ?, 'claim_id', 1)
+        ) VALUES (?, ?, 'main', 'claims', 'duckdb_test', 'ansi', ?, ?, ?, ?, ?, ?, 'claim_id', 1)
     """, [rule_id, f"rule {rule_id}", rule_sql, rule_group, rule_variant, seq_no, sequencing_mode, on_failure])
 
 
@@ -196,10 +196,10 @@ def test_no_rules_returns_no_rules_status():
 
 
 def test_shared_total_cache_avoids_redundant_count_queries_across_rules(monkeypatch):
-    # Two rules in the same group, same table, no scope_sql override --
-    # they both fall to the whole-table default and ask _compute_total()
-    # the identical question, so within one run_rule_group() call that
-    # COUNT(*) should only actually run once.
+    # Two rules in the same group, same database_name/table_name, same
+    # run_params -- _compute_total() auto-builds the identical
+    # database.table + WHERE batch_id = 'B1' query for both, so within one
+    # run_rule_group() call that COUNT(*) should only actually run once.
     conn = _conn()
     cf = _FakeConnectionFactory(conn)
     _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10)
@@ -270,6 +270,10 @@ def test_rule_variant_requested_runs_universal_plus_matching_variant():
 
 def test_run_params_extra_key_is_available_to_every_rule_sql():
     conn = _conn()
+    # run_type must be a real column -- every run_params key also becomes
+    # an equality filter for the auto-generated total-record count (see
+    # rules_engine/executor.py::_build_total_query()).
+    conn.execute("ALTER TABLE claims ADD COLUMN run_type VARCHAR DEFAULT 'MONTHLY'")
     cf = _FakeConnectionFactory(conn)
     _insert_rule(
         conn, 1,

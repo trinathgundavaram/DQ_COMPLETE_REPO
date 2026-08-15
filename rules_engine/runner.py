@@ -108,14 +108,17 @@ def run_rule_group(
     meta_db      : schema the gre_ tables live in; defaults to
                    gre_config.get_meta_db()
     triggered_by : freeform string recorded on gre_audit
-    run_params   : optional dict of extra named values a rule's rule_sql/
-                   scope_sql can reference via "{key}" tokens -- merged with
-                   batch_id via shared.db_ops.build_run_params() (batch_id
-                   always wins on key collision). Lets each project scope
-                   its data however it needs (month/year, run_type, a date
-                   range, a region column, ...) without the engine having
-                   to know about any of those column names. See
-                   shared/db_ops.py::_substitute_params()'s docstring.
+    run_params   : optional dict of extra named values a rule's rule_sql can
+                   reference via "{key}" tokens -- merged with batch_id via
+                   shared.db_ops.build_run_params() (batch_id always wins
+                   on key collision). The SAME dict also becomes the
+                   equality filters for the auto-generated total-record
+                   count (rules_engine/executor.py::_build_total_query()).
+                   Lets each project scope its data however it needs
+                   (month/year, run_type, a date range, a region column,
+                   ...) without the engine having to know about any of
+                   those column names. See shared/db_ops.py::
+                   _substitute_params()'s docstring.
     rule_variant : optional extra selection level on top of rule_group/
                    table -- passed straight to rules_engine.rules.load_rules()
                    (see its docstring) and recorded on gre_audit for this
@@ -182,8 +185,8 @@ def run_rule_group(
 
     # Shared for the whole run: several rules in a group often ask the
     # identical "how many rows are in this batch" question (same
-    # table_name, or a shared scope_sql) -- one dict here, threaded into
-    # every execute_rule() call, lets _compute_total() reuse that COUNT(*)
+    # database_name/table_name and run_params) -- one dict here, threaded
+    # into every execute_rule() call, lets _compute_total() reuse that COUNT(*)
     # result instead of re-scanning the same rows once per rule. See
     # rules_engine/executor.py::_compute_total()'s docstring.
     total_cache = {}

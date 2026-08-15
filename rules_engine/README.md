@@ -9,15 +9,15 @@ upserts a `gre_results` verdict row.
 
 ## Scoping a rule's data: `run_params`
 
-`rule_sql` and `scope_sql` may embed any number of `"{key}"` tokens (not
-just `{batch_id}`) -- each run passes a `run_params` dict, and every
-matching token is substituted (quoted, escaped) before the query runs. A
-project scopes its data however it needs: month/year, `batch_id` +
-`run_type`, a date range, a region/contract column, or nothing at all
-(whole table). `batch_id` is always present in `run_params` -- it's still
-the tracking/idempotency key (`gre_exceptions_uix`, `gre_log`,
-`gre_results`, `gre_audit`) -- but a rule can reference any other key the
-caller supplies too:
+`rule_sql` may embed any number of `"{key}"` tokens (not just
+`{batch_id}`) -- each run passes a `run_params` dict, and every matching
+token is substituted (quoted, escaped) before the query runs. A project
+scopes its data however it needs: month/year, `batch_id` + `run_type`, a
+date range, a region/contract column, or nothing at all (whole table).
+`batch_id` is always present in `run_params` -- it's still the
+tracking/idempotency key (`gre_exceptions_uix`, `gre_log`, `gre_results`,
+`gre_audit`) -- but a rule can reference any other key the caller
+supplies too:
 
 ```python
 summary = run_rule_group(
@@ -31,11 +31,15 @@ fails that rule attempt immediately with a `PARAM_SUBSTITUTION_ERROR`,
 before any query reaches the source database -- the same
 fail-fast-before-any-query philosophy as the dialect guard.
 
-`scope_sql` is optional; when a rule doesn't set it, its total-record
-count defaults to an unfiltered `COUNT(*)` over the whole table -- there
-is no default filter column (the old `batch_id_column` is gone). A rule
-whose total needs scoping sets `scope_sql` explicitly, using whichever
-`{key}` tokens its `run_params` supplies.
+There is no separate `scope_sql` column to author for the total-record
+(denominator) count. Each `gre_rules` row names its `database_name` +
+`table_name`, and the engine builds `SELECT COUNT(*) FROM
+{database_name}.{table_name} WHERE ...` automatically, applying every key
+in `run_params` as an equality filter (AND'd together) -- the SAME dict
+that scopes `rule_sql` already says what's in scope for the total, so
+there's nothing left to hand-write. A rule's table needs a real column
+for every key its run passes (e.g. if a table has no `batch_id` column,
+don't include one when scoping runs against it).
 
 ## Selecting which rules run: `rule_variant`
 

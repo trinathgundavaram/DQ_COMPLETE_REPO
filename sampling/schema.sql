@@ -37,12 +37,14 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_config (
                                                     -- rules_engine's rule_sql is -- see
                                                     -- shared/db_ops.py::_substitute_params().
                                                     -- Defaults to '1=1' (whole table) if unset.
-                                                    -- NOTE: unlike gre_rules.scope_sql (a COUNT
-                                                    -- query), this scope_sql is a WHERE-fragment
-                                                    -- -- same field name, different shape,
-                                                    -- because it answers a different question
-                                                    -- here ("which rows are this cycle's
-                                                    -- candidates" vs. "what's the denominator").
+                                                    -- Kept as an explicit, hand-authored WHERE-
+                                                    -- fragment (unlike rules_engine/schema.sql's
+                                                    -- gre_rules, which has no scope_sql at all --
+                                                    -- its total-record count is auto-derived from
+                                                    -- run_params + database_name.table_name)
+                                                    -- because "which rows are this cycle's
+                                                    -- candidates" isn't always a plain equality
+                                                    -- filter (exclusions, date ranges, ...).
     exclusion_sql        CLOB,                    -- WHERE-fragment; matching rows are EXCLUDED.
                                                     -- Same "{key}" run_params substitution as
                                                     -- scope_sql above (both go through

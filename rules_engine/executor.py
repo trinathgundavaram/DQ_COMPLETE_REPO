@@ -395,37 +395,54 @@ def _log_attempt(meta_conn, meta_db: str, run_id: str, rule: dict, batch_id: str
 # Total in-scope record count
 # ---------------------------------------------------------------------------
 
+def _build_total_query(database_name: str, table_name: str, run_params: dict) -> str:
+    """
+    "SELECT COUNT(*) AS total_count FROM {database_name}.{table_name}
+    WHERE k1 = '{k1}' AND k2 = '{k2}' ..." built straight from run_params'
+    OWN keys -- there is no separate scope_sql to hand-author or keep in
+    sync. The dict that scopes rule_sql already says what's "in scope"
+    for this run, so re-deriving that as a second, independently-written
+    SQL blob was pure duplication with real drift risk (rule_sql's WHERE
+    and scope_sql's WHERE could silently disagree over time). Every key
+    present in run_params (batch_id included) is treated as a literal
+    column name on this rule's table and applied as an equality filter,
+    AND'd together -- a project's run_params IS its scoping definition,
+    for the rule_sql substitution AND the denominator alike.
+
+    Sorted key order makes the resulting query text deterministic
+    regardless of run_params' own insertion order, so _compute_total()'s
+    total_cache key is stable for two calls with the same effective
+    filters. Escaping/quoting is delegated to _substitute_params() (same
+    logic rule_sql substitution uses) rather than reimplemented here.
+    """
+    where_clause = " AND ".join(f"{key} = '{{{key}}}'" for key in sorted(run_params)) or "1=1"
+    template = f"SELECT COUNT(*) AS total_count FROM {database_name}.{table_name} WHERE {where_clause}"
+    return _substitute_params(template, run_params)
+
+
 def _compute_total(db_conn, rule: dict, run_params: dict, total_cache: dict = None) -> int:
     """
-    total_records = scope_sql result if the rule defines one, else an
-    unfiltered COUNT(*) on table_name (whole table). A rule that needs its
-    total scoped MUST define scope_sql -- there is no implicit default
-    filter column anymore (see rules_engine/schema.sql's header for why:
-    every project scopes its data differently, so a rule/config author
-    writes the exact WHERE clause their project needs, using whichever
-    {key} tokens run_params supplies, rather than the engine guessing a
-    column name). scope_sql goes through the same _substitute_params()
-    pass as rule_sql.
+    total_records = COUNT(*) FROM {database_name}.{table_name}, filtered
+    by the SAME run_params dict used to scope rule_sql -- see
+    _build_total_query()'s docstring. database_name is a required
+    gre_rules column (alongside table_name) precisely so this query can
+    be built fully-qualified without guessing which schema the table
+    lives in.
 
     total_cache: an optional dict shared across every rule in one
     run_rule_group() call (see runner.py), keyed by
     (source_connection, effective query text). Multiple rules in a group
-    very often ask the identical question -- same table_name, or an
-    intentionally shared scope_sql -- so caching by the actual resolved
-    query (not just table_name) reuses the COUNT(*) result across every
-    rule that would otherwise re-run the exact same scan, without needing
-    to special-case scope_sql vs. the default path. A fresh cache per run
-    means this never sees stale data across runs; within one run the
-    source isn't expected to change mid-run anyway (the same assumption
+    very often ask the identical question -- same table + the same
+    run_params -- so caching by the actual resolved query (not just
+    table_name) reuses the COUNT(*) result across every rule that would
+    otherwise re-run the exact same scan. A fresh cache per run means
+    this never sees stale data across runs; within one run the source
+    isn't expected to change mid-run anyway (the same assumption
     gre_exceptions' idempotency already relies on). Callers that don't
     pass a cache (e.g. direct execute_rule() calls in tests) get the old
     always-fresh-query behavior unchanged.
     """
-    scope_sql = (rule.get("scope_sql") or "").strip()
-    if scope_sql:
-        query = _substitute_params(scope_sql, run_params)
-    else:
-        query = f"SELECT COUNT(*) AS total_count FROM {rule['table_name']}"
+    query = _build_total_query(rule["database_name"], rule["table_name"], run_params)
 
     cache_key = (rule.get("source_connection"), query)
     if total_cache is not None and cache_key in total_cache:
@@ -462,12 +479,15 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, 
     db_conn     : SourceAdapter for rule['source_connection'] -- READS ONLY
     meta_conn   : SourceAdapter for the gre_ metadata store -- all writes go here
     run_id      : id for this run (assigned by rules_engine/runner.py)
-    run_params  : dict of named values substituted into rule_sql/scope_sql's
-                  "{key}" tokens -- see shared/db_ops.py::_substitute_params()
-                  and build_run_params(). MUST contain a "batch_id" key
-                  (build_run_params() guarantees this): batch_id is still
-                  the value gre_exceptions/gre_log/gre_results/gre_audit key
-                  their tracking/idempotency off, even though it's no
+    run_params  : dict of named values substituted into rule_sql's "{key}"
+                  tokens (see shared/db_ops.py::_substitute_params() and
+                  build_run_params()) AND used, key-for-key, as the
+                  equality filters for the auto-generated total-record
+                  count (see _compute_total()/_build_total_query()). MUST
+                  contain a "batch_id" key (build_run_params() guarantees
+                  this): batch_id is still the value gre_exceptions/
+                  gre_log/gre_results/gre_audit key their tracking/
+                  idempotency off, even though it's no
                   longer the only value a rule can reference.
     meta_db     : schema name the gre_ tables live in
     total_cache : optional dict, shared across every rule in one

@@ -32,9 +32,14 @@ not two drifting copies. Metadata connection/db resolution comes from
 shared/config.py.
 
 scope_sql AND exclusion_sql both go through the same {key} run_params
-substitution as rules_engine's rule_sql/scope_sql -- see
+substitution as rules_engine's rule_sql -- see
 shared/db_ops.py::_substitute_params()'s docstring for why this is a dict
-instead of a single {batch_id} value.
+instead of a single {batch_id} value. Unlike rules_engine (which auto-
+derives its total-record count straight from run_params against
+database_name.table_name -- see rules_engine/executor.py::
+_build_total_query()), sampling's candidate universe isn't always a plain
+equality filter (exclusions, priority ordering, ...), so scope_sql/
+exclusion_sql stay as explicit, hand-authored WHERE-fragments here.
 
 Algorithm
 ---------

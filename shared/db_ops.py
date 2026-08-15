@@ -72,7 +72,7 @@ except ImportError:
 # Dialect safety
 # ---------------------------------------------------------------------------
 # gre_rules.sql_dialect is NOT NULL in rules_engine/schema.sql -- every rule
-# declares which SQL flavor rule_sql/scope_sql are written in. Fresh
+# declares which SQL flavor rule_sql is written in. Fresh
 # implementation here (not imported from core/rule_sql.py -- see this
 # module's docstring on the scope boundary) but the same shape/behavior as
 # the proven dq_* pattern: 'ansi' is accepted everywhere, an unrecognised
