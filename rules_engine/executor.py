@@ -162,6 +162,25 @@ def _scan_violations(db_conn, query: str) -> tuple:
 # Natural key
 # ---------------------------------------------------------------------------
 
+def _format_natural_key(cols: list, row: dict) -> str:
+    """
+    "col1=val1|col2=val2" for `cols`, in order, from `row` -- the actual
+    encoding logic behind build_natural_key() below, factored out so
+    rules_engine/reporting.py can recompute the identical string from a
+    row it fetched straight from the source table (not through a `rule`
+    dict), to match it back to the gre_exceptions row it came from.
+
+    Explicit None -> 'NULL' (not just a missing-key default) so a
+    genuinely NULL key column is stable and human-readable in
+    gre_exceptions.natural_key_value, not the string "None". See
+    parse_natural_key() for the (best-effort) inverse.
+    """
+    def _fmt(c):
+        v = row.get(c, "NULL")
+        return "NULL" if v is None else v
+    return "|".join(f"{c}={_fmt(c)}" for c in cols)
+
+
 def build_natural_key(rule: dict, row: dict) -> str:
     """
     "col1=val1|col2=val2" from rule['natural_key_columns'] -- this engine's
@@ -175,13 +194,36 @@ def build_natural_key(rule: dict, row: dict) -> str:
             f"rule_id={rule.get('rule_id')} has no natural_key_columns -- "
             "every rule must declare one to write idempotent exception rows."
         )
-    # Explicit None -> 'NULL' (not just a missing-key default) so a
-    # genuinely NULL key column is stable and human-readable in
-    # gre_exceptions.natural_key_value, not the string "None".
-    def _fmt(c):
-        v = row.get(c, "NULL")
-        return "NULL" if v is None else v
-    return "|".join(f"{c}={_fmt(c)}" for c in cols)
+    return _format_natural_key(cols, row)
+
+
+def parse_natural_key(natural_key_value: str) -> dict:
+    """
+    Best-effort inverse of build_natural_key()/_format_natural_key():
+    "col1=val1|col2=val2" -> {"col1": "val1", "col2": "val2"}, used by
+    rules_engine/reporting.py to re-derive the WHERE filter that ties a
+    gre_exceptions row back to its source record.
+
+    The literal string 'NULL' round-trips back to Python None (matching
+    build_natural_key()'s own encoding of a genuinely NULL key column) --
+    which means a key column whose REAL value is the literal text "NULL"
+    is indistinguishable from a true NULL after parsing. This is a
+    pre-existing constraint of the delimited-string encoding itself (not
+    introduced here); pick natural_key_columns that won't hold that value.
+
+    Splits on the literal "|" and the FIRST "=" in each segment -- key
+    column NAMES never contain either, but a key VALUE containing "|"
+    will not round-trip correctly, for the same reason. Empty input (a
+    row with no columns, which build_natural_key() never actually
+    produces since it requires at least one column) returns {}.
+    """
+    parsed = {}
+    for segment in (natural_key_value or "").split("|"):
+        if not segment:
+            continue
+        col, _, val = segment.partition("=")
+        parsed[col] = None if val == "NULL" else val
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -305,9 +347,9 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, batch_id
 
     sql = f"""
         INSERT INTO {meta_db}.gre_exceptions (
-            run_id, rule_id, table_name, element_name, source_name,
+            run_id, rule_id, database_name, table_name, element_name, source_name,
             issue_desc, batch_id, natural_key_value
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     seen = set()
     params = []
@@ -320,6 +362,7 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, batch_id
         params.append([
             run_id,
             rule.get("rule_id"),
+            rule.get("database_name"),
             rule.get("table_name"),
             rule.get("element_name"),
             rule.get("source_connection"),

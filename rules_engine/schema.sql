@@ -130,12 +130,25 @@ ON CMSUNIV_FILELAND_DEV_T.gre_log;
 -- Column shape is the legacy INSERT list verbatim (record_id, rule_id,
 -- table_name, element_name, source_name, issue_desc, exception_flag,
 -- exception_approver, batch_id, etl_is_curr_ind, etl_load_dt,
--- etl_last_updt_dt) plus run_id and natural_key_value, which the legacy
--- shape didn't need but this engine's idempotency and traceability do.
+-- etl_last_updt_dt) plus run_id, database_name, and natural_key_value,
+-- which the legacy shape didn't need but this engine's idempotency and
+-- source tie-back do.
+--
+-- Deliberately does NOT store the violating row's own data -- only enough
+-- to re-identify it (database_name/table_name/source_name +
+-- natural_key_value). A row that fails every rule in a 10-rule group
+-- would otherwise get its full column set duplicated 10 times, once per
+-- rule, for no benefit; instead, rules_engine/reporting.py::
+-- get_source_records_for_rule() re-joins back to the LIVE source table at
+-- report/analysis time using this natural key, which costs nothing at
+-- write time and reflects the record as it stands right now (see that
+-- function's docstring for the trade-off this makes vs. a point-in-time
+-- snapshot).
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_exceptions (
     record_id            BIGINT GENERATED ALWAYS AS IDENTITY,
     run_id                VARCHAR(200),
     rule_id               INTEGER NOT NULL,
+    database_name         VARCHAR(200),                 -- copied from gre_rules.database_name
     table_name            VARCHAR(200),
     element_name          VARCHAR(200),
     source_name           VARCHAR(100),

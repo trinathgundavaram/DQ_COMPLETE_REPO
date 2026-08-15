@@ -53,7 +53,7 @@ def _conn():
 
     conn.execute("""
         CREATE TABLE gre_exceptions (
-            record_id BIGINT, run_id VARCHAR, rule_id INTEGER, table_name VARCHAR,
+            record_id BIGINT, run_id VARCHAR, rule_id INTEGER, database_name VARCHAR, table_name VARCHAR,
             element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
             batch_id VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',

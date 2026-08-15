@@ -324,6 +324,18 @@ def bulk_insert_or_skip(conn, sql: str, rows: list, chunk_size: int = None) -> i
 _TOKEN_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 
 
+def _escape_sql_literal(value) -> str:
+    """
+    Escape a value for embedding inside a single-quoted SQL string literal
+    -- doubles embedded single quotes, and treats None as an empty string.
+    Shared by _substitute_params() below (rule_sql/scope_sql/exclusion_sql
+    token substitution) and rules_engine/reporting.py's natural-key
+    tie-back query builder, so there is exactly one escaping
+    implementation, not two that could quietly drift apart.
+    """
+    return str(value if value is not None else "").replace("'", "''")
+
+
 def _find_unresolved_tokens(sql: str) -> list:
     """
     After substitution, scan for any "{name}"-shaped token still present
@@ -355,7 +367,7 @@ def _substitute_params(sql: str, params: dict) -> str:
         return sql
     resolved = sql
     for key, value in (params or {}).items():
-        resolved = resolved.replace("{%s}" % key, str(value if value is not None else "").replace("'", "''"))
+        resolved = resolved.replace("{%s}" % key, _escape_sql_literal(value))
 
     unresolved = _find_unresolved_tokens(resolved)
     if unresolved:

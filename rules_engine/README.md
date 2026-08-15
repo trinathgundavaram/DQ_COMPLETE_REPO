@@ -75,9 +75,57 @@ versa.
 | `rules.py` | `load_rules()` -- loads active `gre_rules` rows for a rule_group (+ optional `rule_variant` filter), ordered by `seq_no`. |
 | `executor.py` | `execute_rule()` -- runs one rule end-to-end: dialect guard, `run_params` substitution, single-scan evaluation (`_scan_violations`), threshold evaluation, `gre_exceptions`/`gre_results`/`gre_log` writes. |
 | `runner.py` | `run_rule_group()` -- orchestration entry point: readiness gate, checkpoint/resume, sequencing_mode-aware loop over `execute_rule()`, `gre_audit` start/finish. |
-| `reporting.py` | `get_breaches()` / `get_records_for_result()` -- thin read-only queries against `gre_results`/`gre_exceptions`. |
+| `reporting.py` | `get_breaches()` / `get_records_for_result()` -- thin read-only queries against `gre_results`/`gre_exceptions`. `get_source_records_for_rule()` -- ties `gre_exceptions` back to the live source record (see "Tying exceptions back to source records" below). |
 | `schema.sql` | `gre_rules`, `gre_log`, `gre_exceptions`, `gre_case`, `gre_results`. Deploy after `shared/schema.sql`. |
 | `schema_drop.sql` | Drops the 5 tables above, for the drop-and-recreate redeploy policy (see the repo root README). |
+
+## Tying exceptions back to source records
+
+A row can fail every rule in a `rule_group`. `gre_exceptions` deliberately
+does **not** store the violating row's own data -- if it did, a row
+failing 10 rules would get its full column set captured 10 times, once
+per rule, purely because the same source data is already sitting right
+there in the source table. Instead each `gre_exceptions` row keeps only
+enough to re-identify it: `database_name`/`table_name`/`source_name`
+(copied from the rule at write time) plus a `natural_key_value` built
+from `rule['natural_key_columns']` (`"col1=val1|col2=val2"`, via
+`executor.py`'s `build_natural_key()`/`_format_natural_key()`).
+
+`reporting.py`'s `get_source_records_for_rule(cf, meta_conn, meta_db,
+rule_id, batch_id)` does the tie-back the other way, lazily, at
+report/analysis time -- "pull the 50 records that failed rule 1" for a
+dashboard, an analyst review, or a downstream share-out:
+
+```python
+from rules_engine.reporting import get_source_records_for_rule
+
+records = get_source_records_for_rule(cf, meta_conn, "CMSUNIV_FILELAND_DEV_T",
+                                       rule_id=1, batch_id="BATCH_2026_08_14")
+```
+
+It queries the current-version (`etl_is_curr_ind = 'Y'`) `gre_exceptions`
+rows for that `(rule_id, batch_id)`, parses each `natural_key_value` back
+into column/value pairs (`executor.py`'s `parse_natural_key()`), and
+re-joins to the LIVE source table in `EXCEPTION_CHUNK`-sized batches (the
+same chunk size `bulk_insert_or_skip()` uses) via the same
+`ConnectionFactory` every rule run already uses -- a single-column key
+becomes `col IN (...)`, a composite key becomes an `OR` of per-record
+`AND`s (no portable cross-dialect multi-column `IN`). Each returned dict
+is the source row's own columns, plus this finding's context under
+underscore-prefixed keys that can't collide with a real source column:
+`_record_id`, `_rule_id`, `_natural_key_value`, `_issue_desc`,
+`_exception_flag`.
+
+This is a **live** re-join, not a point-in-time snapshot: it reflects the
+source table's current state, so a record corrected or deleted upstream
+since the rule ran may come back with updated data, or not come back at
+all (logged at `INFO`, not raised, since that's expected drift rather
+than an error). That trade-off is accepted in exchange for never
+duplicating source data into `gre_exceptions` in the first place. A
+one-row-fails-N-rules scenario still produces N independent
+`gre_exceptions` rows (one per rule, required for per-rule reporting) but
+each is a single small row, and each ties back independently to the
+*same* underlying source record rather than N copies of it.
 
 ## Big-dataset path
 
