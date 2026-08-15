@@ -3,23 +3,43 @@ rules_engine/runner.py
 -------------------------
 Orchestration entry point: run_rule_group(rule_group, batch_id, ...).
 
-Deliberately NOT a thread pool and NOT a dependency graph -- both are
-explicitly out of scope for this engine (see the prompt's CODE STYLE
-section). This is a single-threaded loop: batch-readiness gate, checkpoint/
-resume, then a sequencing_mode-aware pass over the rules, calling
+Single-threaded, sequential rule execution is still the DEFAULT and
+requires zero config: a batch-readiness gate, checkpoint/resume, then a
+sequencing_mode-aware pass over the rules, calling
 rules_engine/executor.py::execute_rule() once per rule. Every rule commits
 its own findings independently -- this file only ever decides run ORDER,
-never commit/rollback.
+never commit/rollback. A dependency graph between rules is still out of
+scope.
+
+Parallel execution (opt-in)
+-------------------------------
+Raising GRE_MAX_PARALLEL_RULES above its default of 1 (see
+shared/config.py) turns on a second path, used ONLY for
+sequencing_mode='independent' groups: rules run concurrently across a
+bounded thread pool, with per-connection concurrency additionally capped
+by DQ_<NAME>_MAX_PARALLEL so a source system that can't tolerate much
+concurrent load (e.g. an OLTP Postgres source, vs. a Teradata warehouse)
+isn't hit harder just because the group-wide worker count went up. See
+rules_engine/parallel.py's module docstring for the connection-pooling
+mechanics, and _run_pending_parallel() below for how it plugs into this
+file's existing checkpoint/resume and gre_audit bookkeeping.
+
+sequencing_mode='sequential' groups NEVER take this path, regardless of
+GRE_MAX_PARALLEL_RULES -- their whole point is a guaranteed run ORDER plus
+on_failure=halt_group support, both of which are meaningless once rules
+can finish out of order.
 """
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from shared import config as gre_config
 from shared.db_ops import execute_query, execute_dml, build_run_params
 from rules_engine.rules import load_rules
 from rules_engine.executor import execute_rule, _log_error, _log_attempt
+from rules_engine.parallel import build_pools, close_pools
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +95,151 @@ def _finish_audit(meta_conn, meta_db: str, run_id: str, status: str,
         SET ended_at = ?, status = ?, rules_succeeded = ?, rules_errored = ?
         WHERE run_id = ?
     """, [datetime.now(), status, rules_succeeded, rules_errored, run_id])
+
+
+# ---------------------------------------------------------------------------
+# Parallel execution (sequencing_mode='independent' only -- see module docstring)
+# ---------------------------------------------------------------------------
+
+def _run_one_pending_rule(rule, source_pools, meta_pool, meta_db, run_id, batch_id, resolved_params, total_cache):
+    """
+    One rule's worth of the ThreadPoolExecutor body -- acquire a source
+    connection AND a metadata connection from their respective pools
+    (never the single shared adapter cf.get() would hand back; see
+    rules_engine/parallel.py's module docstring for why), run it through
+    the exact same execute_rule() every rule goes through either way, then
+    return both connections to their pools no matter what.
+
+    A rule whose source connection pool never built even one adapter
+    (source_pools[name].available is False) is handled by the caller
+    BEFORE this function is ever invoked for that rule -- see
+    _run_pending_parallel() below -- so by the time this runs, both pools
+    passed in are guaranteed usable.
+    """
+    source_pool = source_pools[rule["source_connection"]]
+    db_conn = source_pool.acquire()
+    worker_meta_conn = meta_pool.acquire()
+    try:
+        status = execute_rule(rule, db_conn, worker_meta_conn, run_id, resolved_params, meta_db,
+                              total_cache=total_cache)
+    finally:
+        source_pool.release(db_conn)
+        meta_pool.release(worker_meta_conn)
+    return rule["rule_id"], status
+
+
+def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, batch_id, resolved_params,
+                          total_cache, max_workers):
+    """
+    The parallel counterpart to run_rule_group()'s default sequential
+    for-loop, used only when sequencing_mode='independent' and
+    GRE_MAX_PARALLEL_RULES > 1 (see the module docstring). Mirrors that
+    loop's behavior rule-for-rule -- same CONNECTION_UNAVAILABLE handling,
+    same results dict, same succeeded/errored counts -- just fanned out
+    across a bounded thread pool instead of run one at a time.
+
+    total_cache (shared, plain dict) is passed straight through to every
+    concurrent execute_rule() call exactly as it is in the sequential
+    path. Plain dict get/set/contains are atomic under the GIL, so this
+    never corrupts -- the one accepted trade-off is that two rules racing
+    to compute the SAME cache key (identical database_name/table_name/
+    run_params) for the first time can, rarely, both run the identical
+    COUNT(*) query before either has written the result. Both write the
+    same correct value either way, so this is a harmless, self-resolving
+    duplicate query on a narrow timing window, not a correctness issue --
+    accepted here rather than adding lock-guarded memoization to
+    executor.py::_compute_total() for what would only ever save one
+    redundant query per cache key per run, at most.
+
+    halt_group/on_failure is never consulted here, same as the sequential
+    loop already does for 'independent' mode today -- see run_rule_group().
+
+    Every pooled connection (source AND meta -- see rules_engine/
+    parallel.py) is closed in the finally block below before this
+    function returns, regardless of how the run ended.
+    """
+    results = {}
+    succeeded = 0
+    errored = 0
+
+    unavailable = []
+    runnable = []
+    source_names = set()
+    for rule in pending:
+        source_names.add(rule["source_connection"])
+
+    source_pools = build_pools(cf, source_names, max_workers)
+    meta_pool = build_pools(cf, {gre_config.get_meta_connection_name()}, max_workers)[
+        gre_config.get_meta_connection_name()
+    ]
+
+    try:
+        # meta_pool failing to build even one connection is a harder stop
+        # than a single source being unavailable: EVERY runnable rule
+        # writes through it, and nothing can safely fall back to sharing
+        # the single top-level `meta_conn` across concurrent workers (the
+        # exact hazard this whole pooling design exists to avoid -- see
+        # rules_engine/parallel.py's module docstring). Fail every pending
+        # rule closed rather than acquire()-ing on an empty pool forever.
+        if not meta_pool.available:
+            logger.error(
+                "Metadata connection '%s' could not be pooled for parallel execution "
+                "(GRE_MAX_PARALLEL_RULES=%d) -- logging all %d pending rule(s) as ERROR.",
+                gre_config.get_meta_connection_name(), max_workers, len(pending),
+            )
+            for rule in pending:
+                _log_error(meta_conn, meta_db, run_id, rule, batch_id,
+                           "CONNECTION_UNAVAILABLE",
+                           f"No pooled connection '{gre_config.get_meta_connection_name()}' for parallel execution")
+                _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, time.time(),
+                            f"No pooled connection '{gre_config.get_meta_connection_name()}' for parallel execution")
+                results[rule["rule_id"]] = "ERROR"
+                errored += 1
+            return results, succeeded, errored
+
+        for rule in pending:
+            if source_pools[rule["source_connection"]].available:
+                runnable.append(rule)
+            else:
+                unavailable.append(rule)
+
+        for rule in unavailable:
+            logger.error(
+                "rule_id=%s: source_connection '%s' unavailable -- logging as ERROR.",
+                rule["rule_id"], rule["source_connection"],
+            )
+            _log_error(meta_conn, meta_db, run_id, rule, batch_id,
+                       "CONNECTION_UNAVAILABLE", f"No connection '{rule['source_connection']}'")
+            _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, time.time(),
+                        f"No connection '{rule['source_connection']}'")
+            results[rule["rule_id"]] = "ERROR"
+            errored += 1
+
+        if runnable:
+            logger.info(
+                "Running %d rule(s) in parallel (max_workers=%d) -- source connection(s): %s",
+                len(runnable), max_workers, ", ".join(sorted(source_names)),
+            )
+            with ThreadPoolExecutor(max_workers=max_workers) as pool_exec:
+                futures = [
+                    pool_exec.submit(
+                        _run_one_pending_rule, rule, source_pools, meta_pool, meta_db,
+                        run_id, batch_id, resolved_params, total_cache,
+                    )
+                    for rule in runnable
+                ]
+                for future in as_completed(futures):
+                    rule_id, status = future.result()
+                    results[rule_id] = status
+                    if status == "SUCCESS":
+                        succeeded += 1
+                    else:
+                        errored += 1
+    finally:
+        close_pools(source_pools)
+        close_pools({gre_config.get_meta_connection_name(): meta_pool})
+
+    return results, succeeded, errored
 
 
 # ---------------------------------------------------------------------------
@@ -191,40 +356,52 @@ def run_rule_group(
     # rules_engine/executor.py::_compute_total()'s docstring.
     total_cache = {}
 
-    for rule in pending:
-        db_conn = cf.get(rule["source_connection"])
-        if db_conn is None:
-            logger.error(
-                "rule_id=%s: source_connection '%s' unavailable -- logging as ERROR.",
-                rule["rule_id"], rule["source_connection"],
-            )
-            _log_error(meta_conn, meta_db, run_id, rule, batch_id,
-                       "CONNECTION_UNAVAILABLE", f"No connection '{rule['source_connection']}'")
-            _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, time.time(),
-                        f"No connection '{rule['source_connection']}'")
-            status = "ERROR"
-        else:
-            status = execute_rule(rule, db_conn, meta_conn, run_id, resolved_params, meta_db,
-                                  total_cache=total_cache)
+    # Parallel path only ever applies to 'independent' groups (see the
+    # module docstring) -- 'sequential' groups always take the loop below,
+    # unchanged, regardless of GRE_MAX_PARALLEL_RULES.
+    max_workers = min(gre_config.get_max_parallel_rules(), len(pending)) if pending else 1
+    use_parallel = sequencing_mode == "independent" and max_workers > 1
 
-        results[rule["rule_id"]] = status
+    if use_parallel:
+        results, succeeded, errored = _run_pending_parallel(
+            pending, cf, meta_conn, meta_db, run_id, batch_id, resolved_params,
+            total_cache, max_workers,
+        )
+    else:
+        for rule in pending:
+            db_conn = cf.get(rule["source_connection"])
+            if db_conn is None:
+                logger.error(
+                    "rule_id=%s: source_connection '%s' unavailable -- logging as ERROR.",
+                    rule["rule_id"], rule["source_connection"],
+                )
+                _log_error(meta_conn, meta_db, run_id, rule, batch_id,
+                           "CONNECTION_UNAVAILABLE", f"No connection '{rule['source_connection']}'")
+                _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, time.time(),
+                            f"No connection '{rule['source_connection']}'")
+                status = "ERROR"
+            else:
+                status = execute_rule(rule, db_conn, meta_conn, run_id, resolved_params, meta_db,
+                                      total_cache=total_cache)
 
-        if status == "SUCCESS":
-            succeeded += 1
-        else:
-            errored += 1
-            if sequencing_mode == "sequential":
-                on_failure = (rule.get("on_failure") or "skip_and_continue").lower()
-                if on_failure == "halt_group":
-                    logger.warning(
-                        "rule_id=%s errored with on_failure=halt_group -- "
-                        "stopping further rules in group=%s for run=%s. "
-                        "Already-committed findings from prior rules are untouched.",
-                        rule["rule_id"], rule_group, run_id,
-                    )
-                    halted = True
-                    break
-                # skip_and_continue: error already logged to gre_errors by execute_rule(); keep going.
+            results[rule["rule_id"]] = status
+
+            if status == "SUCCESS":
+                succeeded += 1
+            else:
+                errored += 1
+                if sequencing_mode == "sequential":
+                    on_failure = (rule.get("on_failure") or "skip_and_continue").lower()
+                    if on_failure == "halt_group":
+                        logger.warning(
+                            "rule_id=%s errored with on_failure=halt_group -- "
+                            "stopping further rules in group=%s for run=%s. "
+                            "Already-committed findings from prior rules are untouched.",
+                            rule["rule_id"], rule_group, run_id,
+                        )
+                        halted = True
+                        break
+                    # skip_and_continue: error already logged to gre_errors by execute_rule(); keep going.
 
     final_status = "HALTED" if halted else "COMPLETED"
     _finish_audit(meta_conn, meta_db, run_id, final_status, succeeded, errored)

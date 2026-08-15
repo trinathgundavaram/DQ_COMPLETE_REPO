@@ -120,6 +120,58 @@ def get_meta_db() -> str:
     return META_DB
 
 
+# ── Parallel rule execution (opt-in; see rules_engine/parallel.py) ────────
+# runner.py's default is, and has always been, a single-threaded loop over
+# rules_engine/executor.py::execute_rule() -- see run_rule_group()'s own
+# docstring. These two settings are the ONLY way that changes, and only
+# for sequencing_mode='independent' groups (a 'sequential' group's ordering
+# and on_failure=halt_group semantics are incompatible with running rules
+# out of order, so it never parallelizes regardless of these values).
+#
+# GRE_MAX_PARALLEL_RULES caps how many rules in one group may execute
+# concurrently at all. DQ_<NAME>_MAX_PARALLEL further caps how many of
+# those concurrent rules may simultaneously hold an open session against
+# one specific named connection (e.g. a Postgres OLTP source that can't
+# tolerate as much concurrent load as the Teradata warehouse) -- the two
+# caps compose: a rule_group with GRE_MAX_PARALLEL_RULES=8 where 6 of its
+# rules target a Postgres connection capped at DQ_CLAIMS_PG_MAX_PARALLEL=2
+# still only ever has 2 of those 6 running against Postgres at once, even
+# though up to 8 rules total may be in flight across every source.
+#
+# Both default to 1 -- i.e. off, matching today's behavior exactly with no
+# config changes required. A connection needs an explicit opt-in
+# (DQ_<NAME>_MAX_PARALLEL > 1) before the engine will ever open more than
+# one concurrent session against it, specifically so raising the group-wide
+# cap alone can never silently increase load on a source that wasn't sized
+# for it.
+#
+# These live here (not in db/connection_factory.py, alongside the other
+# per-connection DQ_<NAME>_* settings it already reads) because that file
+# and db/adapters.py are the two files this project is explicitly allowed
+# to REUSE from the dq_* engine but never MODIFY -- see the repo root
+# README's reuse policy, and rules_engine/parallel.py's module docstring
+# for how a connection's cap is honored without connection_factory.py
+# needing to know parallelism is a concept at all.
+def get_max_parallel_rules() -> int:
+    """
+    GRE_MAX_PARALLEL_RULES -- max rules that may execute concurrently
+    within one run_rule_group() call. Default 1 (no parallelism).
+    """
+    return max(1, int(os.getenv("GRE_MAX_PARALLEL_RULES", "1")))
+
+
+def get_max_parallel_for_connection(name: str) -> int:
+    """
+    DQ_<NAME>_MAX_PARALLEL -- how many concurrent sessions the named
+    connection `name` may serve during a parallel run. Default 1 (that
+    connection is never given more than one concurrent session, even if
+    GRE_MAX_PARALLEL_RULES is raised) -- same DQ_<NAME>_* naming
+    convention db/connection_factory.py already uses for
+    DQ_<NAME>_TYPE/DQ_<NAME>_HOST/etc.
+    """
+    return max(1, int(os.getenv(f"DQ_{name.upper()}_MAX_PARALLEL", "1")))
+
+
 # ── Batch-readiness precondition (deferred; see module docstring) ─────────
 _READINESS_CHECKS: Dict[str, Callable[[str, object], bool]] = {}
 

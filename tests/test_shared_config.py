@@ -106,6 +106,40 @@ def test_get_meta_connection_and_db_env_overrides(monkeypatch, reload_config):
     assert module.get_meta_db() == "OTHER_DB"
 
 
+def test_get_max_parallel_rules_default_is_one():
+    assert shared_config.get_max_parallel_rules() == 1
+
+
+def test_get_max_parallel_rules_env_override(monkeypatch):
+    monkeypatch.setenv("GRE_MAX_PARALLEL_RULES", "8")
+    assert shared_config.get_max_parallel_rules() == 8
+
+
+def test_get_max_parallel_rules_never_below_one(monkeypatch):
+    # A misconfigured 0 or negative value must not disable the engine entirely.
+    monkeypatch.setenv("GRE_MAX_PARALLEL_RULES", "0")
+    assert shared_config.get_max_parallel_rules() == 1
+    monkeypatch.setenv("GRE_MAX_PARALLEL_RULES", "-3")
+    assert shared_config.get_max_parallel_rules() == 1
+
+
+def test_get_max_parallel_for_connection_default_is_one():
+    assert shared_config.get_max_parallel_for_connection("claims_pg") == 1
+
+
+def test_get_max_parallel_for_connection_env_override(monkeypatch):
+    monkeypatch.setenv("DQ_CLAIMS_PG_MAX_PARALLEL", "3")
+    assert shared_config.get_max_parallel_for_connection("claims_pg") == 3
+    # Case-insensitive connection name, same as DQ_<NAME>_TYPE elsewhere.
+    assert shared_config.get_max_parallel_for_connection("CLAIMS_PG") == 3
+
+
+def test_get_max_parallel_for_connection_is_independent_per_name(monkeypatch):
+    monkeypatch.setenv("DQ_TERADATA_MAX_PARALLEL", "10")
+    assert shared_config.get_max_parallel_for_connection("teradata") == 10
+    assert shared_config.get_max_parallel_for_connection("some_other_conn") == 1
+
+
 def test_check_batch_ready_defaults_true_when_unregistered():
     assert shared_config.check_batch_ready("some_unregistered_group", "batch_1") is True
 

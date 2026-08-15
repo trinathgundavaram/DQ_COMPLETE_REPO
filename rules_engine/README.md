@@ -74,10 +74,63 @@ versa.
 |---|---|
 | `rules.py` | `load_rules()` -- loads active `gre_rules` rows for a rule_group (+ optional `rule_variant` filter), ordered by `seq_no`. |
 | `executor.py` | `execute_rule()` -- runs one rule end-to-end: dialect guard, `run_params` substitution, single-scan evaluation (`_scan_violations`), threshold evaluation, `gre_exceptions`/`gre_results`/`gre_log` writes. |
-| `runner.py` | `run_rule_group()` -- orchestration entry point: readiness gate, checkpoint/resume, sequencing_mode-aware loop over `execute_rule()`, `gre_audit` start/finish. |
+| `runner.py` | `run_rule_group()` -- orchestration entry point: readiness gate, checkpoint/resume, sequencing_mode-aware loop over `execute_rule()`, `gre_audit` start/finish. Also the opt-in parallel path (`_run_pending_parallel()`) -- see "Parallel rule execution" below. |
+| `parallel.py` | `ConnectionPool`/`build_pools()`/`close_pools()` -- the bounded per-connection connection pooling the parallel path uses instead of the single shared `cf.get()` connection. |
 | `reporting.py` | `get_breaches()` / `get_records_for_result()` -- thin read-only queries against `gre_results`/`gre_exceptions`. `get_source_records_for_rule()` -- ties `gre_exceptions` back to the live source record (see "Tying exceptions back to source records" below). |
 | `schema.sql` | `gre_rules`, `gre_log`, `gre_exceptions`, `gre_case`, `gre_results`. Deploy after `shared/schema.sql`. |
 | `schema_drop.sql` | Drops the 5 tables above, for the drop-and-recreate redeploy policy (see the repo root README). |
+
+## Parallel rule execution (opt-in)
+
+`run_rule_group()` is single-threaded by default and requires zero config
+-- one rule at a time, in the order `load_rules()` returns them. Setting
+`GRE_MAX_PARALLEL_RULES` above its default of `1` turns on a second path,
+used ONLY for `sequencing_mode='independent'` groups:
+
+```
+GRE_MAX_PARALLEL_RULES=4          # up to 4 rules executing concurrently
+DQ_CLAIMS_PG_MAX_PARALLEL=2       # but never more than 2 of those hitting claims_pg at once
+DQ_TERADATA_MAX_PARALLEL=8        # the warehouse can take more concurrent load
+```
+
+The two settings compose: `GRE_MAX_PARALLEL_RULES` caps how many rules in
+a group may run at the same time at all; `DQ_<NAME>_MAX_PARALLEL` (same
+naming convention `db/connection_factory.py` already uses for
+`DQ_<NAME>_TYPE`/`DQ_<NAME>_HOST`) further caps how many of those
+concurrently-running rules may simultaneously hold a session against one
+*specific* named connection. Both default to `1`, so raising the
+group-wide cap alone changes nothing for a connection until that
+connection's own cap is raised too -- a source system that wasn't sized
+for concurrent load never gets hit harder just because a `rule_group`'s
+worker count went up.
+
+`sequencing_mode='sequential'` groups never take this path, regardless of
+either setting -- their entire purpose (a guaranteed run order, plus
+`on_failure=halt_group` support) is incompatible with rules finishing out
+of order.
+
+**How it stays safe to run concurrently.** The single shared connection
+`cf.get(name)` normally hands back (reused for the whole run in the
+sequential path -- see the earlier discussion in this README, or ask the
+engine to explain its own connection lifecycle) is NOT safe for two
+threads to query at once. So the parallel path never uses `cf.get()` for
+a connection a worker will run a query on; `rules_engine/parallel.py`'s
+`ConnectionPool` instead builds up to `DQ_<NAME>_MAX_PARALLEL` genuinely
+independent connections per name via `cf.new_connection()` -- capped by
+`GRE_MAX_PARALLEL_RULES` too, so a pool is never sized larger than the
+group could ever use concurrently -- and hands them out through a
+blocking queue, whose `get()` is what actually enforces the per-connection
+cap. This applies to the metadata connection too: every worker gets its
+own pooled connection for writing to `gre_exceptions`/`gre_results`/
+`gre_log`, not the single connection the top-level run uses for
+`gre_audit` bookkeeping. Every pooled connection is closed once the group
+finishes, win or lose.
+
+A connection that can't be pooled at all (unconfigured, or every build
+attempt fails) fails every rule that needs it closed -- `ERROR` /
+`CONNECTION_UNAVAILABLE`, logged the same way the sequential path already
+handles a missing connection -- rather than blocking forever waiting for a
+connection that will never arrive.
 
 ## Tying exceptions back to source records
 

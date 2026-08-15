@@ -9,6 +9,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import duckdb
+import pytest
 
 import rules_engine.executor as rules_engine_executor
 from rules_engine.runner import run_rule_group
@@ -24,6 +25,36 @@ class _FakeConnectionFactory:
 
     def get(self, name):
         return self._conn
+
+    def new_connection(self, name):
+        # A fresh DuckDB cursor sharing the same in-memory database -- this
+        # is DuckDB's own documented way to get independent,
+        # concurrency-safe connections to one database from multiple
+        # threads, standing in here for what ConnectionFactory.
+        # new_connection() does for a real adapter (build a genuinely
+        # separate connection, not hand back the single shared one).
+        return self._conn.cursor()
+
+
+class _CountingFakeConnectionFactory(_FakeConnectionFactory):
+    """
+    Tracks new_connection() calls per name (for asserting pool sizing),
+    and can simulate a connection that's unavailable altogether
+    (max_builds={"name": 0}) or has limited capacity (max_builds={"name": N})
+    -- used by the parallel-execution tests below.
+    """
+    def __init__(self, conn, max_builds=None):
+        super().__init__(conn)
+        self.calls = {}
+        self.max_builds = max_builds or {}
+
+    def new_connection(self, name):
+        n = self.calls.get(name, 0)
+        self.calls[name] = n + 1
+        limit = self.max_builds.get(name)
+        if limit is not None and n >= limit:
+            return None
+        return super().new_connection(name)
 
 
 def _conn():
@@ -302,3 +333,182 @@ def test_run_params_stray_batch_id_key_never_overrides_the_real_one():
     # build_run_params() let the dedicated batch_id argument win.
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
     assert len(exceptions) == 2
+
+
+# ── Parallel execution (opt-in via GRE_MAX_PARALLEL_RULES) ──────────────
+# All source_connection values below are still "duckdb_test" -- _insert_rule's
+# default -- so _CountingFakeConnectionFactory.calls["duckdb_test"] counts
+# every new_connection() call made for the SOURCE side across a run; the
+# meta side is counted separately under get_meta_connection_name()'s value
+# ("teradata", shared.config's default -- these tests never override
+# GRE_META_CONNECTION).
+from shared import config as gre_config  # noqa: E402  (grouped with this section deliberately)
+
+_META_NAME = gre_config.get_meta_connection_name()
+
+
+def test_parallel_disabled_by_default_uses_sequential_path(monkeypatch):
+    # No GRE_MAX_PARALLEL_RULES set -- default is 1, so even 3 independent
+    # rules must take the existing single-threaded loop untouched. Proven
+    # here by new_connection() never being called at all: the sequential
+    # path only ever uses cf.get(), never cf.new_connection().
+    conn = _conn()
+    cf = _CountingFakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, sequencing_mode="independent")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="independent")
+    _insert_rule(conn, 3, _MISSING_REASON_SQL, seq_no=30, sequencing_mode="independent")
+
+    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+
+    assert summary["status"] == "COMPLETED"
+    assert summary["succeeded"] == 3
+    assert cf.calls == {}   # new_connection() never touched -- confirms sequential path
+
+
+def test_parallel_enabled_runs_every_independent_rule(monkeypatch):
+    monkeypatch.setenv("GRE_MAX_PARALLEL_RULES", "4")
+    conn = _conn()
+    cf = _CountingFakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, sequencing_mode="independent")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="independent")
+    _insert_rule(conn, 3, _BROKEN_SQL, seq_no=30, sequencing_mode="independent")
+
+    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+
+    assert summary["status"] == "COMPLETED"
+    assert summary["results"] == {1: "SUCCESS", 2: "SUCCESS", 3: "ERROR"}
+    assert summary["succeeded"] == 2
+    assert summary["errored"] == 1
+    # Findings actually landed -- the parallel path commits through real
+    # (pooled) connections, not a no-op.
+    exceptions = execute_query(conn, "SELECT rule_id FROM gre_exceptions WHERE batch_id = 'B1'")
+    assert {r["rule_id"] for r in exceptions} == {1, 2}
+    # The pool did open independent connections this time (both source and
+    # meta side), proving the parallel path was actually taken.
+    assert cf.calls.get("duckdb_test", 0) > 0
+    assert cf.calls.get(_META_NAME, 0) > 0
+
+
+def test_parallel_never_applies_to_sequential_mode_even_when_enabled(monkeypatch):
+    # Same halt_group scenario as test_sequential_halt_group_stops_before_next_rule,
+    # but with parallelism turned way up -- must behave IDENTICALLY, proving
+    # sequencing_mode='sequential' never takes the parallel path.
+    monkeypatch.setenv("GRE_MAX_PARALLEL_RULES", "8")
+    conn = _conn()
+    cf = _CountingFakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _BROKEN_SQL, seq_no=10, sequencing_mode="sequential", on_failure="halt_group")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="sequential", on_failure="halt_group")
+
+    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+
+    assert summary["status"] == "HALTED"
+    assert summary["results"][1] == "ERROR"
+    assert 2 not in summary["results"]          # rule 2 was never started
+    assert cf.calls == {}                        # sequential path -- pools never built
+
+
+def test_parallel_source_connection_unavailable_marks_rule_error_without_deadlock(monkeypatch):
+    monkeypatch.setenv("GRE_MAX_PARALLEL_RULES", "4")
+    conn = _conn()
+    # duckdb_test can never build even one connection -- every rule using it
+    # must come back ERROR/CONNECTION_UNAVAILABLE, same as the sequential
+    # path's db_conn is None branch, and the run must still complete (not hang).
+    cf = _CountingFakeConnectionFactory(conn, max_builds={"duckdb_test": 0})
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, sequencing_mode="independent")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="independent")
+
+    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+
+    assert summary["status"] == "COMPLETED"
+    assert summary["results"] == {1: "ERROR", 2: "ERROR"}
+    errors = execute_query(conn, "SELECT * FROM gre_errors WHERE error_type = 'CONNECTION_UNAVAILABLE'")
+    assert len(errors) == 2
+
+
+def test_parallel_meta_connection_unavailable_fails_every_rule_without_deadlock(monkeypatch):
+    monkeypatch.setenv("GRE_MAX_PARALLEL_RULES", "4")
+    conn = _conn()
+    # The metadata connection itself can't be pooled -- every pending rule
+    # must fail closed (via the top-level shared meta_conn, which is still
+    # fine to use for THIS particular write) rather than block forever
+    # waiting on an empty meta connection pool.
+    cf = _CountingFakeConnectionFactory(conn, max_builds={_META_NAME: 0})
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, sequencing_mode="independent")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="independent")
+
+    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+
+    assert summary["status"] == "COMPLETED"
+    assert summary["results"] == {1: "ERROR", 2: "ERROR"}
+
+
+def test_parallel_respects_per_connection_max_parallel_cap(monkeypatch):
+    monkeypatch.setenv("GRE_MAX_PARALLEL_RULES", "6")
+    monkeypatch.setenv("DQ_DUCKDB_TEST_MAX_PARALLEL", "2")   # cap this source at 2 concurrent sessions
+    conn = _conn()
+    cf = _CountingFakeConnectionFactory(conn)
+    for rule_id, seq_no in [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]:
+        _insert_rule(conn, rule_id, _MISSING_REASON_SQL, seq_no=seq_no, sequencing_mode="independent")
+
+    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+
+    assert summary["status"] == "COMPLETED"
+    assert summary["succeeded"] == 5
+    # Only 2 source connections were ever built for 'duckdb_test', even
+    # though 5 rules ran and GRE_MAX_PARALLEL_RULES allowed 6 concurrent --
+    # proves DQ_<NAME>_MAX_PARALLEL, not just the group-wide cap, bounds
+    # how many sessions land on one connection.
+    assert cf.calls["duckdb_test"] == 2
+
+
+def test_parallel_closes_pooled_connections_after_the_run(monkeypatch):
+    monkeypatch.setenv("GRE_MAX_PARALLEL_RULES", "4")
+    conn = _conn()
+    cf = _CountingFakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, sequencing_mode="independent")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="independent")
+
+    # Wrap new_connection() to track every cursor it hands out, so we can
+    # assert they were all closed once the run finishes.
+    issued = []
+    original_new_connection = cf.new_connection
+
+    def tracking(name):
+        adapter = original_new_connection(name)
+        if adapter is not None:
+            issued.append(adapter)
+        return adapter
+
+    cf.new_connection = tracking
+
+    run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+
+    assert len(issued) > 0
+    for cursor in issued:
+        # A closed DuckDB cursor raises on further use -- this is the
+        # simplest reliable "was it actually closed" check available.
+        with pytest.raises(Exception):
+            cursor.execute("SELECT 1")
+
+
+def test_parallel_shared_total_cache_still_avoids_redundant_count_queries(monkeypatch):
+    # Same scenario as test_shared_total_cache_avoids_redundant_count_queries_across_rules,
+    # run through the parallel path instead -- the shared total_cache dict
+    # is passed to every concurrent execute_rule() call exactly as it is
+    # sequentially (see _run_pending_parallel()'s docstring for the
+    # accepted narrow-race trade-off this makes).
+    monkeypatch.setenv("GRE_MAX_PARALLEL_RULES", "4")
+    conn = _conn()
+    cf = _CountingFakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, sequencing_mode="independent")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="independent")
+    conn.execute("UPDATE gre_rules SET threshold_pct = 0")
+
+    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+
+    assert summary["status"] == "COMPLETED"
+    results = execute_query(conn, "SELECT rule_id, total_records FROM gre_results WHERE batch_id = 'B1'")
+    # Regardless of any redundant-query race, both rules must still report
+    # the correct total -- that's the actual correctness guarantee; the
+    # redundant-query count itself isn't asserted since it's timing-dependent.
+    assert {r["rule_id"]: r["total_records"] for r in results} == {1: 4, 2: 4}
