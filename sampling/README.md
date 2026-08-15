@@ -30,6 +30,26 @@ and the `gre_audit`/`gre_errors` tables).
 | `schema_drop.sql` | Drops the 5 tables above, for the drop-and-recreate redeploy policy (see the repo root README). |
 | `seed/um_sample.sql` | The original COMO weekly UM sample (`dq_sampling_config.config_id=1`) re-expressed in this schema -- also the regression fixture `tests/test_sampling.py` checks against. |
 
+## Scoping the candidate pull: `run_params`
+
+`scope_sql` and `exclusion_sql` may both embed any number of `"{key}"`
+tokens (not just `{batch_id}`) -- each run passes a `run_params` dict, and
+every matching token is substituted (quoted, escaped) before the pull
+query runs, the SAME mechanism and dict shape `rules_engine/` uses for
+`rule_sql`/`scope_sql`. `batch_id` is always present in `run_params`:
+
+```python
+result = run_sampling(
+    config_id=1, batch_id="2026-08-14", cf=cf,
+    run_params={"region": "NORTHEAST"},
+)
+```
+
+`scope_sql` defaults to `'1=1'` (whole table) if unset. An unresolved
+`"{token}"` in either `scope_sql` or `exclusion_sql` fails the pull with a
+clear `ValueError` before it reaches the source database, logged as
+`PULL_FAILURE`.
+
 ## Algorithm
 
 ```

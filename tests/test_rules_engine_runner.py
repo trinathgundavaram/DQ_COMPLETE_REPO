@@ -42,7 +42,7 @@ def _conn():
         CREATE TABLE gre_rules (
             rule_id INTEGER, rule_name VARCHAR, table_name VARCHAR,
             source_connection VARCHAR, sql_dialect VARCHAR, rule_sql VARCHAR,
-            scope_sql VARCHAR, batch_id_column VARCHAR, rule_group VARCHAR,
+            scope_sql VARCHAR, rule_group VARCHAR, rule_variant VARCHAR,
             seq_no INTEGER, sequencing_mode VARCHAR, on_failure VARCHAR,
             threshold_pct DOUBLE, threshold_count INTEGER, threshold_operator VARCHAR,
             severity VARCHAR, natural_key_columns VARCHAR, element_name VARCHAR,
@@ -93,7 +93,7 @@ def _conn():
 
     conn.execute("""
         CREATE TABLE gre_audit (
-            run_id VARCHAR, rule_group VARCHAR, batch_id VARCHAR,
+            run_id VARCHAR, rule_group VARCHAR, batch_id VARCHAR, rule_variant VARCHAR,
             started_at TIMESTAMP, ended_at TIMESTAMP, status VARCHAR,
             total_rules INTEGER, rules_succeeded INTEGER, rules_errored INTEGER,
             triggered_by VARCHAR, created_at TIMESTAMP DEFAULT current_timestamp
@@ -104,14 +104,14 @@ def _conn():
 
 
 def _insert_rule(conn, rule_id, rule_sql, seq_no, sequencing_mode="independent",
-                  on_failure="skip_and_continue", rule_group="claims_dq"):
+                  on_failure="skip_and_continue", rule_group="claims_dq", rule_variant=None):
     conn.execute("""
         INSERT INTO gre_rules (
             rule_id, rule_name, table_name, source_connection, sql_dialect, rule_sql,
-            rule_group, seq_no, sequencing_mode, on_failure, natural_key_columns,
+            rule_group, rule_variant, seq_no, sequencing_mode, on_failure, natural_key_columns,
             active_flag
-        ) VALUES (?, ?, 'claims', 'duckdb_test', 'ansi', ?, ?, ?, ?, ?, 'claim_id', 1)
-    """, [rule_id, f"rule {rule_id}", rule_sql, rule_group, seq_no, sequencing_mode, on_failure])
+        ) VALUES (?, ?, 'claims', 'duckdb_test', 'ansi', ?, ?, ?, ?, ?, ?, 'claim_id', 1)
+    """, [rule_id, f"rule {rule_id}", rule_sql, rule_group, rule_variant, seq_no, sequencing_mode, on_failure])
 
 
 _MISSING_REASON_SQL = "SELECT claim_id FROM claims WHERE denial_reason IS NULL AND batch_id = '{batch_id}'"
@@ -196,10 +196,10 @@ def test_no_rules_returns_no_rules_status():
 
 
 def test_shared_total_cache_avoids_redundant_count_queries_across_rules(monkeypatch):
-    # Two rules in the same group, same table/batch_id_column/batch_id, no
-    # scope_sql override -- they ask _compute_total() the identical
-    # question, so within one run_rule_group() call that COUNT(*) should
-    # only actually run once.
+    # Two rules in the same group, same table, no scope_sql override --
+    # they both fall to the whole-table default and ask _compute_total()
+    # the identical question, so within one run_rule_group() call that
+    # COUNT(*) should only actually run once.
     conn = _conn()
     cf = _FakeConnectionFactory(conn)
     _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10)
@@ -231,3 +231,70 @@ def test_shared_total_cache_avoids_redundant_count_queries_across_rules(monkeypa
     # value is being reused correctly, not just skipped.
     results = execute_query(conn, "SELECT rule_id, total_records FROM gre_results WHERE batch_id = 'B1'")
     assert {r["rule_id"]: r["total_records"] for r in results} == {1: 4, 2: 4}
+
+
+# ── rule_variant (additional level on top of rule_group/table) ──────────
+
+def test_rule_variant_none_requested_runs_only_universal_rules():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_variant=None)      # universal
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, rule_variant="2026")    # variant-specific
+
+    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+
+    assert summary["status"] == "COMPLETED"
+    assert summary["total_rules"] == 1
+    assert 1 in summary["results"]
+    assert 2 not in summary["results"]   # variant-specific rule not requested -> not loaded/run
+
+
+def test_rule_variant_requested_runs_universal_plus_matching_variant():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_variant=None)       # universal
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, rule_variant="2026")     # matches
+    _insert_rule(conn, 3, _MISSING_REASON_SQL, seq_no=30, rule_variant="2025")     # does NOT match
+
+    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB, rule_variant="2026")
+
+    assert summary["status"] == "COMPLETED"
+    assert summary["total_rules"] == 2
+    assert set(summary["results"].keys()) == {1, 2}
+
+    audit = execute_query(conn, "SELECT rule_variant FROM gre_audit WHERE run_id = ?", [summary["run_id"]])
+    assert audit[0]["rule_variant"] == "2026"
+
+
+# ── run_params threading (v2 scoping) ────────────────────────────────────
+
+def test_run_params_extra_key_is_available_to_every_rule_sql():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(
+        conn, 1,
+        "SELECT claim_id FROM claims WHERE denial_reason IS NULL "
+        "AND batch_id = '{batch_id}' AND '{run_type}' = 'MONTHLY'",
+        seq_no=10,
+    )
+
+    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB,
+                             run_params={"run_type": "MONTHLY"})
+
+    assert summary["status"] == "COMPLETED"
+    assert summary["results"][1] == "SUCCESS"
+
+
+def test_run_params_stray_batch_id_key_never_overrides_the_real_one():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10)
+
+    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB,
+                             run_params={"batch_id": "SOMETHING_ELSE"})
+
+    assert summary["status"] == "COMPLETED"
+    # Findings are still recorded under the REAL batch_id ('B1'), proving
+    # build_run_params() let the dedicated batch_id argument win.
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
+    assert len(exceptions) == 2

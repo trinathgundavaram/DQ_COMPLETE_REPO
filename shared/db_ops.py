@@ -20,10 +20,18 @@ anything under core/ would violate this project's scope boundary (only
 db/adapters.py and db/connection_factory.py are reusable from the dq_*
 engine this sits alongside). The patterns are intentionally the same; the
 code is not shared.
+
+Run-parameter substitution (_substitute_params / build_run_params) is the
+one mechanism both packages use to let a project scope its data however
+it needs to -- a month/year pair, a batch_id + run_type combination, a
+region/contract column, or nothing at all -- without the engine hardcoding
+any one project's notion of "scope" as a schema column. See that
+function's docstring below for the mechanics.
 """
 
 import logging
 import os
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -297,19 +305,82 @@ def bulk_insert_or_skip(conn, sql: str, rows: list, chunk_size: int = None) -> i
 
 
 # ---------------------------------------------------------------------------
-# Batch-id token substitution (v1 batch-scoping mechanism -- see
+# Run-parameter token substitution (v2 scoping mechanism -- see
 # rules_engine/schema.sql / sampling/schema.sql headers for why there's no
 # filter_column system)
 # ---------------------------------------------------------------------------
+# v1 supported exactly one substitutable value ({batch_id}), passed as a
+# scalar all the way down. Different projects scope their data differently
+# -- a month/year pair, a batch_id + run_type combination, a region or
+# contract column, or no filter at all -- so v2 generalizes this to an
+# arbitrary dict of named values: a rule/config author embeds whichever
+# "{key}" tokens their SQL needs, and the caller supplies a matching dict
+# at run time. batch_id remains a required, always-present key (see
+# build_run_params() below) since it's still the one value the
+# idempotency/checkpoint schema (gre_exceptions_uix, gre_log, gre_audit,
+# sample_run_id) keys off -- but it is no longer the ONLY value a rule can
+# reference.
 
-def _substitute_batch_id(sql: str, batch_id: str) -> str:
+_TOKEN_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+
+
+def _find_unresolved_tokens(sql: str) -> list:
     """
-    Replace every literal "{batch_id}" token in `sql` with the escaped
-    batch_id value. Rule/config authors are responsible for their own
-    quoting (e.g. `WHERE batch_id = '{batch_id}'`) -- this only does the
-    swap.
+    After substitution, scan for any "{name}"-shaped token still present
+    -- almost always a param the caller forgot to pass (or a typo in the
+    rule/config's SQL), which would otherwise surface as a confusing SQL
+    syntax error from the source database instead of a clear, specific,
+    pre-execution one. Deliberately simple (a bare identifier in braces,
+    not a full templating grammar) since that's the only shape this
+    substitution mechanism ever produces or consumes.
     """
-    return sql.replace("{batch_id}", (batch_id or "").replace("'", "''"))
+    return _TOKEN_RE.findall(sql)
+
+
+def _substitute_params(sql: str, params: dict) -> str:
+    """
+    Replace every literal "{key}" token in `sql` with the escaped string
+    value of params[key], for every key present in `params`. Rule/config
+    authors are responsible for their own quoting (e.g.
+    `WHERE batch_id = '{batch_id}'`) -- this only does the swap.
+
+    Raises ValueError if, after substitution, any "{token}"-shaped text
+    remains -- fail fast with a clear message naming the missing
+    parameter(s), rather than letting an unsubstituted token reach the
+    database as a syntax error. `sql` may be None/empty (returns it
+    unchanged) so callers don't need to guard optional CLOB columns
+    (scope_sql, exclusion_sql) themselves.
+    """
+    if not sql:
+        return sql
+    resolved = sql
+    for key, value in (params or {}).items():
+        resolved = resolved.replace("{%s}" % key, str(value if value is not None else "").replace("'", "''"))
+
+    unresolved = _find_unresolved_tokens(resolved)
+    if unresolved:
+        raise ValueError(
+            f"Unresolved parameter token(s) {sorted(set(unresolved))} in SQL -- "
+            f"no matching key in the run_params passed to this run. "
+            f"Params supplied: {sorted((params or {}).keys())}."
+        )
+    return resolved
+
+
+def build_run_params(batch_id: str, extra_params: dict = None) -> dict:
+    """
+    Merge an optional caller-supplied `extra_params` dict with the
+    required `batch_id` value, used identically by
+    rules_engine/runner.py::run_rule_group() and
+    sampling/sampling.py::run_sampling() -- one implementation instead of
+    two copies that could drift.
+
+    `batch_id` always wins on key collision: it's resolved from the
+    dedicated, required `batch_id` argument both entry points already
+    take (for tracking/idempotency), so a stray "batch_id" key inside
+    extra_params can never silently override it.
+    """
+    return {**(extra_params or {}), "batch_id": batch_id}
 
 
 # ---------------------------------------------------------------------------

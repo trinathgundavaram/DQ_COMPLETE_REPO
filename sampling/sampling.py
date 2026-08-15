@@ -25,10 +25,16 @@ that module hardcodes exactly two stratification levels
 Built on shared/db_ops.py + shared/config.py
 -----------------------------------------------
 The low-level DB helpers (execute_query/execute_dml/bulk_insert,
-_run_source_query, _substitute_batch_id) and the shared gre_errors writer
-(log_error) come from shared/db_ops.py -- the SAME module rules_engine/
-uses, so there is exactly one implementation of each, not two drifting
-copies. Metadata connection/db resolution comes from shared/config.py.
+_run_source_query, _substitute_params, build_run_params) and the shared
+gre_errors writer (log_error) come from shared/db_ops.py -- the SAME
+module rules_engine/ uses, so there is exactly one implementation of each,
+not two drifting copies. Metadata connection/db resolution comes from
+shared/config.py.
+
+scope_sql AND exclusion_sql both go through the same {key} run_params
+substitution as rules_engine's rule_sql/scope_sql -- see
+shared/db_ops.py::_substitute_params()'s docstring for why this is a dict
+instead of a single {batch_id} value.
 
 Algorithm
 ---------
@@ -67,7 +73,7 @@ from datetime import datetime
 
 from shared.db_ops import (
     execute_query, execute_dml, bulk_insert, log_error,
-    _run_source_query, _substitute_batch_id,
+    _run_source_query, _substitute_params, build_run_params,
 )
 
 logger = logging.getLogger(__name__)
@@ -255,7 +261,7 @@ def _stratify(candidates: list, levels: list, target: int, method: str, rounding
 # Candidate pull
 # ---------------------------------------------------------------------------
 
-def _pull_candidates(db_conn, config: dict, levels: list, batch_id: str) -> list:
+def _pull_candidates(db_conn, config: dict, levels: list, run_params: dict) -> list:
     """
     Pull the candidate universe, with _priority_rank computed by the
     DATABASE (ROW_NUMBER() OVER (ORDER BY priority_rank_sql)) rather than a
@@ -263,13 +269,19 @@ def _pull_candidates(db_conn, config: dict, levels: list, batch_id: str) -> list
     millions this pushes an O(n) pass down to the source engine -- which
     is already doing the ORDER BY for the SELECT itself -- instead of a
     second O(n) pass in this process after the full fetch.
+
+    Both scope_sql and exclusion_sql go through _substitute_params() with
+    the SAME run_params dict -- previously exclusion_sql got no
+    substitution at all, silently unable to reference {batch_id} or any
+    other run param even though scope_sql could.
     """
     key_cols = [c.strip() for c in config["key_columns"].split(",") if c.strip()]
     strata_select = [f"{lvl['stratify_expr']} AS {_bucket_key(lvl['strata_id'])}" for lvl in levels]
 
     scope = (config.get("scope_sql") or "").strip() or "1=1"
-    scope = _substitute_batch_id(scope, batch_id)
+    scope = _substitute_params(scope, run_params)
     exclusion = (config.get("exclusion_sql") or "").strip()
+    exclusion = _substitute_params(exclusion, run_params)
 
     where_parts = [f"({scope})"]
     if exclusion:
@@ -387,16 +399,20 @@ def _log_sampling_error(meta_conn, meta_db: str, sample_run_id: str, config: dic
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def run_sampling(config_id, batch_id: str, cf, meta_conn=None, meta_db: str = None, seed: int = None) -> dict:
+def run_sampling(config_id, batch_id: str, cf, meta_conn=None, meta_db: str = None, seed: int = None,
+                 run_params: dict = None) -> dict:
     """
     Execute one stratified sampling pass for `config_id`, scoped to
-    `batch_id` (substituted into scope_sql's {batch_id} token, same
-    convention as gre_rules.rule_sql).
+    `batch_id` and whatever else `run_params` supplies (substituted into
+    scope_sql's/exclusion_sql's "{key}" tokens -- same convention, and the
+    same shared.db_ops.build_run_params()/_substitute_params() mechanism,
+    as gre_rules.rule_sql in rules_engine/).
 
     Parameters
     ----------
     config_id  : gre_sampling_config.config_id to run
-    batch_id   : this cycle's batch/cohort identifier
+    batch_id   : this cycle's batch/cohort identifier -- always present in
+                 the run_params every scope_sql/exclusion_sql sees
     cf         : ConnectionFactory, already loaded
     meta_conn  : adapter for the gre_ metadata store; defaults to
                  cf.get(gre_config.get_meta_connection_name())
@@ -404,6 +420,12 @@ def run_sampling(config_id, batch_id: str, cf, meta_conn=None, meta_db: str = No
                  gre_config.get_meta_db()
     seed       : explicit seed for RANDOM/SYSTEMATIC reproducibility; a
                  fresh one is generated and persisted if not supplied
+    run_params : optional dict of extra named values scope_sql/
+                 exclusion_sql can reference via "{key}" tokens -- merged
+                 with batch_id via shared.db_ops.build_run_params()
+                 (batch_id always wins on key collision). Lets each
+                 project scope its candidate universe however it needs,
+                 the same way rules_engine's run_params does.
 
     Returns
     -------
@@ -416,6 +438,8 @@ def run_sampling(config_id, batch_id: str, cf, meta_conn=None, meta_db: str = No
     meta_conn = meta_conn or cf.get(gre_config.get_meta_connection_name())
     if meta_conn is None:
         raise RuntimeError(f"Metadata connection '{gre_config.get_meta_connection_name()}' unavailable.")
+
+    resolved_params = build_run_params(batch_id, run_params)
 
     started_at = datetime.now()
     config, levels = load_sampling_config(meta_conn, meta_db, config_id)
@@ -447,7 +471,7 @@ def run_sampling(config_id, batch_id: str, cf, meta_conn=None, meta_db: str = No
     rng = random.Random(run_seed)
 
     try:
-        candidates = _pull_candidates(db_conn, config, levels, batch_id)
+        candidates = _pull_candidates(db_conn, config, levels, resolved_params)
     except Exception as exc:
         logger.error("Sampling config_id=%s: candidate pull failed: %s", config_id, exc, exc_info=True)
         _log_sampling_error(meta_conn, meta_db, sample_run_id, config, "PULL_FAILURE", str(exc))

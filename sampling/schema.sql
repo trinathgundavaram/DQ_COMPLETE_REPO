@@ -31,10 +31,11 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_config (
     connection_name      VARCHAR(100) NOT NULL,   -- see db/connection_factory.py
     universe_table       VARCHAR(200) NOT NULL,
     key_columns          VARCHAR(500) NOT NULL,   -- entity key column(s), CSV
-    scope_sql            CLOB,                    -- WHERE-fragment; may embed a literal
-                                                    -- {batch_id} token, substituted the same
-                                                    -- way rules_engine's rule_sql is -- see
-                                                    -- shared/db_ops.py::_substitute_batch_id.
+    scope_sql            CLOB,                    -- WHERE-fragment; may embed any number of
+                                                    -- "{key}" tokens (e.g. {batch_id}, {year}),
+                                                    -- substituted from run_params the same way
+                                                    -- rules_engine's rule_sql is -- see
+                                                    -- shared/db_ops.py::_substitute_params().
                                                     -- Defaults to '1=1' (whole table) if unset.
                                                     -- NOTE: unlike gre_rules.scope_sql (a COUNT
                                                     -- query), this scope_sql is a WHERE-fragment
@@ -42,7 +43,10 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_config (
                                                     -- because it answers a different question
                                                     -- here ("which rows are this cycle's
                                                     -- candidates" vs. "what's the denominator").
-    exclusion_sql        CLOB,                    -- WHERE-fragment; matching rows are EXCLUDED
+    exclusion_sql        CLOB,                    -- WHERE-fragment; matching rows are EXCLUDED.
+                                                    -- Same "{key}" run_params substitution as
+                                                    -- scope_sql above (both go through
+                                                    -- _substitute_params with the same dict).
     target_volume        INTEGER NOT NULL DEFAULT 150,
     sampling_method       VARCHAR(20) DEFAULT 'RANKED',  -- 'RANKED'|'RANDOM'|'SYSTEMATIC'
     priority_rank_sql     CLOB,                    -- required for RANKED/SYSTEMATIC; ORDER BY

@@ -7,8 +7,8 @@ table and the gre_ metadata store (schema-qualified as "main", DuckDB's
 default schema, so the f"{meta_db}.table" pattern the engine uses in
 production works unchanged here).
 
-Generic DB-helper behavior (bulk writes, check_dialect() itself,
-{batch_id} substitution) is covered in tests/test_shared_db_ops.py instead
+Generic DB-helper behavior (bulk writes, check_dialect() itself, {key}
+run_params substitution) is covered in tests/test_shared_db_ops.py instead
 -- this file only exercises rule-specific behavior built on top of those
 primitives.
 """
@@ -133,9 +133,13 @@ def _rule(**overrides):
         "sql_dialect": "ansi",
         "rule_sql": "SELECT claim_id, denial_reason FROM claims "
                     "WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
-        "scope_sql": None,
-        "batch_id_column": "batch_id",
+        # Explicit scope_sql -- there is no more batch_id_column fallback,
+        # so a rule whose total should be scoped to the batch (as most of
+        # these tests assume) has to say so; see the dedicated
+        # whole-table-default tests below for the scope_sql=None path.
+        "scope_sql": "SELECT COUNT(*) AS total_count FROM claims WHERE batch_id = '{batch_id}'",
         "rule_group": "claims_dq",
+        "rule_variant": None,
         "seq_no": 10,
         "sequencing_mode": "independent",
         "on_failure": "skip_and_continue",
@@ -222,7 +226,7 @@ def test_execute_rule_writes_exceptions_and_result():
     conn = _conn()
     rule = _rule(threshold_pct=25)  # 2/4 = 50% > 25% -> FAIL
 
-    status = execute_rule(rule, conn, conn, "RUN1", "B1", META_DB)
+    status = execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
 
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
@@ -246,8 +250,8 @@ def test_execute_rule_is_idempotent_on_rerun():
     conn = _conn()
     rule = _rule(threshold_pct=25)
 
-    execute_rule(rule, conn, conn, "RUN1", "B1", META_DB)
-    execute_rule(rule, conn, conn, "RUN2", "B1", META_DB)  # simulate a rerun of the same batch
+    execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    execute_rule(rule, conn, conn, "RUN2", {"batch_id": "B1"}, META_DB)  # simulate a rerun of the same batch
 
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
     assert len(exceptions) == 2   # not duplicated
@@ -264,8 +268,8 @@ def test_execute_rule_batches_are_isolated():
     conn = _conn()
     rule = _rule(threshold_pct=25)
 
-    execute_rule(rule, conn, conn, "RUN1", "B1", META_DB)
-    execute_rule(rule, conn, conn, "RUN1", "B2", META_DB)
+    execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B2"}, META_DB)
 
     b1 = execute_query(conn, "SELECT * FROM gre_exceptions WHERE batch_id = 'B1'")
     b2 = execute_query(conn, "SELECT * FROM gre_exceptions WHERE batch_id = 'B2'")
@@ -277,7 +281,7 @@ def test_execute_rule_no_threshold_fallback_not_written_when_partial_failure():
     conn = _conn()
     rule = _rule(threshold_pct=None, threshold_count=None)  # 2/4 fail, no threshold
 
-    status = execute_rule(rule, conn, conn, "RUN1", "B1", META_DB)
+    status = execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
 
     # Exceptions are still written regardless of any threshold...
@@ -293,7 +297,7 @@ def test_execute_rule_sql_error_routes_to_errors_and_logs():
     conn = _conn()
     rule = _rule(rule_sql="SELECT * FROM no_such_table WHERE batch_id = '{batch_id}'")
 
-    status = execute_rule(rule, conn, conn, "RUN1", "B1", META_DB)
+    status = execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
     assert status == "ERROR"
 
     errors = execute_query(conn, "SELECT * FROM gre_errors WHERE rule_id = 1")
@@ -323,7 +327,7 @@ def test_write_exceptions_dedupes_natural_key_within_one_pull():
                  "SELECT claim_id, denial_reason FROM claims "
                  "WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
     )
-    status = execute_rule(rule, conn, conn, "RUN1", "B1", META_DB)
+    status = execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
 
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
@@ -340,7 +344,7 @@ def test_max_exceptions_cap_keeps_failed_records_true_but_caps_detail_rows(monke
     monkeypatch.setattr(rules_engine_executor, "MAX_EXCEPTIONS", 1)
     rule = _rule(threshold_pct=0)   # any failure breaches -> a gre_results row is written
 
-    status = execute_rule(rule, conn, conn, "RUN1", "B1", META_DB)
+    status = execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
 
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
@@ -360,7 +364,7 @@ def test_execute_rule_dialect_mismatch_routes_to_errors_before_any_query():
     db_conn = _SourceTypeWrapper(conn, "postgresql")
     rule = _rule(sql_dialect="teradata", threshold_pct=25)
 
-    status = execute_rule(rule, db_conn, conn, "RUN1", "B1", META_DB)
+    status = execute_rule(rule, db_conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
     assert status == "ERROR"
 
     errors = execute_query(conn, "SELECT * FROM gre_errors WHERE rule_id = 1")
@@ -380,7 +384,7 @@ def test_execute_rule_ansi_dialect_runs_against_any_source():
     db_conn = _SourceTypeWrapper(conn, "postgresql")
     rule = _rule(sql_dialect="ansi", threshold_pct=25)
 
-    status = execute_rule(rule, db_conn, conn, "RUN1", "B1", META_DB)
+    status = execute_rule(rule, db_conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
 
 
@@ -389,40 +393,60 @@ def test_execute_rule_unrecognised_source_type_skips_dialect_check():
     db_conn = _SourceTypeWrapper(conn, "some_future_adapter")
     rule = _rule(sql_dialect="teradata", threshold_pct=25)
 
-    status = execute_rule(rule, db_conn, conn, "RUN1", "B1", META_DB)
+    status = execute_rule(rule, db_conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"   # unrecognised source_type -> warn and skip, not a hard failure
 
 
-# ── _compute_total memoization ───────────────────────────────────────────
+# ── _compute_total: whole-table default + scope_sql override ────────────
+
+def test_compute_total_defaults_to_unfiltered_whole_table_count():
+    # scope_sql=None -> no batch_id_column fallback anymore (that column is
+    # gone) -- the default is an unfiltered COUNT(*) over the whole table.
+    conn = _conn()
+    rule = _rule(scope_sql=None)   # table_name='claims' -- all 5 seed rows (B1 x4 + B2 x1)
+    total = _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=None)
+    assert total == 5
+
+
+def test_compute_total_scope_sql_scopes_by_whatever_run_params_key_it_names():
+    conn = _conn()
+    rule = _rule(scope_sql="SELECT COUNT(*) AS total_count FROM claims WHERE batch_id = '{batch_id}'")
+    assert _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=None) == 4
+    assert _compute_total(conn, rule, {"batch_id": "B2"}, total_cache=None) == 1
+
 
 def test_compute_total_is_memoized_within_a_shared_cache():
     conn = _conn()
-    rule = _rule()   # scope_sql=None, batch_id_column='batch_id', table_name='claims'
+    rule = _rule(scope_sql=None)   # table_name='claims' -- whole-table default
     cache = {}
 
-    total1 = _compute_total(conn, rule, "B1", total_cache=cache)
-    assert total1 == 4
+    total1 = _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=cache)
+    assert total1 == 5
     assert len(cache) == 1
 
     # Mutate the underlying table -- a fresh (uncached) count would change.
     conn.execute("INSERT INTO claims VALUES ('C99', NULL, 'B1')")
 
-    total2 = _compute_total(conn, rule, "B1", total_cache=cache)
-    assert total2 == 4   # served from cache, not re-queried -- proves memoization
+    total2 = _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=cache)
+    assert total2 == 5   # served from cache, not re-queried -- proves memoization
 
-    total3 = _compute_total(conn, rule, "B1", total_cache=None)
-    assert total3 == 5   # no cache passed -> fresh query, reflects the mutation
+    total3 = _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=None)
+    assert total3 == 6   # no cache passed -> fresh query, reflects the mutation
 
 
 def test_compute_total_cache_is_keyed_by_source_connection_and_query():
+    # Whole-table default has no batch_id in its query text at all, so two
+    # different batches would share one cache entry -- to prove the cache
+    # key really does track the resolved QUERY (not just source_connection
+    # or rule_id), use a rule whose scope_sql embeds {batch_id}, so two
+    # different run_params values resolve to two different query strings.
     conn = _conn()
     cache = {}
-    rule_b1 = _rule()
-    rule_b2 = _rule(batch_id_column="batch_id")   # same query shape, different batch_id below
+    rule = _rule(scope_sql="SELECT COUNT(*) AS total_count FROM claims WHERE batch_id = '{batch_id}'")
 
-    assert _compute_total(conn, rule_b1, "B1", total_cache=cache) == 4
-    assert _compute_total(conn, rule_b2, "B2", total_cache=cache) == 1   # only C5 is in B2
-    assert len(cache) == 2   # different batch_id -> different cache key, not collapsed together
+    assert _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=cache) == 4
+    assert _compute_total(conn, rule, {"batch_id": "B2"}, total_cache=cache) == 1   # only C5 is in B2
+    assert len(cache) == 2   # different resolved query -> different cache key, not collapsed together
 
 
 # ── single-scan evaluation (_scan_violations) ────────────────────────────
@@ -465,6 +489,50 @@ def test_execute_rule_issues_two_source_queries_not_three():
     wrapped_db = _CursorCountingWrapper(conn)
     rule = _rule(threshold_pct=25)
 
-    status = execute_rule(rule, wrapped_db, conn, "RUN1", "B1", META_DB)
+    status = execute_rule(rule, wrapped_db, conn, "RUN1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
     assert wrapped_db.cursor_calls == 2
+
+
+# ── run_params substitution (v2 scoping) ─────────────────────────────────
+
+def test_execute_rule_uses_extra_run_params_key_beyond_batch_id():
+    conn = _conn()
+    rule = _rule(
+        rule_sql="SELECT claim_id, denial_reason FROM claims "
+                 "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' AND '{run_type}' = 'MONTHLY'",
+        scope_sql=None,
+    )
+    status = execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1", "run_type": "MONTHLY"}, META_DB)
+    assert status == "SUCCESS"
+
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
+    assert len(exceptions) == 2   # C1, C3 -- the extra {run_type} token resolved and matched
+
+
+def test_execute_rule_unresolved_token_fails_fast_before_any_query():
+    # rule_sql references {run_type}, but the caller's run_params doesn't
+    # supply it -- must fail BEFORE the scan/count queries run, logged as
+    # PARAM_SUBSTITUTION_ERROR, never as a confusing SQL syntax error from
+    # the source database.
+    conn = _conn()
+    wrapped_db = _CursorCountingWrapper(conn)
+    rule = _rule(
+        rule_sql="SELECT claim_id, denial_reason FROM claims "
+                 "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' AND run_type = '{run_type}'",
+    )
+
+    status = execute_rule(rule, wrapped_db, conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    assert status == "ERROR"
+    assert wrapped_db.cursor_calls == 0   # caught before any source query ran
+
+    errors = execute_query(conn, "SELECT * FROM gre_errors WHERE rule_id = 1")
+    assert len(errors) == 1
+    assert errors[0]["error_type"] == "PARAM_SUBSTITUTION_ERROR"
+    assert "run_type" in errors[0]["error_message"]
+
+    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1")
+    assert len(logs) == 1 and logs[0]["status"] == "ERROR"
+
+    assert execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1") == []
+    assert execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1") == []

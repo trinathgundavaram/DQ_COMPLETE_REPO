@@ -39,6 +39,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_audit (
     run_type               VARCHAR(20) DEFAULT 'RULE_GROUP',  -- 'RULE_GROUP' | 'SAMPLING'
     rule_group              VARCHAR(100),        -- RULE_GROUP runs only
     batch_id                 VARCHAR(100),        -- RULE_GROUP runs only
+    rule_variant               VARCHAR(100),      -- RULE_GROUP runs only; NULL = no variant requested
     started_at                TIMESTAMP,
     ended_at                   TIMESTAMP,
     status                      VARCHAR(20),      -- 'RUNNING' | 'COMPLETED' | 'HALTED'

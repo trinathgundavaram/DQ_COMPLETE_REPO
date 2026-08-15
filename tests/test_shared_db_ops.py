@@ -1,7 +1,7 @@
 """
 shared/db_ops.py tests: the low-level DB helpers used by BOTH
 rules_engine/ and sampling/ -- bulk writes with duplicate-key tolerance,
-the dialect guard, and {batch_id} token substitution. No live DB
+the dialect guard, and {key} run_params token substitution. No live DB
 connection required -- DuckDB stands in for the metadata store.
 """
 import sys, os
@@ -12,7 +12,7 @@ import pytest
 
 from shared.db_ops import (
     execute_query, bulk_insert, bulk_insert_or_skip,
-    check_dialect, DialectMismatchError, _substitute_batch_id,
+    check_dialect, DialectMismatchError, _substitute_params, build_run_params,
 )
 
 
@@ -32,12 +32,65 @@ def _conn():
     return conn
 
 
-# ── batch-id substitution ────────────────────────────────────────────────
+# ── run_params substitution ─────────────────────────────────────────────
 
-def test_substitute_batch_id_escapes_quotes():
+def test_substitute_params_escapes_quotes():
     sql = "WHERE batch_id = '{batch_id}'"
-    assert _substitute_batch_id(sql, "B1") == "WHERE batch_id = 'B1'"
-    assert _substitute_batch_id(sql, "O'Brien") == "WHERE batch_id = 'O''Brien'"
+    assert _substitute_params(sql, {"batch_id": "B1"}) == "WHERE batch_id = 'B1'"
+    assert _substitute_params(sql, {"batch_id": "O'Brien"}) == "WHERE batch_id = 'O''Brien'"
+
+
+def test_substitute_params_multi_key():
+    sql = "WHERE batch_id = '{batch_id}' AND yr = {year} AND run_type = '{run_type}'"
+    resolved = _substitute_params(sql, {"batch_id": "B1", "year": 2026, "run_type": "MONTHLY"})
+    assert resolved == "WHERE batch_id = 'B1' AND yr = 2026 AND run_type = 'MONTHLY'"
+
+
+def test_substitute_params_ignores_extra_keys_not_present_in_sql():
+    sql = "WHERE batch_id = '{batch_id}'"
+    assert _substitute_params(sql, {"batch_id": "B1", "unused": "x"}) == "WHERE batch_id = 'B1'"
+
+
+def test_substitute_params_none_or_empty_sql_passthrough():
+    assert _substitute_params(None, {"batch_id": "B1"}) is None
+    assert _substitute_params("", {"batch_id": "B1"}) == ""
+
+
+def test_substitute_params_none_value_becomes_empty_string():
+    assert _substitute_params("v = '{x}'", {"x": None}) == "v = ''"
+
+
+def test_substitute_params_unresolved_token_raises():
+    sql = "WHERE batch_id = '{batch_id}' AND yr = {year}"
+    with pytest.raises(ValueError) as exc_info:
+        _substitute_params(sql, {"batch_id": "B1"})
+    msg = str(exc_info.value)
+    assert "year" in msg
+    assert "batch_id" in msg  # lists what WAS supplied, for a fast diagnosis
+
+
+def test_substitute_params_empty_params_dict_with_no_tokens_ok():
+    assert _substitute_params("SELECT 1", {}) == "SELECT 1"
+    assert _substitute_params("SELECT 1", None) == "SELECT 1"
+
+
+# ── build_run_params ─────────────────────────────────────────────────────
+
+def test_build_run_params_merges_extra_with_batch_id():
+    assert build_run_params("B1", {"year": 2026}) == {"year": 2026, "batch_id": "B1"}
+
+
+def test_build_run_params_no_extra():
+    assert build_run_params("B1") == {"batch_id": "B1"}
+    assert build_run_params("B1", None) == {"batch_id": "B1"}
+
+
+def test_build_run_params_batch_id_always_wins_on_collision():
+    # A stray "batch_id" key inside extra_params can never silently
+    # override the dedicated, required batch_id argument.
+    assert build_run_params("REAL", {"batch_id": "STRAY", "year": 2026}) == {
+        "batch_id": "REAL", "year": 2026,
+    }
 
 
 # ── bulk writes ───────────────────────────────────────────────────────────

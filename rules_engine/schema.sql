@@ -22,11 +22,18 @@
 -- Design notes (see rules_engine/config usage via shared/config.py,
 -- rules_engine/executor.py docstrings for the code that relies on these
 -- shapes):
---   * rule_sql / scope_sql may embed a literal "{batch_id}" token. The
---     engine string-substitutes it (quoted, escaped) before running the
---     query -- see shared/db_ops.py::_substitute_batch_id(). There is no
---     filter_column/filter_sql system like dq_rules has; SQL-authoring
---     rules are expected to be fully self-contained.
+--   * rule_sql / scope_sql may embed any number of "{key}" tokens (e.g.
+--     "{batch_id}", "{year}", "{run_type}"). The engine string-substitutes
+--     each one (quoted, escaped) from the run_params dict passed to this
+--     run -- see shared/db_ops.py::_substitute_params() /
+--     build_run_params(). batch_id is always present in run_params (it's
+--     still the tracking/idempotency key -- gre_exceptions_uix, gre_log,
+--     gre_results, gre_audit), but a rule can reference any other key the
+--     caller supplies. There is no filter_column/filter_sql system like
+--     dq_rules has; SQL-authoring rules are expected to be fully
+--     self-contained -- an unresolved "{token}" fails the rule attempt
+--     immediately (PARAM_SUBSTITUTION_ERROR) rather than reaching the
+--     source database as a syntax error.
 --   * source_connection names a connection already configured via
 --     DQ_CONNECTION_NAMES / db/connection_factory.py -- the SAME connector
 --     layer dq_* uses, imported directly, not reimplemented.
@@ -37,11 +44,22 @@
 --     (UNIQUE INDEX below), mirroring the dq_metrics_summary_uix pattern:
 --     catch the duplicate-key error and skip/update rather than
 --     delete-then-insert, which leaves a crash-mid-delete window.
---   * batch_id_column is only consulted when scope_sql is NULL: the
---     engine's default total-record count becomes
---       SELECT COUNT(*) AS total_count FROM {table_name}
---       WHERE {batch_id_column} = '{batch_id}'
---     defaulting batch_id_column itself to 'batch_id' when not set.
+--   * scope_sql is optional; when NULL the engine's default total-record
+--     count is an unfiltered "SELECT COUNT(*) AS total_count FROM
+--     {table_name}" (whole table) -- there is no default filter column.
+--     A project whose total needs scoping (by batch_id, a date range, or
+--     anything else) sets scope_sql explicitly, using whichever {key}
+--     tokens its run_params supplies.
+--   * rule_variant adds ONE additional generic level on top of
+--     project/table (rule_group) for selecting which rules run: NULL
+--     means the rule always applies within its rule_group; a non-NULL
+--     value means it only applies when the caller's run explicitly
+--     requests that exact value (rules_engine/rules.py::load_rules()).
+--     This is deliberately a single freeform column, not separate
+--     hardcoded year/run_type columns -- a project needing more than one
+--     dimension composes a single string (e.g. "2026|MONTHLY"), the same
+--     "SQL/config authors are self-contained" philosophy as rule_sql
+--     above.
 -- ============================================================
 
 
@@ -54,8 +72,9 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_rules (
     sql_dialect          VARCHAR(20)  NOT NULL,   -- 'teradata' | 'postgres' | 'ansi'
     rule_sql             CLOB NOT NULL,            -- the negative SELECT; never mutates data
     scope_sql            CLOB,                     -- optional override for the total-record count
-    batch_id_column      VARCHAR(100) DEFAULT 'batch_id',  -- used only when scope_sql IS NULL
     rule_group           VARCHAR(100) NOT NULL,    -- groups rules for one use case / table pipeline
+    rule_variant         VARCHAR(100),             -- optional extra selection level within rule_group;
+                                                    -- NULL = always applies, see design notes above
     seq_no               INTEGER DEFAULT 100,      -- run order within a group (sequential mode only)
     sequencing_mode      VARCHAR(20) DEFAULT 'independent',  -- 'independent' | 'sequential'
     on_failure           VARCHAR(20) DEFAULT 'skip_and_continue',  -- 'halt_group' | 'skip_and_continue'
@@ -71,6 +90,11 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_rules (
     updated_at           TIMESTAMP
 )
 PRIMARY INDEX (rule_id);
+
+-- rules_engine/rules.py::load_rules() always filters on exactly these
+-- three columns -- covers that lookup without a full-table scan.
+CREATE INDEX gre_rules_group_variant_ix (rule_group, active_flag, rule_variant)
+ON CMSUNIV_FILELAND_DEV_T.gre_rules;
 
 
 -- ── 2. gre_log -- one row per rule execution attempt ──────────────────────

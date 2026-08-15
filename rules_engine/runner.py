@@ -17,7 +17,7 @@ import time
 from datetime import datetime
 
 from shared import config as gre_config
-from shared.db_ops import execute_query, execute_dml
+from shared.db_ops import execute_query, execute_dml, build_run_params
 from rules_engine.rules import load_rules
 from rules_engine.executor import execute_rule, _log_error, _log_attempt
 
@@ -59,13 +59,13 @@ def _already_succeeded_rule_ids(meta_conn, meta_db: str, rule_group: str, batch_
 # ---------------------------------------------------------------------------
 
 def _start_audit(meta_conn, meta_db: str, run_id: str, rule_group: str, batch_id: str,
-                  total_rules: int, triggered_by: str) -> None:
+                  total_rules: int, triggered_by: str, rule_variant: str = None) -> None:
     execute_dml(meta_conn, f"""
         INSERT INTO {meta_db}.gre_audit (
-            run_id, rule_group, batch_id, started_at, status,
+            run_id, rule_group, batch_id, rule_variant, started_at, status,
             total_rules, rules_succeeded, rules_errored, triggered_by
-        ) VALUES (?, ?, ?, ?, 'RUNNING', ?, 0, 0, ?)
-    """, [run_id, rule_group, batch_id, datetime.now(), total_rules, triggered_by])
+        ) VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, 0, 0, ?)
+    """, [run_id, rule_group, batch_id, rule_variant, datetime.now(), total_rules, triggered_by])
 
 
 def _finish_audit(meta_conn, meta_db: str, run_id: str, status: str,
@@ -88,22 +88,39 @@ def run_rule_group(
     meta_conn=None,
     meta_db: str = None,
     triggered_by: str = "SYSTEM",
+    run_params: dict = None,
+    rule_variant: str = None,
 ) -> dict:
     """
     Run every active rule in `rule_group` against `batch_id`.
 
     Parameters
     ----------
-    rule_group : which group of gre_rules to run
-    batch_id   : the batch being evaluated -- substituted into every rule's
-                 {batch_id} token and used for idempotency/scoping
-    cf         : a db.connection_factory.ConnectionFactory, already loaded,
-                 used to resolve each rule's source_connection to an adapter
-    meta_conn  : adapter for the gre_ metadata store; defaults to
-                 cf.get(gre_config.get_meta_connection_name())
-    meta_db    : schema the gre_ tables live in; defaults to
-                 gre_config.get_meta_db()
+    rule_group   : which group of gre_rules to run
+    batch_id     : the batch being evaluated -- the tracking/idempotency key
+                   (gre_exceptions_uix, gre_log, gre_results, gre_audit) and
+                   always present in the run_params every rule sees (see
+                   run_params below).
+    cf           : a db.connection_factory.ConnectionFactory, already loaded,
+                   used to resolve each rule's source_connection to an adapter
+    meta_conn    : adapter for the gre_ metadata store; defaults to
+                   cf.get(gre_config.get_meta_connection_name())
+    meta_db      : schema the gre_ tables live in; defaults to
+                   gre_config.get_meta_db()
     triggered_by : freeform string recorded on gre_audit
+    run_params   : optional dict of extra named values a rule's rule_sql/
+                   scope_sql can reference via "{key}" tokens -- merged with
+                   batch_id via shared.db_ops.build_run_params() (batch_id
+                   always wins on key collision). Lets each project scope
+                   its data however it needs (month/year, run_type, a date
+                   range, a region column, ...) without the engine having
+                   to know about any of those column names. See
+                   shared/db_ops.py::_substitute_params()'s docstring.
+    rule_variant : optional extra selection level on top of rule_group/
+                   table -- passed straight to rules_engine.rules.load_rules()
+                   (see its docstring) and recorded on gre_audit for this
+                   run. None (the default) loads only rules with
+                   rule_variant IS NULL (universal rules for the group).
 
     Returns
     -------
@@ -123,7 +140,7 @@ def run_rule_group(
             "succeeded": 0, "errored": 0, "results": {},
         }
 
-    rules = load_rules(meta_conn, meta_db, rule_group)
+    rules = load_rules(meta_conn, meta_db, rule_group, rule_variant=rule_variant)
     if not rules:
         logger.info("No active rules for rule_group=%s.", rule_group)
         return {
@@ -131,8 +148,11 @@ def run_rule_group(
             "succeeded": 0, "errored": 0, "results": {},
         }
 
+    resolved_params = build_run_params(batch_id, run_params)
+
     run_id = generate_run_id(rule_group, batch_id)
-    _start_audit(meta_conn, meta_db, run_id, rule_group, batch_id, len(rules), triggered_by)
+    _start_audit(meta_conn, meta_db, run_id, rule_group, batch_id, len(rules), triggered_by,
+                 rule_variant=rule_variant)
     logger.info("Starting GRE run: %s (%d rule(s))", run_id, len(rules))
 
     # Checkpoint/resume: skip rules that already succeeded for this batch.
@@ -162,10 +182,10 @@ def run_rule_group(
 
     # Shared for the whole run: several rules in a group often ask the
     # identical "how many rows are in this batch" question (same
-    # table_name/batch_id_column, or a shared scope_sql) -- one dict here,
-    # threaded into every execute_rule() call, lets _compute_total() reuse
-    # that COUNT(*) result instead of re-scanning the same rows once per
-    # rule. See rules_engine/executor.py::_compute_total()'s docstring.
+    # table_name, or a shared scope_sql) -- one dict here, threaded into
+    # every execute_rule() call, lets _compute_total() reuse that COUNT(*)
+    # result instead of re-scanning the same rows once per rule. See
+    # rules_engine/executor.py::_compute_total()'s docstring.
     total_cache = {}
 
     for rule in pending:
@@ -181,7 +201,7 @@ def run_rule_group(
                         f"No connection '{rule['source_connection']}'")
             status = "ERROR"
         else:
-            status = execute_rule(rule, db_conn, meta_conn, run_id, batch_id, meta_db,
+            status = execute_rule(rule, db_conn, meta_conn, run_id, resolved_params, meta_db,
                                   total_cache=total_cache)
 
         results[rule["rule_id"]] = status

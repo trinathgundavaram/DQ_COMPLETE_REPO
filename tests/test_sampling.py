@@ -282,7 +282,7 @@ def test_pull_candidates_computes_priority_rank_in_sql_for_ranked():
         "scope_sql": "pull_date = '{batch_id}'", "exclusion_sql": "auto_closed = 1",
         "sampling_method": "RANKED", "priority_rank_sql": "revision DESC, case_id ASC",
     }
-    candidates = _pull_candidates(conn, config, [], "2026-08-01")
+    candidates = _pull_candidates(conn, config, [], {"batch_id": "2026-08-01"})
     assert len(candidates) > 0
 
     # _priority_rank is sequential and DB-computed (ROW_NUMBER()), not a
@@ -306,9 +306,48 @@ def test_pull_candidates_random_gets_null_priority_rank():
         "scope_sql": "pull_date = '{batch_id}'", "exclusion_sql": "auto_closed = 1",
         "sampling_method": "RANDOM", "priority_rank_sql": None,
     }
-    candidates = _pull_candidates(conn, config, [], "2026-08-01")
+    candidates = _pull_candidates(conn, config, [], {"batch_id": "2026-08-01"})
     assert len(candidates) > 0
     assert all(c["_priority_rank"] is None for c in candidates)
+
+
+def test_pull_candidates_exclusion_sql_gets_run_params_substitution():
+    # Previously exclusion_sql got NO substitution at all -- only scope_sql
+    # did. Prove exclusion_sql can now reference a run_params {key} token
+    # too, and that it actually takes effect (excludes the matching rows).
+    conn = _conn()
+    _build_universe(conn, n=50)
+    config = {
+        "config_id": 1, "universe_table": "case_universe", "key_columns": "case_id",
+        "scope_sql": "pull_date = '{batch_id}'",
+        "exclusion_sql": "revision = {excluded_revision}",
+        "sampling_method": "RANDOM", "priority_rank_sql": None,
+    }
+    candidates = _pull_candidates(conn, config, [], {"batch_id": "2026-08-01", "excluded_revision": 1})
+    assert len(candidates) > 0
+
+    remaining_revisions = {r[0] for r in conn.execute(
+        "SELECT DISTINCT revision FROM case_universe WHERE pull_date = '2026-08-01' AND revision = 1"
+    ).fetchall()}
+    assert remaining_revisions  # sanity: revision=1 rows exist in the universe...
+    pulled_ids = {c["case_id"] for c in candidates}
+    excluded_ids = {r[0] for r in conn.execute(
+        "SELECT case_id FROM case_universe WHERE pull_date = '2026-08-01' AND revision = 1"
+    ).fetchall()}
+    assert not (pulled_ids & excluded_ids)   # ...but none of them made it through the pull
+
+
+def test_pull_candidates_exclusion_sql_unresolved_token_raises():
+    conn = _conn()
+    _build_universe(conn, n=10)
+    config = {
+        "config_id": 1, "universe_table": "case_universe", "key_columns": "case_id",
+        "scope_sql": "pull_date = '{batch_id}'",
+        "exclusion_sql": "revision = {excluded_revision}",   # not supplied below
+        "sampling_method": "RANDOM", "priority_rank_sql": None,
+    }
+    with pytest.raises(ValueError):
+        _pull_candidates(conn, config, [], {"batch_id": "2026-08-01"})
 
 
 # ── run_sampling end-to-end ───────────────────────────────────────────
@@ -417,6 +456,47 @@ def test_switching_method_is_config_only():
         result = run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
         assert result["status"] == "COMPLETED", method
         assert result["selected"] <= 40, method
+
+
+# ── run_params threading (v2 scoping) ────────────────────────────────────
+
+def test_run_sampling_extra_run_params_key_reaches_scope_sql():
+    conn = _conn()
+    _build_universe(conn)
+    _insert_config(conn, target_volume=25, sampling_method="RANKED",
+                   scope_sql="pull_date = '{batch_id}' AND {min_revision} <= revision")
+    cf = _FakeConnectionFactory(conn)
+
+    result = run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB,
+                          run_params={"min_revision": 0})
+    assert result["status"] == "COMPLETED"
+    assert result["candidates"] > 0
+
+
+def test_run_sampling_stray_batch_id_in_run_params_never_overrides_the_real_one():
+    conn = _conn()
+    _build_universe(conn)
+    _insert_config(conn, target_volume=25, sampling_method="RANKED")
+    cf = _FakeConnectionFactory(conn)
+
+    result = run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB,
+                          run_params={"batch_id": "SOME_OTHER_DATE"})
+    assert result["status"] == "COMPLETED"
+    assert result["candidates"] > 0   # still pulled against the real batch_id ('2026-08-01')
+
+
+def test_run_sampling_unresolved_scope_token_routes_to_pull_failure():
+    conn = _conn()
+    _build_universe(conn)
+    _insert_config(conn, target_volume=25, sampling_method="RANKED",
+                   scope_sql="pull_date = '{batch_id}' AND revision = {min_revision}")
+    cf = _FakeConnectionFactory(conn)
+
+    result = run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)  # min_revision not supplied
+    assert result["status"] == "ERROR"
+    errors = conn.execute("SELECT error_type, error_message FROM gre_errors").fetchall()
+    assert len(errors) == 1 and errors[0][0] == "PULL_FAILURE"
+    assert "min_revision" in errors[0][1]
 
 
 def test_ranked_without_priority_rank_sql_raises_clear_error():

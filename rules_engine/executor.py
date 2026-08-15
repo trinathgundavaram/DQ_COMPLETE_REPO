@@ -12,11 +12,11 @@ one rule. See execute_rule() for why that's safe under a crash/resume.
 Built on shared/db_ops.py
 ---------------------------
 The low-level DB helpers (execute_query/execute_dml/bulk_insert*), the
-dialect guard, {batch_id} substitution, and the retry-wrapped source query
-all live in shared/db_ops.py -- used identically by sampling/sampling.py.
-Everything in THIS file is specific to rule evaluation: the single-scan
-optimization, natural-key building, threshold evaluation, and the
-gre_exceptions/gre_results/gre_log writers.
+dialect guard, {key} run_params substitution (_substitute_params), and the
+retry-wrapped source query all live in shared/db_ops.py -- used identically
+by sampling/sampling.py. Everything in THIS file is specific to rule
+evaluation: the single-scan optimization, natural-key building, threshold
+evaluation, and the gre_exceptions/gre_results/gre_log writers.
 
 Big-dataset path (single-scan evaluation + bulk writes)
 ----------------------------------------------------------
@@ -55,7 +55,7 @@ from datetime import datetime
 
 from shared.db_ops import (
     execute_dml, bulk_insert_or_skip, _is_duplicate_key_error,
-    _substitute_batch_id, _run_source_query, check_dialect, DialectMismatchError,
+    _substitute_params, _run_source_query, check_dialect, DialectMismatchError,
     log_error, EXCEPTION_CHUNK,
 )
 
@@ -395,36 +395,37 @@ def _log_attempt(meta_conn, meta_db: str, run_id: str, rule: dict, batch_id: str
 # Total in-scope record count
 # ---------------------------------------------------------------------------
 
-def _compute_total(db_conn, rule: dict, batch_id: str, total_cache: dict = None) -> int:
+def _compute_total(db_conn, rule: dict, run_params: dict, total_cache: dict = None) -> int:
     """
-    total_records = scope_sql result if the rule defines one, else
-    COUNT(*) on table_name scoped to the current batch via batch_id_column
-    (default 'batch_id'). Both paths go through the same {batch_id}
-    substitution as rule_sql.
+    total_records = scope_sql result if the rule defines one, else an
+    unfiltered COUNT(*) on table_name (whole table). A rule that needs its
+    total scoped MUST define scope_sql -- there is no implicit default
+    filter column anymore (see rules_engine/schema.sql's header for why:
+    every project scopes its data differently, so a rule/config author
+    writes the exact WHERE clause their project needs, using whichever
+    {key} tokens run_params supplies, rather than the engine guessing a
+    column name). scope_sql goes through the same _substitute_params()
+    pass as rule_sql.
 
     total_cache: an optional dict shared across every rule in one
     run_rule_group() call (see runner.py), keyed by
     (source_connection, effective query text). Multiple rules in a group
-    very often ask the identical question -- same table_name/
-    batch_id_column, or an intentionally shared scope_sql -- so caching by
-    the actual resolved query (not just table_name) reuses the COUNT(*)
-    result across every rule that would otherwise re-run the exact same
-    scan, without needing to special-case scope_sql vs. the default path.
-    A fresh cache per run means this never sees stale data across runs;
-    within one run the source isn't expected to change mid-run anyway
-    (the same assumption gre_exceptions' idempotency already relies on).
-    Callers that don't pass a cache (e.g. direct execute_rule() calls in
-    tests) get the old always-fresh-query behavior unchanged.
+    very often ask the identical question -- same table_name, or an
+    intentionally shared scope_sql -- so caching by the actual resolved
+    query (not just table_name) reuses the COUNT(*) result across every
+    rule that would otherwise re-run the exact same scan, without needing
+    to special-case scope_sql vs. the default path. A fresh cache per run
+    means this never sees stale data across runs; within one run the
+    source isn't expected to change mid-run anyway (the same assumption
+    gre_exceptions' idempotency already relies on). Callers that don't
+    pass a cache (e.g. direct execute_rule() calls in tests) get the old
+    always-fresh-query behavior unchanged.
     """
     scope_sql = (rule.get("scope_sql") or "").strip()
     if scope_sql:
-        query = _substitute_batch_id(scope_sql, batch_id)
+        query = _substitute_params(scope_sql, run_params)
     else:
-        col = rule.get("batch_id_column") or "batch_id"
-        query = _substitute_batch_id(
-            f"SELECT COUNT(*) AS total_count FROM {rule['table_name']} WHERE {col} = '{{batch_id}}'",
-            batch_id,
-        )
+        query = f"SELECT COUNT(*) AS total_count FROM {rule['table_name']}"
 
     cache_key = (rule.get("source_connection"), query)
     if total_cache is not None and cache_key in total_cache:
@@ -447,13 +448,13 @@ def _compute_total(db_conn, rule: dict, batch_id: str, total_cache: dict = None)
 # Rule execution
 # ---------------------------------------------------------------------------
 
-def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, batch_id: str, meta_db: str,
+def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, meta_db: str,
                   total_cache: dict = None) -> str:
     """
     Execute one rule end-to-end: check its declared dialect against the
-    source connection, run rule_sql, write every violating row to
-    gre_exceptions, evaluate the rule-level threshold, upsert gre_results,
-    and log the attempt.
+    source connection, substitute run_params into rule_sql, run it, write
+    every violating row to gre_exceptions, evaluate the rule-level
+    threshold, upsert gre_results, and log the attempt.
 
     Parameters
     ----------
@@ -461,7 +462,13 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, batch_id: str, met
     db_conn     : SourceAdapter for rule['source_connection'] -- READS ONLY
     meta_conn   : SourceAdapter for the gre_ metadata store -- all writes go here
     run_id      : id for this run (assigned by rules_engine/runner.py)
-    batch_id    : the batch being evaluated
+    run_params  : dict of named values substituted into rule_sql/scope_sql's
+                  "{key}" tokens -- see shared/db_ops.py::_substitute_params()
+                  and build_run_params(). MUST contain a "batch_id" key
+                  (build_run_params() guarantees this): batch_id is still
+                  the value gre_exceptions/gre_log/gre_results/gre_audit key
+                  their tracking/idempotency off, even though it's no
+                  longer the only value a rule can reference.
     meta_db     : schema name the gre_ tables live in
     total_cache : optional dict, shared across every rule in one
                   run_rule_group() call, that memoizes _compute_total()'s
@@ -503,6 +510,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, batch_id: str, met
     this batch" question.
     """
     start = time.time()
+    batch_id = run_params["batch_id"]
 
     # ── STEP 0: dialect guard -- fail fast, never mid-run ─────────────────────
     source_type = getattr(db_conn, "source_type", "unknown")
@@ -514,7 +522,14 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, batch_id: str, met
         _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, start, str(exc))
         return "ERROR"
 
-    query = _substitute_batch_id(rule["rule_sql"], batch_id)
+    # ── STEP 0b: run_params substitution -- fail fast, never mid-run ─────────
+    try:
+        query = _substitute_params(rule["rule_sql"], run_params)
+    except ValueError as exc:
+        logger.error("Rule %s: run_params substitution failed: %s", rule.get("rule_id"), exc)
+        _log_error(meta_conn, meta_db, run_id, rule, batch_id, "PARAM_SUBSTITUTION_ERROR", str(exc))
+        _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, start, str(exc))
+        return "ERROR"
 
     # ── STEP 1: ONE scan of rule_sql -- TRUE failed count + capped rows ──────
     try:
@@ -527,7 +542,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, batch_id: str, met
 
     # ── STEP 2: total in-scope record count (memoized across the run_group) ──
     try:
-        total = _compute_total(db_conn, rule, batch_id, total_cache=total_cache)
+        total = _compute_total(db_conn, rule, run_params, total_cache=total_cache)
     except Exception as exc:
         logger.error("Rule %s: scope/count query failed: %s", rule.get("rule_id"), exc, exc_info=True)
         _log_error(meta_conn, meta_db, run_id, rule, batch_id, "SCOPE_QUERY_FAILURE", str(exc))
