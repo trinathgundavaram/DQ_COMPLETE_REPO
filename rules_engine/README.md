@@ -125,6 +125,43 @@ consistency check) and stamps them onto `gre_audit` for the run; every
 `project_name`/`process_name` too, so any of those tables can be sliced or
 joined by project without a round trip back to `gre_rules`.
 
+## Descriptive/reporting columns (rule-catalog vocabulary, audit)
+
+Beyond the columns the engine actually reads, `gre_rules` and
+`gre_exceptions` also carry a set of purely descriptive columns -- never
+read by `load_rules()`/`execute_rule()`, safe to leave NULL, added so a
+project's own rule-catalog and audit vocabulary (e.g. a CMS Universe rule
+catalog) can live directly on these tables instead of a separate mapping
+table:
+
+**`gre_rules`**: `universe_version` (e.g. `"V22"` -- the catalog/approval
+version this rule belongs to), `universe_year`, `dgr_nbr` (an external
+rule/version identifier, e.g. `"CDAG1V22R4"` -- encodes the universe
+version and the rule's number within it), `issue_category_name`,
+`business_rule` (a business-friendly statement of what the rule checks,
+distinct from `rule_sql` itself), `rule_description`, `created_by`,
+`last_updated_by`.
+
+**`gre_exceptions`** gets three of those copied straight from the rule
+row that produced each exception, the same way `element_name`/
+`project_name`/`process_name` already are: `rule_name`, `dgr_nbr`,
+`universe_version`. It also gets two run-level values, copied from
+`run_params` *only if the caller supplies those exact keys* for this run
+(they are not reserved -- see `run_params` above -- just a courtesy
+landing spot if you use them): `run_type`, `batch_schedule`. Plus
+`last_updated_by`/`updated_at` for audit symmetry with `created_at`.
+
+```python
+summary = run_rule_group(
+    "claims_dq", run_key, cf,
+    run_params={"run_type": "MONTHLY", "batch_schedule": "WEEKDAYS_0600"},
+)
+```
+
+A rule that never sets `dgr_nbr`/`universe_version`/etc. -- which is every
+rule written before this existed -- just gets NULL there; nothing about
+this is required.
+
 ## Running multiple projects/processes: `run_all_active_groups()`
 
 `run_rule_group()` is deliberately single-`rule_group`: one call, one

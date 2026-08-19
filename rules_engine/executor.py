@@ -329,7 +329,8 @@ def evaluate_threshold(
 # gre_exceptions / gre_results writers
 # ---------------------------------------------------------------------------
 
-def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key: str, rows: list) -> int:
+def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key: str, rows: list,
+                       run_params: dict = None) -> int:
     """
     Write every violating row to gre_exceptions via one shared, batched
     path. Rows are de-duplicated by natural key WITHIN this call first (a
@@ -341,15 +342,26 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
     natural key already committed by an earlier attempt on this run_key.
     Returns how many NEW rows were inserted this call (not the total on
     file).
+
+    rule_name/dgr_nbr/universe_version are copied straight from `rule`
+    (gre_rules), same as element_name/project_name/process_name above --
+    purely descriptive, NULL if the rule row doesn't set them.
+    run_type/batch_schedule are copied from `run_params` ONLY if the
+    caller happened to supply those exact keys for this run -- also purely
+    descriptive, and never required (run_params has no reserved keys, see
+    execute_rule()'s docstring).
     """
     if not rows:
         return 0
 
+    run_params = run_params or {}
+
     sql = f"""
         INSERT INTO {meta_db}.gre_exceptions (
             run_id, rule_id, database_name, table_name, project_name, process_name,
-            element_name, source_name, issue_desc, run_key, natural_key_value
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            element_name, source_name, issue_desc, run_key, natural_key_value,
+            rule_name, dgr_nbr, universe_version, run_type, batch_schedule
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     seen = set()
     params = []
@@ -371,6 +383,11 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
             issue_desc,
             run_key,
             nk,
+            rule.get("rule_name"),
+            rule.get("dgr_nbr"),
+            rule.get("universe_version"),
+            run_params.get("run_type"),
+            run_params.get("batch_schedule"),
         ])
 
     return bulk_insert_or_skip(meta_conn, sql, params)
@@ -541,7 +558,13 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
                   auto-generated total-record count (see
                   _compute_total()/_build_total_query()). Has no
                   reserved/required key -- entirely up to the rule author
-                  what it contains.
+                  what it contains. Two keys get an extra, optional
+                  courtesy: if present, "run_type" and "batch_schedule"
+                  are ALSO copied onto gre_exceptions.run_type/
+                  batch_schedule (purely descriptive columns, see
+                  rules_engine/schema.sql) -- this doesn't make them
+                  reserved, it's just where those two particular values
+                  land if you choose to use them.
     meta_db     : schema name the gre_ tables live in
     total_cache : optional dict, shared across every rule in one
                   run_rule_group() call, that memoizes _compute_total()'s
@@ -630,7 +653,8 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     written = 0
     if violating_rows:
         try:
-            written = _write_exceptions(meta_conn, meta_db, rule, run_id, run_key, violating_rows)
+            written = _write_exceptions(meta_conn, meta_db, rule, run_id, run_key, violating_rows,
+                                        run_params=run_params)
         except Exception as exc:
             logger.warning(
                 "Rule %s: exception-row write failed (failed_records is still accurate): %s",

@@ -124,6 +124,25 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_rules (
     natural_key_columns  VARCHAR(500) NOT NULL,    -- comma-separated cols from the rule's own SELECT
     element_name         VARCHAR(200),             -- optional; copied straight into gre_exceptions
     active_flag          BYTEINT DEFAULT 1,
+    -- ── Descriptive/reporting columns below -- purely informational, never
+    -- read by engine logic (load_rules()/execute_rule() ignore them
+    -- entirely). Added to carry a project's own rule-catalog vocabulary
+    -- (e.g. a CMS Universe rule catalog) alongside the engine's own
+    -- required columns above; every one is nullable so existing rows and
+    -- projects that don't use this vocabulary are unaffected.
+    universe_version     VARCHAR(50),              -- e.g. "V22" -- the universe/rule-catalog approval
+                                                    -- version this rule belongs to
+    universe_year        INTEGER,                  -- reporting year this rule's universe cycle covers
+    dgr_nbr              VARCHAR(50),              -- external rule/version identifier, e.g.
+                                                    -- "CDAG1V22R4" (encodes universe version + rule
+                                                    -- number within it) -- copied onto gre_exceptions
+                                                    -- at write time, see below
+    issue_category_name  VARCHAR(200),             -- descriptive issue category (e.g. "Missing Data")
+    business_rule        VARCHAR(2000),            -- business-friendly statement of what this rule
+                                                    -- checks -- distinct from rule_sql (the actual SQL)
+    rule_description     VARCHAR(2000),            -- longer-form description
+    created_by           VARCHAR(100),             -- audit: who/what created this row
+    last_updated_by      VARCHAR(100),             -- audit: who/what last modified this row
     created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at           TIMESTAMP
 )
@@ -173,7 +192,10 @@ ON CMSUNIV_FILELAND_DEV_T.gre_log;
 -- exception_approver, run_key, etl_is_curr_ind, etl_load_dt,
 -- etl_last_updt_dt) plus run_id, database_name, and natural_key_value,
 -- which the legacy shape didn't need but this engine's idempotency and
--- source tie-back do.
+-- source tie-back do. rule_name/dgr_nbr/universe_version/run_type/
+-- batch_schedule/last_updated_by/updated_at below extend this further to
+-- match a project's own rule-catalog/audit vocabulary (see gre_rules'
+-- design notes) -- purely descriptive, never read by engine logic.
 --
 -- Deliberately does NOT store the violating row's own data -- only enough
 -- to re-identify it (database_name/table_name/source_name +
@@ -203,7 +225,20 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_exceptions (
     etl_load_dt           DATE,
     etl_last_updt_dt      TIMESTAMP,
     natural_key_value     VARCHAR(1000) NOT NULL,       -- built from rule.natural_key_columns
-    created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    -- ── Descriptive/reporting columns below -- purely informational, never
+    -- read by engine logic. rule_name/dgr_nbr/universe_version are copied
+    -- from gre_rules at write time (like element_name/project_name above);
+    -- run_type/batch_schedule are copied from run_params IF the caller
+    -- supplies those exact keys for this run, else NULL -- see
+    -- rules_engine/executor.py::_write_exceptions().
+    rule_name             VARCHAR(500),                 -- copied from gre_rules.rule_name
+    dgr_nbr               VARCHAR(50),                  -- copied from gre_rules.dgr_nbr
+    universe_version      VARCHAR(50),                  -- copied from gre_rules.universe_version
+    run_type              VARCHAR(50),                  -- from run_params["run_type"], if supplied
+    batch_schedule        VARCHAR(100),                 -- from run_params["batch_schedule"], if supplied
+    created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_updated_by       VARCHAR(100),                 -- audit: who/what last modified this row
+    updated_at            TIMESTAMP
 )
 PRIMARY INDEX (record_id);
 

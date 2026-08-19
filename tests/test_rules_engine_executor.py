@@ -93,7 +93,11 @@ def _conn():
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
             run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
             etl_load_dt DATE, etl_last_updt_dt TIMESTAMP,
-            natural_key_value VARCHAR, created_at TIMESTAMP DEFAULT current_timestamp
+            natural_key_value VARCHAR,
+            rule_name VARCHAR, dgr_nbr VARCHAR, universe_version VARCHAR,
+            run_type VARCHAR, batch_schedule VARCHAR,
+            created_at TIMESTAMP DEFAULT current_timestamp,
+            last_updated_by VARCHAR, updated_at TIMESTAMP
         )
     """)
     conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, run_key, natural_key_value)")
@@ -622,3 +626,79 @@ def test_execute_rule_with_year_month_run_key_not_batch_id():
 
     logs = execute_query(conn, f"SELECT * FROM gre_log WHERE rule_id = 1 AND run_key = '{run_key}'")
     assert len(logs) == 1 and logs[0]["status"] == "SUCCESS"
+
+
+# ── descriptive/reporting columns: rule_name/dgr_nbr/universe_version, ───
+# ── run_type/batch_schedule ───────────────────────────────────────────────
+
+def test_execute_rule_copies_rule_name_dgr_nbr_universe_version_onto_exceptions():
+    # rule_name/dgr_nbr/universe_version are copied straight from the rule
+    # row onto every gre_exceptions row it writes -- purely descriptive,
+    # never read by engine logic (execute_rule() doesn't branch on them).
+    conn = _conn()
+    rule = _rule(dgr_nbr="CDAG1V22R4", universe_version="V22")
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    assert status == "SUCCESS"
+
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1")
+    assert len(exceptions) == 2
+    for exc in exceptions:
+        assert exc["rule_name"] == rule["rule_name"]
+        assert exc["dgr_nbr"] == "CDAG1V22R4"
+        assert exc["universe_version"] == "V22"
+
+
+def test_execute_rule_dgr_nbr_and_universe_version_null_when_rule_doesnt_set_them():
+    # A rule that never sets dgr_nbr/universe_version (most rules, and
+    # every rule written before this feature existed) gets NULL there --
+    # this is purely additive, not a new requirement on every rule.
+    conn = _conn()
+    rule = _rule()
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    assert status == "SUCCESS"
+
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1")
+    assert len(exceptions) == 2
+    for exc in exceptions:
+        assert exc["dgr_nbr"] is None
+        assert exc["universe_version"] is None
+
+
+def test_execute_rule_copies_run_type_and_batch_schedule_from_run_params_when_present():
+    # run_type/batch_schedule are copied from run_params onto
+    # gre_exceptions IF the caller happens to supply those exact keys --
+    # they are NOT reserved/required (run_params still has no reserved
+    # key), just a courtesy landing spot for these two particular values.
+    # (Every run_params key doubles as an equality filter for the
+    # auto-generated total-record count -- see _compute_total() -- so the
+    # source table needs matching columns here, same as any other
+    # run_params key.)
+    conn = _conn()
+    conn.execute("ALTER TABLE claims ADD COLUMN run_type VARCHAR DEFAULT 'MONTHLY'")
+    conn.execute("ALTER TABLE claims ADD COLUMN batch_schedule VARCHAR DEFAULT 'WEEKDAYS_0600'")
+    rule = _rule()
+    status = execute_rule(
+        rule, _Adapter(conn), conn, "RUN1", "B1",
+        {"batch_id": "B1", "run_type": "MONTHLY", "batch_schedule": "WEEKDAYS_0600"},
+        META_DB,
+    )
+    assert status == "SUCCESS"
+
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1")
+    assert len(exceptions) == 2
+    for exc in exceptions:
+        assert exc["run_type"] == "MONTHLY"
+        assert exc["batch_schedule"] == "WEEKDAYS_0600"
+
+
+def test_execute_rule_run_type_and_batch_schedule_null_when_run_params_omits_them():
+    conn = _conn()
+    rule = _rule()
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    assert status == "SUCCESS"
+
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1")
+    assert len(exceptions) == 2
+    for exc in exceptions:
+        assert exc["run_type"] is None
+        assert exc["batch_schedule"] is None

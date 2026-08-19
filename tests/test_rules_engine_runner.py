@@ -104,7 +104,11 @@ def _conn():
             seq_no INTEGER, sequencing_mode VARCHAR, on_failure VARCHAR,
             threshold_pct DOUBLE, threshold_count INTEGER, threshold_operator VARCHAR,
             severity VARCHAR, natural_key_columns VARCHAR, element_name VARCHAR,
-            active_flag INTEGER, created_at TIMESTAMP DEFAULT current_timestamp,
+            active_flag INTEGER,
+            universe_version VARCHAR, universe_year INTEGER, dgr_nbr VARCHAR,
+            issue_category_name VARCHAR, business_rule VARCHAR, rule_description VARCHAR,
+            created_by VARCHAR, last_updated_by VARCHAR,
+            created_at TIMESTAMP DEFAULT current_timestamp,
             updated_at TIMESTAMP
         )
     """)
@@ -117,7 +121,11 @@ def _conn():
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
             run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
             etl_load_dt DATE, etl_last_updt_dt TIMESTAMP,
-            natural_key_value VARCHAR, created_at TIMESTAMP DEFAULT current_timestamp
+            natural_key_value VARCHAR,
+            rule_name VARCHAR, dgr_nbr VARCHAR, universe_version VARCHAR,
+            run_type VARCHAR, batch_schedule VARCHAR,
+            created_at TIMESTAMP DEFAULT current_timestamp,
+            last_updated_by VARCHAR, updated_at TIMESTAMP
         )
     """)
     conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, run_key, natural_key_value)")
