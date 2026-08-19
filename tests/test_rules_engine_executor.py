@@ -91,18 +91,18 @@ def _conn():
             project_name VARCHAR, process_name VARCHAR,
             element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
-            batch_id VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
+            run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
             etl_load_dt DATE, etl_last_updt_dt TIMESTAMP,
             natural_key_value VARCHAR, created_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
-    conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, batch_id, natural_key_value)")
+    conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, run_key, natural_key_value)")
 
     conn.execute("""
         CREATE TABLE gre_log (
             log_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
             project_name VARCHAR, process_name VARCHAR,
-            batch_id VARCHAR, seq_no INTEGER, start_time TIMESTAMP, end_time TIMESTAMP,
+            run_key VARCHAR, seq_no INTEGER, start_time TIMESTAMP, end_time TIMESTAMP,
             status VARCHAR, rowcount BIGINT, error_message VARCHAR,
             created_at TIMESTAMP DEFAULT current_timestamp
         )
@@ -111,14 +111,14 @@ def _conn():
     conn.execute("""
         CREATE TABLE gre_errors (
             error_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
-            batch_id VARCHAR, error_type VARCHAR, error_message VARCHAR,
+            run_key VARCHAR, error_type VARCHAR, error_message VARCHAR,
             error_detail VARCHAR, occurred_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
 
     conn.execute("""
         CREATE TABLE gre_results (
-            result_id BIGINT, rule_id INTEGER, batch_id VARCHAR, run_id VARCHAR,
+            result_id BIGINT, rule_id INTEGER, run_key VARCHAR, run_id VARCHAR,
             project_name VARCHAR, process_name VARCHAR,
             total_records BIGINT, failed_records BIGINT, failure_pct DOUBLE,
             threshold_pct_used DOUBLE, threshold_count_used INTEGER,
@@ -126,7 +126,7 @@ def _conn():
             evaluated_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
-    conn.execute("CREATE UNIQUE INDEX gre_results_uix ON gre_results(rule_id, batch_id)")
+    conn.execute("CREATE UNIQUE INDEX gre_results_uix ON gre_results(rule_id, run_key)")
 
     return conn
 
@@ -235,16 +235,16 @@ def test_execute_rule_writes_exceptions_and_result():
     conn = _conn()
     rule = _rule(threshold_pct=25)  # 2/4 = 50% > 25% -> FAIL
 
-    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
 
-    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(exceptions) == 2
     assert {r["natural_key_value"] for r in exceptions} == {"claim_id=C1", "claim_id=C3"}
     assert all(r["project_name"] == "HEALTHSPRING_UM" and r["process_name"] == "UNIVERSE_VALIDATION"
                for r in exceptions)
 
-    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND batch_id = 'B1'")
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(results) == 1
     assert results[0]["status"] == "FAIL"
     assert results[0]["total_records"] == 4
@@ -253,7 +253,7 @@ def test_execute_rule_writes_exceptions_and_result():
     assert results[0]["project_name"] == "HEALTHSPRING_UM"
     assert results[0]["process_name"] == "UNIVERSE_VALIDATION"
 
-    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND batch_id = 'B1'")
+    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(logs) == 1
     assert logs[0]["status"] == "SUCCESS"
     assert logs[0]["rowcount"] == 2
@@ -265,17 +265,17 @@ def test_execute_rule_is_idempotent_on_rerun():
     conn = _conn()
     rule = _rule(threshold_pct=25)
 
-    execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
-    execute_rule(rule, _Adapter(conn), conn, "RUN2", {"batch_id": "B1"}, META_DB)  # simulate a rerun of the same batch
+    execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    execute_rule(rule, _Adapter(conn), conn, "RUN2", "B1", {"batch_id": "B1"}, META_DB)  # simulate a rerun of the same batch
 
-    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(exceptions) == 2   # not duplicated
 
-    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND batch_id = 'B1'")
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(results) == 1      # upserted in place, not a second row
     assert results[0]["run_id"] == "RUN2"   # reflects the latest run
 
-    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND batch_id = 'B1'")
+    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(logs) == 2         # both attempts are logged (attempt history, unlike results)
 
 
@@ -283,11 +283,11 @@ def test_execute_rule_batches_are_isolated():
     conn = _conn()
     rule = _rule(threshold_pct=25)
 
-    execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
-    execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B2"}, META_DB)
+    execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    execute_rule(rule, _Adapter(conn), conn, "RUN1", "B2", {"batch_id": "B2"}, META_DB)
 
-    b1 = execute_query(conn, "SELECT * FROM gre_exceptions WHERE batch_id = 'B1'")
-    b2 = execute_query(conn, "SELECT * FROM gre_exceptions WHERE batch_id = 'B2'")
+    b1 = execute_query(conn, "SELECT * FROM gre_exceptions WHERE run_key = 'B1'")
+    b2 = execute_query(conn, "SELECT * FROM gre_exceptions WHERE run_key = 'B2'")
     assert len(b1) == 2
     assert len(b2) == 1   # only C5 is in B2
 
@@ -296,15 +296,15 @@ def test_execute_rule_no_threshold_fallback_not_written_when_partial_failure():
     conn = _conn()
     rule = _rule(threshold_pct=None, threshold_count=None)  # 2/4 fail, no threshold
 
-    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
 
     # Exceptions are still written regardless of any threshold...
-    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(exceptions) == 2
 
     # ...but gre_results gets no row, since not every in-scope record failed.
-    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND batch_id = 'B1'")
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(results) == 0
 
 
@@ -312,7 +312,7 @@ def test_execute_rule_sql_error_routes_to_errors_and_logs():
     conn = _conn()
     rule = _rule(rule_sql="SELECT * FROM no_such_table WHERE batch_id = '{batch_id}'")
 
-    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     assert status == "ERROR"
 
     errors = execute_query(conn, "SELECT * FROM gre_errors WHERE rule_id = 1")
@@ -342,14 +342,14 @@ def test_write_exceptions_dedupes_natural_key_within_one_pull():
                  "SELECT claim_id, denial_reason FROM claims "
                  "WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
     )
-    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
 
-    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(exceptions) == 2   # C1, C3 -- deduped, not 4, even though the pull returned each twice
     assert {r["natural_key_value"] for r in exceptions} == {"claim_id=C1", "claim_id=C3"}
 
-    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND batch_id = 'B1'")
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(results) == 1
     assert results[0]["failed_records"] == 4   # true COUNT(*) on rule_sql counts every returned row
 
@@ -359,16 +359,16 @@ def test_max_exceptions_cap_keeps_failed_records_true_but_caps_detail_rows(monke
     monkeypatch.setattr(rules_engine_executor, "MAX_EXCEPTIONS", 1)
     rule = _rule(threshold_pct=0)   # any failure breaches -> a gre_results row is written
 
-    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
 
-    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(exceptions) == 1   # capped at MAX_EXCEPTIONS=1
 
-    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND batch_id = 'B1'")
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
     assert results[0]["failed_records"] == 2   # true count stays exact -- 2 of 4 actually failed
 
-    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND batch_id = 'B1'")
+    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND run_key = 'B1'")
     assert logs[0]["rowcount"] == 1   # "rows written to gre_exceptions this attempt" == the capped count
 
 
@@ -385,7 +385,7 @@ def test_execute_rule_prepare_failure_routes_to_errors_before_any_query():
             raise ValueError("table_name is empty -- cannot prepare file source.")
 
     rule = _rule(threshold_pct=25)
-    status = execute_rule(rule, _FailingAdapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    status = execute_rule(rule, _FailingAdapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     assert status == "ERROR"
 
     errors = execute_query(conn, "SELECT * FROM gre_errors WHERE rule_id = 1")
@@ -413,7 +413,7 @@ def test_execute_rule_calls_prepare_before_scanning():
             calls.append(rule["rule_id"])
 
     rule = _rule(threshold_pct=25)
-    status = execute_rule(rule, _TrackingAdapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    status = execute_rule(rule, _TrackingAdapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
     assert calls == [1]
 
@@ -540,7 +540,7 @@ def test_execute_rule_issues_two_source_queries_not_three():
     wrapped_db = _CursorCountingWrapper(conn)
     rule = _rule(threshold_pct=25)
 
-    status = execute_rule(rule, wrapped_db, conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    status = execute_rule(rule, wrapped_db, conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
     assert wrapped_db.cursor_calls == 2
 
@@ -559,10 +559,10 @@ def test_execute_rule_uses_extra_run_params_key_beyond_batch_id():
         rule_sql="SELECT claim_id, denial_reason FROM claims "
                  "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' AND '{run_type}' = 'MONTHLY'",
     )
-    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B1", "run_type": "MONTHLY"}, META_DB)
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1", "run_type": "MONTHLY"}, META_DB)
     assert status == "SUCCESS"
 
-    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(exceptions) == 2   # C1, C3 -- the extra {run_type} token resolved and matched
 
 
@@ -578,7 +578,7 @@ def test_execute_rule_unresolved_token_fails_fast_before_any_query():
                  "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' AND run_type = '{run_type}'",
     )
 
-    status = execute_rule(rule, wrapped_db, conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    status = execute_rule(rule, wrapped_db, conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     assert status == "ERROR"
     assert wrapped_db.cursor_calls == 0   # caught before any source query ran
 
@@ -592,3 +592,33 @@ def test_execute_rule_unresolved_token_fails_fast_before_any_query():
 
     assert execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1") == []
     assert execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1") == []
+
+
+# ── run_key genericity: no "batch_id" concept required ───────────────────
+
+def test_execute_rule_with_year_month_run_key_not_batch_id():
+    # run_key doesn't have to be a "batch" at all -- a year+month composite
+    # (built via shared/db_ops.py::build_run_key()) works identically, and
+    # run_params contains NO "batch_id" key anywhere -- rule_sql here
+    # doesn't reference {batch_id}, proving run_key is fully decoupled
+    # from run_params.
+    from shared.db_ops import build_run_key
+    conn = _conn()
+    run_key = build_run_key(2026, 8)
+    assert run_key == "2026_8"
+
+    rule = _rule(
+        rule_sql="SELECT claim_id, denial_reason FROM claims WHERE denial_reason IS NULL",
+        threshold_pct=25,
+    )
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", run_key, {}, META_DB)
+    assert status == "SUCCESS"
+
+    exceptions = execute_query(conn, f"SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = '{run_key}'")
+    assert len(exceptions) == 3   # C1, C3, C5 -- no batch_id filter in rule_sql this time
+
+    results = execute_query(conn, f"SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = '{run_key}'")
+    assert len(results) == 1
+
+    logs = execute_query(conn, f"SELECT * FROM gre_log WHERE rule_id = 1 AND run_key = '{run_key}'")
+    assert len(logs) == 1 and logs[0]["status"] == "SUCCESS"

@@ -30,18 +30,34 @@ and the `gre_audit`/`gre_errors` tables).
 | `schema_drop.sql` | Drops the 5 tables above, for the drop-and-recreate redeploy policy (see the repo root README). |
 | `seed/um_sample.sql` | The original COMO weekly UM sample (`dq_sampling_config.config_id=1`) re-expressed in this schema -- also the regression fixture `tests/test_sampling.py` checks against. |
 
+## Tracking a run: `run_key`
+
+`run_key` is an opaque, caller-supplied string -- the ONE tracking
+identifier `gre_audit` and `gre_errors` key off, and it's what
+`sample_run_id` is built from (`f"{sample_name}_{run_key}_{timestamp}"`).
+There's no fixed shape to it: a plain batch id, a year+month combo, a
+specific date, a region, or any combination all work equally well.
+`shared/db_ops.py`'s `build_run_key(*parts, delimiter="_")` is a
+convenience formatter (`build_run_key(2026, 8) -> "2026_8"`), or just pass
+your own string.
+
 ## Scoping the candidate pull: `run_params`
 
 `scope_sql` and `exclusion_sql` may both embed any number of `"{key}"`
-tokens (not just `{batch_id}`) -- each run passes a `run_params` dict, and
-every matching token is substituted (quoted, escaped) before the pull
-query runs, the SAME mechanism and dict shape `rules_engine/` uses for
-`rule_sql`/`scope_sql`. `batch_id` is always present in `run_params`:
+tokens -- each run passes a `run_params` dict, and every matching token is
+substituted (quoted, escaped) before the pull query runs, the SAME
+mechanism and dict shape `rules_engine/` uses for `rule_sql`/`scope_sql`.
+`run_params` is completely free-form -- there is no reserved/required
+key, and `run_key` is deliberately NOT auto-merged into it, since it's
+often not a real column on the universe table (e.g. a composite like
+`"2026_8"`). If `scope_sql`/`exclusion_sql` needs the run's tracking value
+as a literal column filter, pass it explicitly via `run_params` under
+whatever key matches an actual column:
 
 ```python
 result = run_sampling(
-    config_id=1, batch_id="2026-08-14", cf=cf,
-    run_params={"region": "NORTHEAST"},
+    config_id=1, run_key="2026-08-14", cf=cf,
+    run_params={"pull_date": "2026-08-14", "region": "NORTHEAST"},
 )
 ```
 
@@ -90,7 +106,7 @@ from sampling.sampling import run_sampling
 cf = ConnectionFactory()
 cf.load()
 
-result = run_sampling(config_id=1, batch_id="2026-08-14", cf=cf)
+result = run_sampling(config_id=1, run_key="2026-08-14", cf=cf)
 print(result["status"], result["selected"], "/", result["target_volume"])
 ```
 

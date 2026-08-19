@@ -140,21 +140,21 @@ def test_get_max_parallel_for_connection_is_independent_per_type(monkeypatch):
     assert shared_config.get_max_parallel_for_connection("s3") == 1
 
 
-def test_check_batch_ready_defaults_true_when_unregistered():
-    assert shared_config.check_batch_ready("some_unregistered_group", "batch_1") is True
+def test_check_run_ready_defaults_true_when_unregistered():
+    assert shared_config.check_run_ready("some_unregistered_group", "run_1") is True
 
 
-def test_check_batch_ready_uses_registered_check():
+def test_check_run_ready_uses_registered_check():
     calls = []
 
-    def fake_check(batch_id, meta_conn):
-        calls.append((batch_id, meta_conn))
-        return batch_id == "ready_batch"
+    def fake_check(run_key, meta_conn):
+        calls.append((run_key, meta_conn))
+        return run_key == "ready_run"
 
     shared_config.register_readiness_check("my_group", fake_check)
     try:
-        assert shared_config.check_batch_ready("my_group", "ready_batch") is True
-        assert shared_config.check_batch_ready("my_group", "other_batch") is False
-        assert calls == [("ready_batch", None), ("other_batch", None)]
+        assert shared_config.check_run_ready("my_group", "ready_run") is True
+        assert shared_config.check_run_ready("my_group", "other_run") is False
+        assert calls == [("ready_run", None), ("other_run", None)]
     finally:
         shared_config._READINESS_CHECKS.pop("my_group", None)

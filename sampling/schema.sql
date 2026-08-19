@@ -35,7 +35,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_config (
     universe_table       VARCHAR(200) NOT NULL,   -- fully-qualified FROM target, e.g. "db.schema.table"
     key_columns          VARCHAR(500) NOT NULL,   -- entity key column(s), CSV
     scope_sql            CLOB,                    -- WHERE-fragment; may embed any number of
-                                                    -- "{key}" tokens (e.g. {batch_id}, {year}),
+                                                    -- "{key}" tokens (e.g. {run_date}, {year}),
                                                     -- substituted from run_params the same way
                                                     -- rules_engine's rule_sql is -- see
                                                     -- shared/db_ops.py::_substitute_params().

@@ -18,16 +18,16 @@ GRE_META_CONNECTION picks which source_type ('teradata', 'postgres', 's3',
 'file' -- see db/connection_factory.py) holds the gre_ tables. Defaults to
 "teradata". No separate connection setup is required out of the box.
 
-Batch-readiness precondition (deferred for v1)
+Run-readiness precondition (deferred for v1)
 -------------------------------------------------
 The original prompt calls for a "don't evaluate rules until the source
-batch/load is complete" precondition, expressed as config rather than
-hardcoded per rule. For v1 this ships as a no-op extension point:
-check_batch_ready() always returns True unless a check has been
-registered for that rule_group via register_readiness_check(). Wiring up
-a real check (e.g. a status-table SELECT) for a given rule_group is then
-a one-line addition here, not an engine code change. (Sampling has no
-equivalent readiness gate -- it runs on demand against a pull_date.)
+data for this run is complete" precondition, expressed as config rather
+than hardcoded per rule. For v1 this ships as a no-op extension point:
+check_run_ready() always returns True unless a check has been registered
+for that rule_group via register_readiness_check(). Wiring up a real
+check (e.g. a status-table SELECT keyed off the run's run_key) is then a
+one-line addition here, not an engine code change. (Sampling has no
+equivalent readiness gate -- it runs on demand.)
 
 Local dev credentials (.env)
 -------------------------------
@@ -149,7 +149,7 @@ def get_max_parallel_for_connection(source_type: str) -> int:
     return max(1, int(os.getenv(f"GRE_{source_type.upper()}_MAX_PARALLEL", "1")))
 
 
-# ── Batch-readiness precondition (deferred; see module docstring) ─────────
+# ── Run-readiness precondition (deferred; see module docstring) ───────────
 _READINESS_CHECKS: Dict[str, Callable[[str, object], bool]] = {}
 
 
@@ -157,16 +157,16 @@ def register_readiness_check(rule_group: str, fn: Callable[[str, object], bool])
     """
     Register a readiness check for a rule_group.
 
-    fn receives (batch_id, meta_conn) and returns True when the batch is
+    fn receives (run_key, meta_conn) and returns True when that run is
     ready to be evaluated. Not called anywhere in v1 unless registered --
-    see check_batch_ready() below.
+    see check_run_ready() below.
     """
     _READINESS_CHECKS[rule_group] = fn
 
 
-def check_batch_ready(rule_group: str, batch_id: str, meta_conn=None) -> bool:
+def check_run_ready(rule_group: str, run_key: str, meta_conn=None) -> bool:
     """
-    Return True when `rule_group` is clear to run against `batch_id`.
+    Return True when `rule_group` is clear to run against `run_key`.
 
     v1 default: always True (no-op) unless a check was registered for this
     rule_group via register_readiness_check(). This keeps the precondition
@@ -176,4 +176,4 @@ def check_batch_ready(rule_group: str, batch_id: str, meta_conn=None) -> bool:
     fn = _READINESS_CHECKS.get(rule_group)
     if fn is None:
         return True
-    return bool(fn(batch_id, meta_conn))
+    return bool(fn(run_key, meta_conn))

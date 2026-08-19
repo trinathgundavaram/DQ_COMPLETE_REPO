@@ -113,18 +113,18 @@ def _conn():
             project_name VARCHAR, process_name VARCHAR,
             element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
-            batch_id VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
+            run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
             etl_load_dt DATE, etl_last_updt_dt TIMESTAMP,
             natural_key_value VARCHAR, created_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
-    conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, batch_id, natural_key_value)")
+    conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, run_key, natural_key_value)")
 
     conn.execute("""
         CREATE TABLE gre_log (
             log_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
             project_name VARCHAR, process_name VARCHAR,
-            batch_id VARCHAR, seq_no INTEGER, start_time TIMESTAMP, end_time TIMESTAMP,
+            run_key VARCHAR, seq_no INTEGER, start_time TIMESTAMP, end_time TIMESTAMP,
             status VARCHAR, rowcount BIGINT, error_message VARCHAR,
             created_at TIMESTAMP DEFAULT current_timestamp
         )
@@ -133,14 +133,14 @@ def _conn():
     conn.execute("""
         CREATE TABLE gre_errors (
             error_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
-            batch_id VARCHAR, error_type VARCHAR, error_message VARCHAR,
+            run_key VARCHAR, error_type VARCHAR, error_message VARCHAR,
             error_detail VARCHAR, occurred_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
 
     conn.execute("""
         CREATE TABLE gre_results (
-            result_id BIGINT, rule_id INTEGER, batch_id VARCHAR, run_id VARCHAR,
+            result_id BIGINT, rule_id INTEGER, run_key VARCHAR, run_id VARCHAR,
             project_name VARCHAR, process_name VARCHAR,
             total_records BIGINT, failed_records BIGINT, failure_pct DOUBLE,
             threshold_pct_used DOUBLE, threshold_count_used INTEGER,
@@ -148,12 +148,12 @@ def _conn():
             evaluated_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
-    conn.execute("CREATE UNIQUE INDEX gre_results_uix ON gre_results(rule_id, batch_id)")
+    conn.execute("CREATE UNIQUE INDEX gre_results_uix ON gre_results(rule_id, run_key)")
 
     conn.execute("""
         CREATE TABLE gre_audit (
             run_id VARCHAR, rule_group VARCHAR, project_name VARCHAR, process_name VARCHAR,
-            batch_id VARCHAR, rule_variant VARCHAR,
+            run_key VARCHAR, rule_variant VARCHAR,
             started_at TIMESTAMP, ended_at TIMESTAMP, status VARCHAR,
             total_rules INTEGER, rules_succeeded INTEGER, rules_errored INTEGER,
             triggered_by VARCHAR, created_at TIMESTAMP DEFAULT current_timestamp
@@ -181,6 +181,29 @@ _MISSING_REASON_SQL = "SELECT claim_id FROM claims WHERE denial_reason IS NULL A
 _BROKEN_SQL = "SELECT * FROM no_such_table WHERE batch_id = '{batch_id}'"
 
 
+def _run(rule_group, run_key, cf, **kwargs):
+    """
+    Test convenience wrapper: run_key is no longer auto-injected into
+    run_params (see rules_engine/runner.py::run_rule_group()'s docstring
+    -- doing so would corrupt _compute_total()'s auto-generated filter for
+    any table without a run_key column). _MISSING_REASON_SQL/_BROKEN_SQL
+    reference the real claims.batch_id business column via a "{batch_id}"
+    token, so default it to run_key's value here (matching the OLD
+    build_run_params() behavior) unless the caller passes their own
+    run_params, in which case merge rather than replace.
+    """
+    run_params = {"batch_id": run_key}
+    run_params.update(kwargs.pop("run_params", None) or {})
+    return run_rule_group(rule_group, run_key, cf, run_params=run_params, **kwargs)
+
+
+def _run_all(meta_conn, meta_db, run_key, cf, **kwargs):
+    """Same convenience as _run(), for run_all_active_groups()."""
+    run_params = {"batch_id": run_key}
+    run_params.update(kwargs.pop("run_params", None) or {})
+    return run_all_active_groups(meta_conn, meta_db, run_key, cf, run_params=run_params, **kwargs)
+
+
 def test_checkpoint_resume_skips_already_succeeded_rules():
     conn = _conn()
     cf = _FakeConnectionFactory(conn)
@@ -189,11 +212,11 @@ def test_checkpoint_resume_skips_already_succeeded_rules():
 
     # Pre-seed gre_log as if rule 1 already succeeded in a prior (interrupted) run.
     conn.execute("""
-        INSERT INTO gre_log (run_id, rule_id, rule_group, batch_id, status, rowcount)
+        INSERT INTO gre_log (run_id, rule_id, rule_group, run_key, status, rowcount)
         VALUES ('PRIOR_RUN', 1, 'claims_dq', 'B1', 'SUCCESS', 2)
     """)
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "COMPLETED"
     assert 1 not in summary["results"]          # rule 1 was skipped, not re-run
@@ -212,7 +235,7 @@ def test_sequential_halt_group_stops_before_next_rule():
     _insert_rule(conn, 1, _BROKEN_SQL, seq_no=10, sequencing_mode="sequential", on_failure="halt_group")
     _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="sequential", on_failure="halt_group")
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "HALTED"
     assert summary["results"][1] == "ERROR"
@@ -228,7 +251,7 @@ def test_sequential_skip_and_continue_runs_next_rule_after_error():
     _insert_rule(conn, 1, _BROKEN_SQL, seq_no=10, sequencing_mode="sequential", on_failure="skip_and_continue")
     _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="sequential", on_failure="skip_and_continue")
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "COMPLETED"
     assert summary["results"][1] == "ERROR"
@@ -244,7 +267,7 @@ def test_independent_mode_runs_every_rule_regardless_of_earlier_errors():
     _insert_rule(conn, 1, _BROKEN_SQL, seq_no=10, sequencing_mode="independent")
     _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="independent")
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "COMPLETED"
     assert summary["results"][1] == "ERROR"
@@ -254,14 +277,14 @@ def test_independent_mode_runs_every_rule_regardless_of_earlier_errors():
 def test_no_rules_returns_no_rules_status():
     conn = _conn()
     cf = _FakeConnectionFactory(conn)
-    summary = run_rule_group("empty_group", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    summary = _run("empty_group", "B1", cf, meta_conn=conn, meta_db=META_DB)
     assert summary["status"] == "NO_RULES"
 
 
 def test_shared_total_cache_avoids_redundant_count_queries_across_rules(monkeypatch):
     # Two rules in the same group, same database_name/table_name, same
     # run_params -- _compute_total() auto-builds the identical
-    # database.table + WHERE batch_id = 'B1' query for both, so within one
+    # database.table + WHERE batch_id = '{run_key}' query for both, so within one
     # run_rule_group() call that COUNT(*) should only actually run once.
     conn = _conn()
     cf = _FakeConnectionFactory(conn)
@@ -280,7 +303,7 @@ def test_shared_total_cache_avoids_redundant_count_queries_across_rules(monkeypa
 
     monkeypatch.setattr(rules_engine_executor, "_run_source_query", counting)
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "COMPLETED"
     assert summary["results"][1] == "SUCCESS"
@@ -292,7 +315,7 @@ def test_shared_total_cache_avoids_redundant_count_queries_across_rules(monkeypa
 
     # Both rules should still report the correct total, proving the cached
     # value is being reused correctly, not just skipped.
-    results = execute_query(conn, "SELECT rule_id, total_records FROM gre_results WHERE batch_id = 'B1'")
+    results = execute_query(conn, "SELECT rule_id, total_records FROM gre_results WHERE run_key = 'B1'")
     assert {r["rule_id"]: r["total_records"] for r in results} == {1: 4, 2: 4}
 
 
@@ -304,7 +327,7 @@ def test_rule_variant_none_requested_runs_only_universal_rules():
     _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_variant=None)      # universal
     _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, rule_variant="2026")    # variant-specific
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "COMPLETED"
     assert summary["total_rules"] == 1
@@ -319,7 +342,7 @@ def test_rule_variant_requested_runs_universal_plus_matching_variant():
     _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, rule_variant="2026")     # matches
     _insert_rule(conn, 3, _MISSING_REASON_SQL, seq_no=30, rule_variant="2025")     # does NOT match
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB, rule_variant="2026")
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB, rule_variant="2026")
 
     assert summary["status"] == "COMPLETED"
     assert summary["total_rules"] == 2
@@ -345,26 +368,34 @@ def test_run_params_extra_key_is_available_to_every_rule_sql():
         seq_no=10,
     )
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB,
-                             run_params={"run_type": "MONTHLY"})
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB,
+                    run_params={"run_type": "MONTHLY"})
 
     assert summary["status"] == "COMPLETED"
     assert summary["results"][1] == "SUCCESS"
 
 
-def test_run_params_stray_batch_id_key_never_overrides_the_real_one():
+def test_run_params_batch_id_key_is_an_ordinary_key_not_reserved():
+    # run_key is now fully decoupled from run_params: passing a
+    # run_params["batch_id"] that differs from run_key doesn't collide with
+    # anything, because run_key is never auto-merged into run_params (see
+    # rules_engine/runner.py::run_rule_group()'s docstring). Tracking
+    # (gre_exceptions/gre_log/gre_results) is keyed by run_key ("TRACKING_KEY"
+    # here); the business filter used by _MISSING_REASON_SQL's {batch_id}
+    # token is driven independently by run_params["batch_id"] ("B1").
     conn = _conn()
     cf = _FakeConnectionFactory(conn)
     _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10)
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB,
-                             run_params={"batch_id": "SOMETHING_ELSE"})
+    summary = run_rule_group("claims_dq", "TRACKING_KEY", cf, meta_conn=conn, meta_db=META_DB,
+                              run_params={"batch_id": "B1"})
 
     assert summary["status"] == "COMPLETED"
-    # Findings are still recorded under the REAL batch_id ('B1'), proving
-    # build_run_params() let the dedicated batch_id argument win.
-    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
+    # Findings are recorded under run_key, NOT the business batch_id value.
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'TRACKING_KEY'")
     assert len(exceptions) == 2
+    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND run_key = 'TRACKING_KEY'")
+    assert len(logs) == 1 and logs[0]["status"] == "SUCCESS"
 
 
 # ── Parallel execution (opt-in via GRE_MAX_PARALLEL_RULES) ──────────────
@@ -390,7 +421,7 @@ def test_parallel_disabled_by_default_uses_sequential_path(monkeypatch):
     _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="independent")
     _insert_rule(conn, 3, _MISSING_REASON_SQL, seq_no=30, sequencing_mode="independent")
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "COMPLETED"
     assert summary["succeeded"] == 3
@@ -405,7 +436,7 @@ def test_parallel_enabled_runs_every_independent_rule(monkeypatch):
     _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="independent")
     _insert_rule(conn, 3, _BROKEN_SQL, seq_no=30, sequencing_mode="independent")
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "COMPLETED"
     assert summary["results"] == {1: "SUCCESS", 2: "SUCCESS", 3: "ERROR"}
@@ -413,7 +444,7 @@ def test_parallel_enabled_runs_every_independent_rule(monkeypatch):
     assert summary["errored"] == 1
     # Findings actually landed -- the parallel path commits through real
     # (pooled) connections, not a no-op.
-    exceptions = execute_query(conn, "SELECT rule_id FROM gre_exceptions WHERE batch_id = 'B1'")
+    exceptions = execute_query(conn, "SELECT rule_id FROM gre_exceptions WHERE run_key = 'B1'")
     assert {r["rule_id"] for r in exceptions} == {1, 2}
     # The pool did open independent connections this time (both source and
     # meta side), proving the parallel path was actually taken.
@@ -431,7 +462,7 @@ def test_parallel_never_applies_to_sequential_mode_even_when_enabled(monkeypatch
     _insert_rule(conn, 1, _BROKEN_SQL, seq_no=10, sequencing_mode="sequential", on_failure="halt_group")
     _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="sequential", on_failure="halt_group")
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "HALTED"
     assert summary["results"][1] == "ERROR"
@@ -449,7 +480,7 @@ def test_parallel_sql_dialect_unavailable_marks_rule_error_without_deadlock(monk
     _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, sequencing_mode="independent")
     _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="independent")
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "COMPLETED"
     assert summary["results"] == {1: "ERROR", 2: "ERROR"}
@@ -468,7 +499,7 @@ def test_parallel_meta_connection_unavailable_fails_every_rule_without_deadlock(
     _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, sequencing_mode="independent")
     _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="independent")
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "COMPLETED"
     assert summary["results"] == {1: "ERROR", 2: "ERROR"}
@@ -482,7 +513,7 @@ def test_parallel_respects_per_connection_max_parallel_cap(monkeypatch):
     for rule_id, seq_no in [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]:
         _insert_rule(conn, rule_id, _MISSING_REASON_SQL, seq_no=seq_no, sequencing_mode="independent")
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "COMPLETED"
     assert summary["succeeded"] == 5
@@ -513,7 +544,7 @@ def test_parallel_closes_pooled_connections_after_the_run(monkeypatch):
 
     cf.new_connection = tracking
 
-    run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert len(issued) > 0
     for cursor in issued:
@@ -536,10 +567,10 @@ def test_parallel_shared_total_cache_still_avoids_redundant_count_queries(monkey
     _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="independent")
     conn.execute("UPDATE gre_rules SET threshold_pct = 0")
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "COMPLETED"
-    results = execute_query(conn, "SELECT rule_id, total_records FROM gre_results WHERE batch_id = 'B1'")
+    results = execute_query(conn, "SELECT rule_id, total_records FROM gre_results WHERE run_key = 'B1'")
     # Regardless of any redundant-query race, both rules must still report
     # the correct total -- that's the actual correctness guarantee; the
     # redundant-query count itself isn't asserted since it's timing-dependent.
@@ -554,7 +585,7 @@ def test_gre_audit_carries_project_and_process_name_from_rules():
     _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10,
                  project_name="HEALTHSPRING_UM", process_name="UNIVERSE_VALIDATION")
 
-    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
     assert summary["status"] == "COMPLETED"
 
     audit = execute_query(conn, "SELECT * FROM gre_audit WHERE run_id = ?", [summary["run_id"]])
@@ -572,7 +603,7 @@ def test_gre_audit_warns_and_picks_lowest_seq_no_on_mixed_project_name(caplog):
                  project_name="OTHER_PROJECT", process_name="OTHER_PROCESS")
 
     with caplog.at_level("WARNING"):
-        summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+        summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "COMPLETED"
     audit = execute_query(conn, "SELECT * FROM gre_audit WHERE run_id = ?", [summary["run_id"]])
@@ -604,7 +635,7 @@ def test_run_all_active_groups_runs_one_group_per_rule_group():
     _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=10, rule_group="group_b",
                  project_name="PROJECT_B", process_name="PROC_B")
 
-    outcome = run_all_active_groups(conn, META_DB, "B1", cf)
+    outcome = _run_all(conn, META_DB, "B1", cf)
 
     assert set(outcome["rule_groups"].keys()) == {"group_a", "group_b"}
     assert outcome["rule_groups"]["group_a"]["status"] == "COMPLETED"
@@ -621,6 +652,6 @@ def test_run_all_active_groups_scoped_to_one_project():
     _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=10, rule_group="group_b",
                  project_name="PROJECT_B", process_name="PROC_B")
 
-    outcome = run_all_active_groups(conn, META_DB, "B1", cf, project_name="PROJECT_A")
+    outcome = _run_all(conn, META_DB, "B1", cf, project_name="PROJECT_A")
 
     assert set(outcome["rule_groups"].keys()) == {"group_a"}

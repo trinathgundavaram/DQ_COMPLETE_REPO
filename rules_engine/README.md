@@ -3,21 +3,29 @@
 A generic, config-driven rule evaluation engine: `gre_rules` rows define a
 negative SQL SELECT per rule (the query returns the rows that VIOLATE the
 rule); the engine runs each active rule for a `rule_group` (optionally
-narrowed further by `rule_variant` -- see below) against a `batch_id`,
+narrowed further by `rule_variant` -- see below) against a `run_key`,
 writes every violating row to `gre_exceptions`, evaluates a threshold, and
 upserts a `gre_results` verdict row.
 
+## Tracking a run: `run_key`
+
+`run_key` is an opaque, caller-supplied string -- the ONE tracking/
+idempotency identifier `gre_log`, `gre_exceptions` (`gre_exceptions_uix`),
+`gre_results` (`gre_results_uix`), and `gre_audit` all key off. There's no
+fixed shape to it: a plain batch id, a year+month combo, a specific date,
+a region, or any combination all work equally well. `shared/db_ops.py`'s
+`build_run_key(*parts, delimiter="_")` is a convenience formatter
+(`build_run_key(2026, 8) -> "2026_8"`), or just pass your own string.
+
 ## Scoping a rule's data: `run_params`
 
-`rule_sql` may embed any number of `"{key}"` tokens (not just
-`{batch_id}`) -- each run passes a `run_params` dict, and every matching
-token is substituted (quoted, escaped) before the query runs. A project
-scopes its data however it needs: month/year, `batch_id` + `run_type`, a
-date range, a region/contract column, or nothing at all (whole table).
-`batch_id` is always present in `run_params` -- it's still the
-tracking/idempotency key (`gre_exceptions_uix`, `gre_log`, `gre_results`,
-`gre_audit`) -- but a rule can reference any other key the caller
-supplies too:
+`rule_sql` may embed any number of `"{key}"` tokens -- each run passes a
+`run_params` dict, and every matching token is substituted (quoted,
+escaped) before the query runs. A project scopes its data however it
+needs: month/year, a business batch id, a date range, a region/contract
+column, or nothing at all (whole table). `run_params` is completely
+free-form -- there is no reserved/required key, and `run_key` is
+deliberately NOT auto-merged into it (see below):
 
 ```python
 summary = run_rule_group(
@@ -39,8 +47,14 @@ real database, or the prepared view name for a file/S3 source -- see
 `run_params` as an equality filter (AND'd together) -- the SAME dict that
 scopes `rule_sql` already says what's in scope for the total, so there's
 nothing left to hand-write. A rule's table needs a real column for every
-key its run passes (e.g. if a table has no `batch_id` column, don't
-include one when scoping runs against it).
+key its run passes (e.g. if a table has no matching column, don't include
+that key when scoping runs against it). This is also why `run_key` isn't
+auto-injected into `run_params`: `run_key` is often NOT a real column
+(e.g. a composite like `"2026_8"`), so auto-adding it would silently
+break the total-record query for most tables. If `rule_sql` needs to
+reference the run's tracking value as a literal column filter, pass it
+explicitly via `run_params` under whatever key matches an actual column
+(e.g. `run_params={"batch_id": "BATCH_2026_08_14"}`).
 
 ## One connection per source: `sql_dialect`
 
@@ -71,7 +85,7 @@ same name in its `FROM` clause:
 ```sql
 -- gre_rules row: database_name='/data/inbound', table_name='claims.csv',
 -- sql_dialect='file'
-SELECT claim_id FROM claims WHERE denial_reason IS NULL AND batch_id = '{batch_id}'
+SELECT claim_id FROM claims WHERE denial_reason IS NULL AND claim_batch = '{claim_batch}'
 --                   ^^^^^^ view name = _view_name('claims.csv') = 'claims'
 ```
 
@@ -225,7 +239,7 @@ from `rule['natural_key_columns']` (`"col1=val1|col2=val2"`, via
 `executor.py`'s `build_natural_key()`/`_format_natural_key()`).
 
 `reporting.py`'s `get_source_records_for_rule(cf, meta_conn, meta_db,
-rule_id, batch_id)` does the tie-back the other way, lazily, at
+rule_id, run_key)` does the tie-back the other way, lazily, at
 report/analysis time -- "pull the 50 records that failed rule 1" for a
 dashboard, an analyst review, or a downstream share-out:
 
@@ -233,11 +247,11 @@ dashboard, an analyst review, or a downstream share-out:
 from rules_engine.reporting import get_source_records_for_rule
 
 records = get_source_records_for_rule(cf, meta_conn, "CMSUNIV_FILELAND_DEV_T",
-                                       rule_id=1, batch_id="BATCH_2026_08_14")
+                                       rule_id=1, run_key="BATCH_2026_08_14")
 ```
 
 It queries the current-version (`etl_is_curr_ind = 'Y'`) `gre_exceptions`
-rows for that `(rule_id, batch_id)`, parses each `natural_key_value` back
+rows for that `(rule_id, run_key)`, parses each `natural_key_value` back
 into column/value pairs (`executor.py`'s `parse_natural_key()`), and
 re-joins to the LIVE source table in `EXCEPTION_CHUNK`-sized batches (the
 same chunk size `bulk_insert_or_skip()` uses) via the same

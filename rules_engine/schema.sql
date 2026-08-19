@@ -22,14 +22,18 @@
 -- Design notes (see rules_engine/config usage via shared/config.py,
 -- rules_engine/executor.py docstrings for the code that relies on these
 -- shapes):
---   * rule_sql may embed any number of "{key}" tokens (e.g. "{batch_id}",
+--   * rule_sql may embed any number of "{key}" tokens (e.g. "{run_date}",
 --     "{year}", "{run_type}"). The engine string-substitutes each one
 --     (quoted, escaped) from the run_params dict passed to this run --
---     see shared/db_ops.py::_substitute_params() / build_run_params().
---     batch_id is always present in run_params (it's still the
---     tracking/idempotency key -- gre_exceptions_uix, gre_log,
---     gre_results, gre_audit), but a rule can reference any other key the
---     caller supplies. There is no filter_column/filter_sql system like
+--     see shared/db_ops.py::_substitute_params(). run_params has NO
+--     reserved/required key -- entirely up to the rule author what it
+--     contains. The one value the tracking/idempotency schema
+--     (gre_exceptions_uix, gre_log, gre_results, gre_audit) keys off is
+--     `run_key`, a SEPARATE explicit parameter passed alongside
+--     run_params to rules_engine/runner.py's entry points -- see
+--     shared/db_ops.py::build_run_key() for a convenience way to build one
+--     out of a batch id, a year+month pair, a specific date, or any other
+--     column/combination. There is no filter_column/filter_sql system like
 --     dq_rules has; SQL-authoring rules are expected to be fully
 --     self-contained -- an unresolved "{token}" fails the rule attempt
 --     immediately (PARAM_SUBSTITUTION_ERROR) rather than reaching the
@@ -40,11 +44,11 @@
 --     already IS the definition of what's in scope for this run, so a
 --     second, independently hand-written WHERE clause was pure
 --     duplication (and a real drift risk -- the two could silently
---     disagree). Every key present in run_params (batch_id included) is
---     applied as an equality filter against database_name.table_name,
---     AND'd together -- see rules_engine/executor.py::_build_total_query().
---     A project whose table doesn't carry a column for one of its
---     run_params keys should not pass that key for rules on this table.
+--     disagree). Every key present in run_params is applied as an equality
+--     filter against database_name.table_name, AND'd together -- see
+--     rules_engine/executor.py::_build_total_query(). A project whose
+--     table doesn't carry a column for one of its run_params keys should
+--     not pass that key for rules on this table.
 --   * There is no separate named-connection column. sql_dialect ('teradata'
 --     | 'postgres' | 's3' | 'file') selects the one connection this rule
 --     runs against -- db/connection_factory.py builds exactly one
@@ -146,7 +150,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_log (
     rule_group       VARCHAR(100),
     project_name     VARCHAR(100),         -- copied from gre_rules.project_name (reporting dimension)
     process_name     VARCHAR(100),         -- copied from gre_rules.process_name
-    batch_id         VARCHAR(100) NOT NULL,
+    run_key          VARCHAR(100) NOT NULL,
     seq_no           INTEGER,
     start_time       TIMESTAMP,
     end_time         TIMESTAMP,
@@ -157,16 +161,16 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_log (
 )
 PRIMARY INDEX (run_id, rule_id);
 
--- Checkpoint/resume reads this per (rule_group, batch_id) to find the first
+-- Checkpoint/resume reads this per (rule_group, run_key) to find the first
 -- rule with no SUCCESS row yet -- see rules_engine/runner.py::_resume_point().
-CREATE INDEX gre_log_group_batch_ix (rule_group, batch_id, status)
+CREATE INDEX gre_log_group_run_key_ix (rule_group, run_key, status)
 ON CMSUNIV_FILELAND_DEV_T.gre_log;
 
 
 -- ── 3. gre_exceptions -- data findings, engine-populated only ─────────────
 -- Column shape is the legacy INSERT list verbatim (record_id, rule_id,
 -- table_name, element_name, source_name, issue_desc, exception_flag,
--- exception_approver, batch_id, etl_is_curr_ind, etl_load_dt,
+-- exception_approver, run_key, etl_is_curr_ind, etl_load_dt,
 -- etl_last_updt_dt) plus run_id, database_name, and natural_key_value,
 -- which the legacy shape didn't need but this engine's idempotency and
 -- source tie-back do.
@@ -194,7 +198,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_exceptions (
     issue_desc            VARCHAR(2000),
     exception_flag        VARCHAR(20) DEFAULT 'OPEN',   -- compliance disposition
     exception_approver     VARCHAR(100),
-    batch_id              VARCHAR(100) NOT NULL,
+    run_key               VARCHAR(100) NOT NULL,
     etl_is_curr_ind       CHAR(1) DEFAULT 'Y',
     etl_load_dt           DATE,
     etl_last_updt_dt      TIMESTAMP,
@@ -206,21 +210,21 @@ PRIMARY INDEX (record_id);
 -- v1: UNIQUE INDEX is the idempotency mechanism -- catch the duplicate-key
 -- error on rerun and skip that row rather than delete-then-insert (same
 -- pattern as dq_metrics_summary_uix).
-CREATE UNIQUE INDEX gre_exceptions_uix (rule_id, batch_id, natural_key_value)
+CREATE UNIQUE INDEX gre_exceptions_uix (rule_id, run_key, natural_key_value)
 ON CMSUNIV_FILELAND_DEV_T.gre_exceptions;
 
--- v1: fast lookup by rule_id/batch_id -- this is exactly how gre_results
+-- v1: fast lookup by rule_id/run_key -- this is exactly how gre_results
 -- rows are joined back to their underlying records (see
 -- rules_engine/reporting.py), mirroring dq_exceptions_run_rule_ix.
-CREATE INDEX gre_exceptions_rule_batch_ix (rule_id, batch_id)
+CREATE INDEX gre_exceptions_rule_run_key_ix (rule_id, run_key)
 ON CMSUNIV_FILELAND_DEV_T.gre_exceptions;
 
 
--- ── 4. gre_results -- one row per (rule_id, batch_id): rule-LEVEL verdict ──
+-- ── 4. gre_results -- one row per (rule_id, run_key): rule-LEVEL verdict ──
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_results (
     result_id                 BIGINT GENERATED ALWAYS AS IDENTITY,
     rule_id                    INTEGER NOT NULL,
-    batch_id                   VARCHAR(100) NOT NULL,
+    run_key                    VARCHAR(100) NOT NULL,
     run_id                     VARCHAR(200) NOT NULL,
     project_name                VARCHAR(100),         -- copied from gre_rules.project_name
     process_name                VARCHAR(100),         -- copied from gre_rules.process_name
@@ -234,10 +238,10 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_results (
     status                      VARCHAR(10),  -- 'PASS' | 'FAIL' | 'WARN'
     evaluated_at                TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
-PRIMARY INDEX (rule_id, batch_id);
+PRIMARY INDEX (rule_id, run_key);
 
--- v1: UNIQUE INDEX so a rerun of a batch UPDATEs this summary row in place
--- (upsert) instead of expire-and-insert-new -- modeled directly on
--- dq_metrics_summary_uix.
-CREATE UNIQUE INDEX gre_results_uix (rule_id, batch_id)
+-- v1: UNIQUE INDEX so a rerun of the same run_key UPDATEs this summary row
+-- in place (upsert) instead of expire-and-insert-new -- modeled directly
+-- on dq_metrics_summary_uix.
+CREATE UNIQUE INDEX gre_results_uix (rule_id, run_key)
 ON CMSUNIV_FILELAND_DEV_T.gre_results;

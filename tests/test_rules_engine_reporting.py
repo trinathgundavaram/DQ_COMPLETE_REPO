@@ -79,7 +79,7 @@ def _conn():
             record_id BIGINT, run_id VARCHAR, rule_id INTEGER, database_name VARCHAR, table_name VARCHAR,
             element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
-            batch_id VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
+            run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
             etl_load_dt DATE, etl_last_updt_dt TIMESTAMP,
             natural_key_value VARCHAR, created_at TIMESTAMP DEFAULT current_timestamp
         )
@@ -87,7 +87,7 @@ def _conn():
 
     conn.execute("""
         CREATE TABLE gre_results (
-            result_id BIGINT, rule_id INTEGER, batch_id VARCHAR, run_id VARCHAR,
+            result_id BIGINT, rule_id INTEGER, run_key VARCHAR, run_id VARCHAR,
             total_records BIGINT, failed_records BIGINT, failure_pct DOUBLE,
             threshold_pct_used DOUBLE, threshold_count_used INTEGER,
             threshold_operator_used VARCHAR, severity VARCHAR, status VARCHAR,
@@ -102,23 +102,23 @@ _record_id_seq = [0]
 
 
 def _insert_exception(conn, rule_id, natural_key_value, database_name="main", table_name="claims",
-                      source_name="duckdb_test", batch_id="B1", issue_desc=None,
+                      source_name="duckdb_test", run_key="B1", issue_desc=None,
                       exception_flag="OPEN", etl_is_curr_ind="Y"):
     _record_id_seq[0] += 1
     execute_dml(conn, """
         INSERT INTO gre_exceptions (
             record_id, run_id, rule_id, database_name, table_name, source_name,
-            issue_desc, exception_flag, batch_id, etl_is_curr_ind, natural_key_value
+            issue_desc, exception_flag, run_key, etl_is_curr_ind, natural_key_value
         ) VALUES (?, 'RUN1', ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [_record_id_seq[0], rule_id, database_name, table_name, source_name,
-          issue_desc or f"rule {rule_id} violated", exception_flag, batch_id, etl_is_curr_ind, natural_key_value])
+          issue_desc or f"rule {rule_id} violated", exception_flag, run_key, etl_is_curr_ind, natural_key_value])
 
 
-def _insert_result(conn, rule_id, batch_id, run_id, status):
+def _insert_result(conn, rule_id, run_key, run_id, status):
     execute_dml(conn, """
-        INSERT INTO gre_results (result_id, rule_id, batch_id, run_id, total_records, failed_records, status)
+        INSERT INTO gre_results (result_id, rule_id, run_key, run_id, total_records, failed_records, status)
         VALUES (?, ?, ?, ?, 10, 1, ?)
-    """, [rule_id, rule_id, batch_id, run_id, status])
+    """, [rule_id, rule_id, run_key, run_id, status])
 
 
 # ── get_breaches / get_records_for_result (existing, previously untested) ──
@@ -136,9 +136,9 @@ def test_get_breaches_filters_to_fail_and_warn_for_the_run():
 
 def test_get_records_for_result_filters_current_version_only():
     conn = _conn()
-    _insert_exception(conn, 1, "claim_id=C1", batch_id="B1")
-    _insert_exception(conn, 1, "claim_id=C2", batch_id="B1", etl_is_curr_ind="N")
-    _insert_exception(conn, 2, "claim_id=C3", batch_id="B1")   # different rule -- excluded
+    _insert_exception(conn, 1, "claim_id=C1", run_key="B1")
+    _insert_exception(conn, 1, "claim_id=C2", run_key="B1", etl_is_curr_ind="N")
+    _insert_exception(conn, 2, "claim_id=C3", run_key="B1")   # different rule -- excluded
 
     records = get_records_for_result(conn, META_DB, 1, "B1")
     assert len(records) == 1
@@ -183,11 +183,11 @@ def test_get_source_records_no_exceptions_returns_empty_list():
     assert get_source_records_for_rule(cf, conn, META_DB, 999, "B1") == []
 
 
-def test_get_source_records_scoped_to_rule_and_batch():
+def test_get_source_records_scoped_to_rule_and_run_key():
     conn = _conn()
-    _insert_exception(conn, 1, "claim_id=C1", batch_id="B1")
-    _insert_exception(conn, 1, "claim_id=C3", batch_id="B2")   # different batch -- excluded
-    _insert_exception(conn, 2, "claim_id=C2", batch_id="B1")   # different rule -- excluded
+    _insert_exception(conn, 1, "claim_id=C1", run_key="B1")
+    _insert_exception(conn, 1, "claim_id=C3", run_key="B2")   # different run_key -- excluded
+    _insert_exception(conn, 2, "claim_id=C2", run_key="B1")   # different rule -- excluded
     cf = _FakeConnectionFactory(conn)
 
     records = get_source_records_for_rule(cf, conn, META_DB, 1, "B1")

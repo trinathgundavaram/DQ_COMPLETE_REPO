@@ -73,11 +73,11 @@ MAX_EXCEPTIONS = int(os.getenv("GRE_MAX_EXCEPTIONS", "10000"))
 _SOFT_SEVERITIES = {"WARN", "WARNING", "INFO", "NOTICE"}
 
 
-def _log_error(meta_conn, meta_db: str, run_id: str, rule: dict, batch_id: str,
+def _log_error(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str,
                 error_type: str, message: str, detail: str = None) -> None:
     """Rule-dict convenience wrapper around shared/db_ops.py::log_error(), for gre_rules-keyed callers."""
     log_error(meta_conn, meta_db, run_id, rule.get("rule_id"), rule.get("rule_group"),
-              batch_id, error_type, message, detail)
+              run_key, error_type, message, detail)
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +186,7 @@ def build_natural_key(rule: dict, row: dict) -> str:
     "col1=val1|col2=val2" from rule['natural_key_columns'] -- this engine's
     analog of dq_rules.primary_key_columns / utils/ids.py::build_pk_string.
     Every violating row must produce one of these; it's what makes
-    gre_exceptions_uix (rule_id, batch_id, natural_key_value) meaningful.
+    gre_exceptions_uix (rule_id, run_key, natural_key_value) meaningful.
     """
     cols = [c.strip() for c in (rule.get("natural_key_columns") or "").split(",") if c.strip()]
     if not cols:
@@ -245,7 +245,7 @@ def evaluate_threshold(
     Returns a dict:
         status                   "PASS" | "FAIL" | "WARN"
         write_result              bool -- False means: don't insert/update
-                                   gre_results for this rule+batch at all
+                                   gre_results for this rule+run_key at all
         threshold_pct_used        effective value actually applied (or None)
         threshold_count_used      effective value actually applied (or None)
         threshold_operator_used   effective value actually applied (or None)
@@ -329,7 +329,7 @@ def evaluate_threshold(
 # gre_exceptions / gre_results writers
 # ---------------------------------------------------------------------------
 
-def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, batch_id: str, rows: list) -> int:
+def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key: str, rows: list) -> int:
     """
     Write every violating row to gre_exceptions via one shared, batched
     path. Rows are de-duplicated by natural key WITHIN this call first (a
@@ -338,7 +338,7 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, batch_id
     repeat), then written with bulk_insert_or_skip() -- one executemany()
     per GRE_EXCEPTION_CHUNK-sized chunk instead of one INSERT+commit per
     row, falling back to row-by-row only for a chunk that collides with a
-    natural key already committed by an earlier attempt on this batch_id.
+    natural key already committed by an earlier attempt on this run_key.
     Returns how many NEW rows were inserted this call (not the total on
     file).
     """
@@ -348,7 +348,7 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, batch_id
     sql = f"""
         INSERT INTO {meta_db}.gre_exceptions (
             run_id, rule_id, database_name, table_name, project_name, process_name,
-            element_name, source_name, issue_desc, batch_id, natural_key_value
+            element_name, source_name, issue_desc, run_key, natural_key_value
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     seen = set()
@@ -369,7 +369,7 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, batch_id
             rule.get("element_name"),
             rule.get("sql_dialect"),
             issue_desc,
-            batch_id,
+            run_key,
             nk,
         ])
 
@@ -378,20 +378,20 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, batch_id
 
 def _upsert_result(meta_conn, meta_db: str, row: dict) -> None:
     """
-    Upsert one gre_results row for (rule_id, batch_id): INSERT, and on the
+    Upsert one gre_results row for (rule_id, run_key): INSERT, and on the
     unique-index duplicate-key error, UPDATE in place instead -- unlike
     gre_exceptions, this table is a summary row, not row-level history, so
     a rerun should overwrite it rather than accumulate duplicates.
     """
     insert_sql = f"""
         INSERT INTO {meta_db}.gre_results (
-            rule_id, batch_id, run_id, project_name, process_name, total_records, failed_records,
+            rule_id, run_key, run_id, project_name, process_name, total_records, failed_records,
             failure_pct, threshold_pct_used, threshold_count_used,
             threshold_operator_used, severity, status
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = [
-        row["rule_id"], row["batch_id"], row["run_id"], row.get("project_name"), row.get("process_name"),
+        row["rule_id"], row["run_key"], row["run_id"], row.get("project_name"), row.get("process_name"),
         row["total_records"], row["failed_records"], row["failure_pct"], row["threshold_pct_used"],
         row["threshold_count_used"], row["threshold_operator_used"],
         row["severity"], row["status"],
@@ -409,29 +409,29 @@ def _upsert_result(meta_conn, meta_db: str, row: dict) -> None:
             failure_pct = ?, threshold_pct_used = ?, threshold_count_used = ?,
             threshold_operator_used = ?, severity = ?, status = ?,
             evaluated_at = CURRENT_TIMESTAMP
-        WHERE rule_id = ? AND batch_id = ?
+        WHERE rule_id = ? AND run_key = ?
     """
     execute_dml(meta_conn, update_sql, [
         row["run_id"], row.get("project_name"), row.get("process_name"), row["total_records"],
         row["failed_records"], row["failure_pct"],
         row["threshold_pct_used"], row["threshold_count_used"], row["threshold_operator_used"],
-        row["severity"], row["status"], row["rule_id"], row["batch_id"],
+        row["severity"], row["status"], row["rule_id"], row["run_key"],
     ])
 
 
-def _log_attempt(meta_conn, meta_db: str, run_id: str, rule: dict, batch_id: str,
+def _log_attempt(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str,
                   status: str, rowcount: int, start_time: float, error_message: str = None) -> None:
     """Insert one gre_log row for this execution attempt. Never raises."""
     sql = f"""
         INSERT INTO {meta_db}.gre_log (
-            run_id, rule_id, rule_group, project_name, process_name, batch_id, seq_no,
+            run_id, rule_id, rule_group, project_name, process_name, run_key, seq_no,
             start_time, end_time, status, rowcount, error_message
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     try:
         execute_dml(meta_conn, sql, [
             run_id, rule.get("rule_id"), rule.get("rule_group"), rule.get("project_name"),
-            rule.get("process_name"), batch_id, rule.get("seq_no"),
+            rule.get("process_name"), run_key, rule.get("seq_no"),
             datetime.fromtimestamp(start_time), datetime.now(), status, rowcount, error_message,
         ])
     except Exception as exc:
@@ -451,10 +451,10 @@ def _build_total_query(table_ref: str, run_params: dict) -> str:
     re-deriving that as a second, independently-written SQL blob was pure
     duplication with real drift risk (rule_sql's WHERE and scope_sql's
     WHERE could silently disagree over time). Every key present in
-    run_params (batch_id included) is treated as a literal column name on
-    this rule's table and applied as an equality filter, AND'd together --
-    a project's run_params IS its scoping definition, for the rule_sql
-    substitution AND the denominator alike.
+    run_params is treated as a literal column name on this rule's table
+    and applied as an equality filter, AND'd together -- a project's
+    run_params IS its scoping definition, for the rule_sql substitution
+    AND the denominator alike.
 
     table_ref is the adapter's own FROM-clause identifier for this rule
     (SourceAdapter.qualified_name()) -- "database_name.table_name" for a
@@ -513,7 +513,7 @@ def _compute_total(db_conn, rule: dict, run_params: dict, total_cache: dict = No
 # Rule execution
 # ---------------------------------------------------------------------------
 
-def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, meta_db: str,
+def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_params: dict, meta_db: str,
                   total_cache: dict = None) -> str:
     """
     Execute one rule end-to-end: prepare its source (file/S3 rules register
@@ -527,16 +527,21 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, 
     db_conn     : SourceAdapter for rule['sql_dialect'] -- READS ONLY
     meta_conn   : SourceAdapter for the gre_ metadata store -- all writes go here
     run_id      : id for this run (assigned by rules_engine/runner.py)
+    run_key     : opaque tracking/idempotency identifier for this run --
+                  gre_exceptions/gre_log/gre_results key off this value
+                  (see rules_engine/schema.sql's gre_exceptions_uix /
+                  gre_results_uix). Not required to appear in run_params --
+                  build it however fits your data (a batch id, a
+                  year+month pair, a specific date, or any other
+                  column/combination) via shared/db_ops.py::build_run_key(),
+                  or pass your own string directly.
     run_params  : dict of named values substituted into rule_sql's "{key}"
-                  tokens (see shared/db_ops.py::_substitute_params() and
-                  build_run_params()) AND used, key-for-key, as the
-                  equality filters for the auto-generated total-record
-                  count (see _compute_total()/_build_total_query()). MUST
-                  contain a "batch_id" key (build_run_params() guarantees
-                  this): batch_id is still the value gre_exceptions/
-                  gre_log/gre_results/gre_audit key their tracking/
-                  idempotency off, even though it's no
-                  longer the only value a rule can reference.
+                  tokens (see shared/db_ops.py::_substitute_params()) AND
+                  used, key-for-key, as the equality filters for the
+                  auto-generated total-record count (see
+                  _compute_total()/_build_total_query()). Has no
+                  reserved/required key -- entirely up to the rule author
+                  what it contains.
     meta_db     : schema name the gre_ tables live in
     total_cache : optional dict, shared across every rule in one
                   run_rule_group() call, that memoizes _compute_total()'s
@@ -558,7 +563,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, 
     attempt row are their own separate commits too. Nothing here is
     wrapped in one transaction, by design -- a crash mid-write leaves
     whatever chunks already committed in place, and a rerun of this same
-    rule/batch picks up exactly where it left off because of the
+    rule/run_key picks up exactly where it left off because of the
     gre_exceptions_uix natural-key uniqueness.
 
     Big-dataset path
@@ -575,10 +580,9 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, 
     still logged but non-fatal, since `failed`/`total` are already known
     by then. total_cache (STEP 2) similarly avoids a redundant COUNT(*)
     scan when several rules in a group ask the same "how many rows are in
-    this batch" question.
+    this run" question.
     """
     start = time.time()
-    batch_id = run_params["batch_id"]
 
     # ── STEP 0: prepare the source -- fail fast, never mid-run ───────────────
     # No-op for teradata/postgres; a file/S3 rule registers its DuckDB view
@@ -588,8 +592,8 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, 
         db_conn.prepare(rule)
     except Exception as exc:
         logger.error("Rule %s: source prepare failed: %s", rule.get("rule_id"), exc, exc_info=True)
-        _log_error(meta_conn, meta_db, run_id, rule, batch_id, "SOURCE_PREPARE_ERROR", str(exc))
-        _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, start, str(exc))
+        _log_error(meta_conn, meta_db, run_id, rule, run_key, "SOURCE_PREPARE_ERROR", str(exc))
+        _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, start, str(exc))
         return "ERROR"
 
     # ── STEP 0b: run_params substitution -- fail fast, never mid-run ─────────
@@ -597,8 +601,8 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, 
         query = _substitute_params(rule["rule_sql"], run_params)
     except ValueError as exc:
         logger.error("Rule %s: run_params substitution failed: %s", rule.get("rule_id"), exc)
-        _log_error(meta_conn, meta_db, run_id, rule, batch_id, "PARAM_SUBSTITUTION_ERROR", str(exc))
-        _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, start, str(exc))
+        _log_error(meta_conn, meta_db, run_id, rule, run_key, "PARAM_SUBSTITUTION_ERROR", str(exc))
+        _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, start, str(exc))
         return "ERROR"
 
     # ── STEP 1: ONE scan of rule_sql -- TRUE failed count + capped rows ──────
@@ -606,8 +610,8 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, 
         failed, violating_rows = _scan_violations(db_conn, query)
     except Exception as exc:
         logger.error("Rule %s: rule_sql scan failed: %s", rule.get("rule_id"), exc, exc_info=True)
-        _log_error(meta_conn, meta_db, run_id, rule, batch_id, "SQL_RUNTIME", str(exc))
-        _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, start, str(exc))
+        _log_error(meta_conn, meta_db, run_id, rule, run_key, "SQL_RUNTIME", str(exc))
+        _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, start, str(exc))
         return "ERROR"
 
     # ── STEP 2: total in-scope record count (memoized across the run_group) ──
@@ -615,8 +619,8 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, 
         total = _compute_total(db_conn, rule, run_params, total_cache=total_cache)
     except Exception as exc:
         logger.error("Rule %s: scope/count query failed: %s", rule.get("rule_id"), exc, exc_info=True)
-        _log_error(meta_conn, meta_db, run_id, rule, batch_id, "SCOPE_QUERY_FAILURE", str(exc))
-        _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, start, str(exc))
+        _log_error(meta_conn, meta_db, run_id, rule, run_key, "SCOPE_QUERY_FAILURE", str(exc))
+        _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, start, str(exc))
         return "ERROR"
 
     # ── STEP 3: write the already-fetched violating rows -- best effort ──────
@@ -626,13 +630,13 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, 
     written = 0
     if violating_rows:
         try:
-            written = _write_exceptions(meta_conn, meta_db, rule, run_id, batch_id, violating_rows)
+            written = _write_exceptions(meta_conn, meta_db, rule, run_id, run_key, violating_rows)
         except Exception as exc:
             logger.warning(
                 "Rule %s: exception-row write failed (failed_records is still accurate): %s",
                 rule.get("rule_id"), exc, exc_info=True,
             )
-            _log_error(meta_conn, meta_db, run_id, rule, batch_id, "WRITE_FAILURE", str(exc))
+            _log_error(meta_conn, meta_db, run_id, rule, run_key, "WRITE_FAILURE", str(exc))
 
     verdict = evaluate_threshold(
         total, failed,
@@ -647,7 +651,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, 
         try:
             _upsert_result(meta_conn, meta_db, {
                 "rule_id": rule.get("rule_id"),
-                "batch_id": batch_id,
+                "run_key": run_key,
                 "run_id": run_id,
                 "project_name": rule.get("project_name"),
                 "process_name": rule.get("process_name"),
@@ -662,8 +666,8 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, 
             })
         except Exception as exc:
             logger.error("Rule %s: gre_results upsert failed: %s", rule.get("rule_id"), exc, exc_info=True)
-            _log_error(meta_conn, meta_db, run_id, rule, batch_id, "RESULTS_WRITE_FAILURE", str(exc))
-            _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", written, start, str(exc))
+            _log_error(meta_conn, meta_db, run_id, rule, run_key, "RESULTS_WRITE_FAILURE", str(exc))
+            _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", written, start, str(exc))
             return "ERROR"
 
     logger.info(
@@ -675,5 +679,5 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, 
     # actual insert count, excluding skipped duplicates), not `failed`
     # (the true total, which double-counts rows already on file from a
     # prior attempt on a rerun).
-    _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "SUCCESS", written, start)
+    _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "SUCCESS", written, start)
     return "SUCCESS"

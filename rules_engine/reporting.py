@@ -34,11 +34,11 @@ def get_breaches(meta_conn, meta_db: str, run_id: str) -> list:
     )
 
 
-def get_records_for_result(meta_conn, meta_db: str, rule_id, batch_id: str) -> list:
+def get_records_for_result(meta_conn, meta_db: str, rule_id, run_key: str) -> list:
     """
     Every gre_exceptions record behind one gre_results verdict -- the drill-
     down join described in the prompt: gre_results -> gre_exceptions on
-    (rule_id, batch_id), filtered to the current record version.
+    (rule_id, run_key), filtered to the current record version.
 
     This returns gre_exceptions' OWN columns only (natural_key_value,
     issue_desc, ...) -- not the source record itself. For the full source
@@ -49,10 +49,10 @@ def get_records_for_result(meta_conn, meta_db: str, rule_id, batch_id: str) -> l
         f"""
         SELECT e.*
         FROM {meta_db}.gre_exceptions e
-        WHERE e.rule_id = ? AND e.batch_id = ? AND e.etl_is_curr_ind = 'Y'
+        WHERE e.rule_id = ? AND e.run_key = ? AND e.etl_is_curr_ind = 'Y'
         ORDER BY e.record_id
         """,
-        [rule_id, batch_id],
+        [rule_id, run_key],
     )
 
 
@@ -101,9 +101,9 @@ def _build_natural_key_where(keys: list) -> str:
     return " OR ".join(record_clauses)
 
 
-def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, batch_id: str) -> list:
+def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, run_key: str) -> list:
     """
-    Every SOURCE record behind one rule's failures for one batch -- "pull
+    Every SOURCE record behind one rule's failures for one run -- "pull
     the 50 records that failed rule 1" for a dashboard, an analyst
     review, or a downstream share-out.
 
@@ -134,8 +134,8 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, batch_id: 
     CURRENT state, not its state at the moment the rule ran. If a record
     has since been corrected or deleted upstream, this may return updated
     data for that key, or fewer rows than gre_exceptions has on file for
-    this rule/batch (the missing ones are logged at info level below, not
-    silently dropped). Accepted here in exchange for not duplicating
+    this rule/run_key (the missing ones are logged at info level below,
+    not silently dropped). Accepted here in exchange for not duplicating
     source data into gre_exceptions at all -- see the module docstring.
     A caller than genuinely needs point-in-time accuracy regardless of
     upstream changes needs a different design (a stored snapshot column),
@@ -147,9 +147,9 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, batch_id: 
         SELECT record_id, natural_key_value, database_name, table_name, source_name,
                issue_desc, exception_flag
         FROM {meta_db}.gre_exceptions
-        WHERE rule_id = ? AND batch_id = ? AND etl_is_curr_ind = 'Y'
+        WHERE rule_id = ? AND run_key = ? AND etl_is_curr_ind = 'Y'
         """,
-        [rule_id, batch_id],
+        [rule_id, run_key],
     )
     if not exceptions:
         return []
@@ -169,7 +169,7 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, batch_id: 
         if db_conn is None:
             raise RuntimeError(
                 f"Source connection '{source_name}' unavailable -- cannot tie "
-                f"rule_id={rule_id} batch_id={batch_id} exceptions back to source records."
+                f"rule_id={rule_id} run_key={run_key} exceptions back to source records."
             )
 
         # source_name is gre_exceptions' copy of the rule's sql_dialect
@@ -206,9 +206,9 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, batch_id: 
         if missing:
             logger.info(
                 "get_source_records_for_rule: %d of %d exception(s) for rule_id=%s "
-                "batch_id=%s no longer match a row in %s.%s (likely corrected/deleted "
+                "run_key=%s no longer match a row in %s.%s (likely corrected/deleted "
                 "upstream since the rule ran).",
-                len(missing), len(group), rule_id, batch_id, database_name, table_name,
+                len(missing), len(group), rule_id, run_key, database_name, table_name,
             )
 
     return records

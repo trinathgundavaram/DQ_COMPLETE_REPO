@@ -1,10 +1,10 @@
 """
 rules_engine/runner.py
 -------------------------
-Orchestration entry point: run_rule_group(rule_group, batch_id, ...).
+Orchestration entry point: run_rule_group(rule_group, run_key, ...).
 
 Single-threaded, sequential rule execution is still the DEFAULT and
-requires zero config: a batch-readiness gate, checkpoint/resume, then a
+requires zero config: a run-readiness gate, checkpoint/resume, then a
 sequencing_mode-aware pass over the rules, calling
 rules_engine/executor.py::execute_rule() once per rule. Every rule commits
 its own findings independently -- this file only ever decides run ORDER,
@@ -36,7 +36,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from shared import config as gre_config
-from shared.db_ops import execute_query, execute_dml, build_run_params
+from shared.db_ops import execute_query, execute_dml
 from rules_engine.rules import load_rules
 from rules_engine.executor import execute_rule, _log_error, _log_attempt
 from rules_engine.parallel import build_pools, close_pools
@@ -44,21 +44,21 @@ from rules_engine.parallel import build_pools, close_pools
 logger = logging.getLogger(__name__)
 
 
-def generate_run_id(rule_group: str, batch_id: str) -> str:
+def generate_run_id(rule_group: str, run_key: str) -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{rule_group}_{batch_id}_{ts}"
+    return f"{rule_group}_{run_key}_{ts}"
 
 
 # ---------------------------------------------------------------------------
 # Checkpoint / resume
 # ---------------------------------------------------------------------------
 
-def _already_succeeded_rule_ids(meta_conn, meta_db: str, rule_group: str, batch_id: str) -> set:
+def _already_succeeded_rule_ids(meta_conn, meta_db: str, rule_group: str, run_key: str) -> set:
     """
     rule_ids that already have a SUCCESS attempt logged in gre_log for this
-    (rule_group, batch_id). These are skipped on resume -- carrying over
+    (rule_group, run_key). These are skipped on resume -- carrying over
     the legacy framework's get_failed_start_seq idea: a killed-and-rerun
-    batch picks up after the last rule that actually completed, instead of
+    run picks up after the last rule that actually completed, instead of
     re-running (and re-committing duplicate work against) rules that
     already succeeded.
     """
@@ -67,9 +67,9 @@ def _already_succeeded_rule_ids(meta_conn, meta_db: str, rule_group: str, batch_
         f"""
         SELECT DISTINCT rule_id
         FROM {meta_db}.gre_log
-        WHERE rule_group = ? AND batch_id = ? AND status = 'SUCCESS'
+        WHERE rule_group = ? AND run_key = ? AND status = 'SUCCESS'
         """,
-        [rule_group, batch_id],
+        [rule_group, run_key],
     )
     return {r["rule_id"] for r in rows}
 
@@ -78,15 +78,15 @@ def _already_succeeded_rule_ids(meta_conn, meta_db: str, rule_group: str, batch_
 # gre_audit
 # ---------------------------------------------------------------------------
 
-def _start_audit(meta_conn, meta_db: str, run_id: str, rule_group: str, batch_id: str,
+def _start_audit(meta_conn, meta_db: str, run_id: str, rule_group: str, run_key: str,
                   total_rules: int, triggered_by: str, rule_variant: str = None,
                   project_name: str = None, process_name: str = None) -> None:
     execute_dml(meta_conn, f"""
         INSERT INTO {meta_db}.gre_audit (
-            run_id, rule_group, project_name, process_name, batch_id, rule_variant, started_at, status,
+            run_id, rule_group, project_name, process_name, run_key, rule_variant, started_at, status,
             total_rules, rules_succeeded, rules_errored, triggered_by
         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, 0, 0, ?)
-    """, [run_id, rule_group, project_name, process_name, batch_id, rule_variant,
+    """, [run_id, rule_group, project_name, process_name, run_key, rule_variant,
           datetime.now(), total_rules, triggered_by])
 
 
@@ -103,7 +103,7 @@ def _finish_audit(meta_conn, meta_db: str, run_id: str, status: str,
 # Parallel execution (sequencing_mode='independent' only -- see module docstring)
 # ---------------------------------------------------------------------------
 
-def _run_one_pending_rule(rule, source_pools, meta_pool, meta_db, run_id, batch_id, resolved_params, total_cache):
+def _run_one_pending_rule(rule, source_pools, meta_pool, meta_db, run_id, run_key, resolved_params, total_cache):
     """
     One rule's worth of the ThreadPoolExecutor body -- acquire a source
     connection AND a metadata connection from their respective pools
@@ -122,7 +122,7 @@ def _run_one_pending_rule(rule, source_pools, meta_pool, meta_db, run_id, batch_
     db_conn = source_pool.acquire()
     worker_meta_conn = meta_pool.acquire()
     try:
-        status = execute_rule(rule, db_conn, worker_meta_conn, run_id, resolved_params, meta_db,
+        status = execute_rule(rule, db_conn, worker_meta_conn, run_id, run_key, resolved_params, meta_db,
                               total_cache=total_cache)
     finally:
         source_pool.release(db_conn)
@@ -130,7 +130,7 @@ def _run_one_pending_rule(rule, source_pools, meta_pool, meta_db, run_id, batch_
     return rule["rule_id"], status
 
 
-def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, batch_id, resolved_params,
+def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, run_key, resolved_params,
                           total_cache, max_workers):
     """
     The parallel counterpart to run_rule_group()'s default sequential
@@ -190,10 +190,10 @@ def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, batch_id, res
                 gre_config.get_meta_connection_name(), max_workers, len(pending),
             )
             for rule in pending:
-                _log_error(meta_conn, meta_db, run_id, rule, batch_id,
+                _log_error(meta_conn, meta_db, run_id, rule, run_key,
                            "CONNECTION_UNAVAILABLE",
                            f"No pooled connection '{gre_config.get_meta_connection_name()}' for parallel execution")
-                _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, time.time(),
+                _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, time.time(),
                             f"No pooled connection '{gre_config.get_meta_connection_name()}' for parallel execution")
                 results[rule["rule_id"]] = "ERROR"
                 errored += 1
@@ -210,9 +210,9 @@ def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, batch_id, res
                 "rule_id=%s: source_type '%s' unavailable -- logging as ERROR.",
                 rule["rule_id"], rule["sql_dialect"],
             )
-            _log_error(meta_conn, meta_db, run_id, rule, batch_id,
+            _log_error(meta_conn, meta_db, run_id, rule, run_key,
                        "CONNECTION_UNAVAILABLE", f"No connection '{rule['sql_dialect']}'")
-            _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, time.time(),
+            _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, time.time(),
                         f"No connection '{rule['sql_dialect']}'")
             results[rule["rule_id"]] = "ERROR"
             errored += 1
@@ -226,7 +226,7 @@ def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, batch_id, res
                 futures = [
                     pool_exec.submit(
                         _run_one_pending_rule, rule, source_pools, meta_pool, meta_db,
-                        run_id, batch_id, resolved_params, total_cache,
+                        run_id, run_key, resolved_params, total_cache,
                     )
                     for rule in runnable
                 ]
@@ -250,7 +250,7 @@ def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, batch_id, res
 
 def run_rule_group(
     rule_group: str,
-    batch_id: str,
+    run_key: str,
     cf,
     meta_conn=None,
     meta_db: str = None,
@@ -259,15 +259,26 @@ def run_rule_group(
     rule_variant: str = None,
 ) -> dict:
     """
-    Run every active rule in `rule_group` against `batch_id`.
+    Run every active rule in `rule_group` for this `run_key`.
 
     Parameters
     ----------
     rule_group   : which group of gre_rules to run
-    batch_id     : the batch being evaluated -- the tracking/idempotency key
-                   (gre_exceptions_uix, gre_log, gre_results, gre_audit) and
-                   always present in the run_params every rule sees (see
-                   run_params below).
+    run_key      : opaque tracking/idempotency identifier for this run
+                   (gre_exceptions_uix, gre_log, gre_results, gre_audit key
+                   off this value) -- a batch id, a year+month pair, a
+                   specific date, or any other column/combination the
+                   caller wants; build one via shared/db_ops.py::
+                   build_run_key() or pass your own string. Deliberately
+                   NOT merged into run_params: run_params doubles as the
+                   equality filters for the auto-generated total-record
+                   count (see run_params below), and run_key is often NOT
+                   a real column on a rule's table (e.g. a composite like
+                   "2026_8"), so auto-injecting it there would silently
+                   break that query for most tables. If a rule_sql needs
+                   to reference the run's tracking value, pass it
+                   explicitly via run_params under whatever key matches an
+                   actual column.
     cf           : a db.connection_factory.ConnectionFactory, already loaded,
                    used to resolve each rule's sql_dialect (source_type) to an adapter
     meta_conn    : adapter for the gre_ metadata store; defaults to
@@ -275,13 +286,13 @@ def run_rule_group(
     meta_db      : schema the gre_ tables live in; defaults to
                    gre_config.get_meta_db()
     triggered_by : freeform string recorded on gre_audit
-    run_params   : optional dict of extra named values a rule's rule_sql can
-                   reference via "{key}" tokens -- merged with batch_id via
-                   shared.db_ops.build_run_params() (batch_id always wins
-                   on key collision). The SAME dict also becomes the
-                   equality filters for the auto-generated total-record
-                   count (rules_engine/executor.py::_build_total_query()).
-                   Lets each project scope its data however it needs
+    run_params   : optional dict of named values a rule's rule_sql can
+                   reference via "{key}" tokens -- passed through exactly
+                   as given, no reserved/required key. The SAME dict also
+                   becomes the equality filters for the auto-generated
+                   total-record count
+                   (rules_engine/executor.py::_build_total_query()). Lets
+                   each project scope its data however it needs
                    (month/year, run_type, a date range, a region column,
                    ...) without the engine having to know about any of
                    those column names. See shared/db_ops.py::
@@ -303,8 +314,8 @@ def run_rule_group(
             f"Metadata connection '{gre_config.get_meta_connection_name()}' unavailable."
         )
 
-    if not gre_config.check_batch_ready(rule_group, batch_id, meta_conn):
-        logger.info("rule_group=%s batch_id=%s not ready -- skipping this run.", rule_group, batch_id)
+    if not gre_config.check_run_ready(rule_group, run_key, meta_conn):
+        logger.info("rule_group=%s run_key=%s not ready -- skipping this run.", rule_group, run_key)
         return {
             "run_id": None, "status": "NOT_READY", "total_rules": 0,
             "succeeded": 0, "errored": 0, "results": {},
@@ -318,7 +329,7 @@ def run_rule_group(
             "succeeded": 0, "errored": 0, "results": {},
         }
 
-    resolved_params = build_run_params(batch_id, run_params)
+    resolved_params = dict(run_params or {})
 
     # project_name/process_name are descriptive/reporting dimensions carried
     # on every gre_rules row (see rules_engine/schema.sql's design notes) --
@@ -335,18 +346,18 @@ def run_rule_group(
             rule_group, project_name, process_name, rules[0]["rule_id"],
         )
 
-    run_id = generate_run_id(rule_group, batch_id)
-    _start_audit(meta_conn, meta_db, run_id, rule_group, batch_id, len(rules), triggered_by,
+    run_id = generate_run_id(rule_group, run_key)
+    _start_audit(meta_conn, meta_db, run_id, rule_group, run_key, len(rules), triggered_by,
                  rule_variant=rule_variant, project_name=project_name, process_name=process_name)
     logger.info("Starting GRE run: %s (%d rule(s))", run_id, len(rules))
 
-    # Checkpoint/resume: skip rules that already succeeded for this batch.
-    done_ids = _already_succeeded_rule_ids(meta_conn, meta_db, rule_group, batch_id)
+    # Checkpoint/resume: skip rules that already succeeded for this run_key.
+    done_ids = _already_succeeded_rule_ids(meta_conn, meta_db, rule_group, run_key)
     pending = [r for r in rules if r["rule_id"] not in done_ids]
     if done_ids:
         logger.info(
-            "Resuming run for batch_id=%s: %d rule(s) already succeeded, %d pending.",
-            batch_id, len(done_ids), len(pending),
+            "Resuming run for run_key=%s: %d rule(s) already succeeded, %d pending.",
+            run_key, len(done_ids), len(pending),
         )
 
     # sequencing_mode is expected to be consistent across a rule_group; take
@@ -366,7 +377,7 @@ def run_rule_group(
     halted = False
 
     # Shared for the whole run: several rules in a group often ask the
-    # identical "how many rows are in this batch" question (same
+    # identical "how many rows are in this run" question (same
     # database_name/table_name and run_params) -- one dict here, threaded
     # into every execute_rule() call, lets _compute_total() reuse that COUNT(*)
     # result instead of re-scanning the same rows once per rule. See
@@ -381,7 +392,7 @@ def run_rule_group(
 
     if use_parallel:
         results, succeeded, errored = _run_pending_parallel(
-            pending, cf, meta_conn, meta_db, run_id, batch_id, resolved_params,
+            pending, cf, meta_conn, meta_db, run_id, run_key, resolved_params,
             total_cache, max_workers,
         )
     else:
@@ -392,13 +403,13 @@ def run_rule_group(
                     "rule_id=%s: source_type '%s' unavailable -- logging as ERROR.",
                     rule["rule_id"], rule["sql_dialect"],
                 )
-                _log_error(meta_conn, meta_db, run_id, rule, batch_id,
+                _log_error(meta_conn, meta_db, run_id, rule, run_key,
                            "CONNECTION_UNAVAILABLE", f"No connection '{rule['sql_dialect']}'")
-                _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, time.time(),
+                _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, time.time(),
                             f"No connection '{rule['sql_dialect']}'")
                 status = "ERROR"
             else:
-                status = execute_rule(rule, db_conn, meta_conn, run_id, resolved_params, meta_db,
+                status = execute_rule(rule, db_conn, meta_conn, run_id, run_key, resolved_params, meta_db,
                                       total_cache=total_cache)
 
             results[rule["rule_id"]] = status
@@ -482,7 +493,7 @@ def discover_rule_groups(meta_conn, meta_db: str, project_name: str = None,
 def run_all_active_groups(
     meta_conn,
     meta_db: str,
-    batch_id: str,
+    run_key: str,
     cf,
     project_name: str = None,
     process_name: str = None,
@@ -493,7 +504,7 @@ def run_all_active_groups(
     """
     Discover every active rule_group in scope (optionally filtered by
     project_name/process_name) and call run_rule_group() once per group,
-    against the SAME batch_id/run_params/rule_variant. Each group still gets
+    against the SAME run_key/run_params/rule_variant. Each group still gets
     its own run_id, its own gre_audit row, and its own checkpoint/resume --
     this is a thin fan-out, not a merged run.
 
@@ -504,14 +515,14 @@ def run_all_active_groups(
     rule_groups = discover_rule_groups(meta_conn, meta_db, project_name=project_name,
                                         process_name=process_name)
     logger.info(
-        "run_all_active_groups: %d rule_group(s) in scope (project_name=%s process_name=%s) for batch_id=%s.",
-        len(rule_groups), project_name, process_name, batch_id,
+        "run_all_active_groups: %d rule_group(s) in scope (project_name=%s process_name=%s) for run_key=%s.",
+        len(rule_groups), project_name, process_name, run_key,
     )
 
     summaries = {}
     for rule_group in rule_groups:
         summaries[rule_group] = run_rule_group(
-            rule_group, batch_id, cf,
+            rule_group, run_key, cf,
             meta_conn=meta_conn, meta_db=meta_db, triggered_by=triggered_by,
             run_params=run_params, rule_variant=rule_variant,
         )

@@ -25,7 +25,7 @@ that module hardcodes exactly two stratification levels
 Built on shared/db_ops.py + shared/config.py
 -----------------------------------------------
 The low-level DB helpers (execute_query/execute_dml/bulk_insert,
-_run_source_query, _substitute_params, build_run_params) and the shared
+_run_source_query, _substitute_params, build_run_key) and the shared
 gre_errors writer (log_error) come from shared/db_ops.py -- the SAME
 module rules_engine/ uses, so there is exactly one implementation of each,
 not two drifting copies. Metadata connection/db resolution comes from
@@ -33,8 +33,8 @@ shared/config.py.
 
 scope_sql AND exclusion_sql both go through the same {key} run_params
 substitution as rules_engine's rule_sql -- see
-shared/db_ops.py::_substitute_params()'s docstring for why this is a dict
-instead of a single {batch_id} value. Unlike rules_engine (which auto-
+shared/db_ops.py::_substitute_params()'s docstring for why this is a
+free-form dict rather than a single fixed value. Unlike rules_engine (which auto-
 derives its total-record count straight from run_params against
 database_name.table_name -- see rules_engine/executor.py::
 _build_total_query()), sampling's candidate universe isn't always a plain
@@ -77,7 +77,7 @@ from datetime import datetime
 
 from shared.db_ops import (
     execute_query, execute_dml, bulk_insert, log_error,
-    _run_source_query, _substitute_params, build_run_params,
+    _run_source_query, _substitute_params,
 )
 
 logger = logging.getLogger(__name__)
@@ -276,7 +276,7 @@ def _pull_candidates(db_conn, config: dict, levels: list, run_params: dict) -> l
 
     Both scope_sql and exclusion_sql go through _substitute_params() with
     the SAME run_params dict -- previously exclusion_sql got no
-    substitution at all, silently unable to reference {batch_id} or any
+    substitution at all, silently unable to reference {run_key} or any
     other run param even though scope_sql could.
     """
     key_cols = [c.strip() for c in config["key_columns"].split(",") if c.strip()]
@@ -370,23 +370,23 @@ def _persist_selections(meta_conn, meta_db: str, sample_run_id: str, config: dic
     bulk_insert(meta_conn, attr_sql, attr_params)
 
 
-def _write_audit(meta_conn, meta_db: str, sample_run_id: str, config: dict, method: str,
+def _write_audit(meta_conn, meta_db: str, sample_run_id: str, run_key: str, config: dict, method: str,
                  seed, target_vol: int, total_candidates: int, total_selected: int,
                  started_at: datetime, status: str) -> None:
     execute_dml(meta_conn, f"""
         INSERT INTO {meta_db}.gre_audit (
-            run_id, run_type, started_at, ended_at, status,
+            run_id, run_type, run_key, started_at, ended_at, status,
             sample_config_id, sampling_method, random_seed,
             target_volume, total_candidates, total_selected, triggered_by
-        ) VALUES (?, 'SAMPLING', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SYSTEM')
+        ) VALUES (?, 'SAMPLING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SYSTEM')
     """, [
-        sample_run_id, started_at, datetime.now(), status,
+        sample_run_id, run_key, started_at, datetime.now(), status,
         config.get("config_id"), method, seed,
         target_vol, total_candidates, total_selected,
     ])
 
 
-def _log_sampling_error(meta_conn, meta_db: str, sample_run_id: str, config: dict,
+def _log_sampling_error(meta_conn, meta_db: str, sample_run_id: str, run_key: str, config: dict,
                         error_type: str, message: str) -> None:
     """
     Thin wrapper over shared/db_ops.py's shared log_error(): a sampling run
@@ -395,7 +395,7 @@ def _log_sampling_error(meta_conn, meta_db: str, sample_run_id: str, config: dic
     implementation), just without a second copy of the INSERT+try/except
     body.
     """
-    log_error(meta_conn, meta_db, sample_run_id, None, config.get("process_name"), None,
+    log_error(meta_conn, meta_db, sample_run_id, None, config.get("process_name"), run_key,
               error_type, message)
 
 
@@ -403,20 +403,27 @@ def _log_sampling_error(meta_conn, meta_db: str, sample_run_id: str, config: dic
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def run_sampling(config_id, batch_id: str, cf, meta_conn=None, meta_db: str = None, seed: int = None,
+def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = None, seed: int = None,
                  run_params: dict = None) -> dict:
     """
     Execute one stratified sampling pass for `config_id`, scoped to
-    `batch_id` and whatever else `run_params` supplies (substituted into
+    `run_key` and whatever else `run_params` supplies (substituted into
     scope_sql's/exclusion_sql's "{key}" tokens -- same convention, and the
-    same shared.db_ops.build_run_params()/_substitute_params() mechanism,
-    as gre_rules.rule_sql in rules_engine/).
+    same shared.db_ops.py::_substitute_params() mechanism, as
+    gre_rules.rule_sql in rules_engine/).
 
     Parameters
     ----------
     config_id  : gre_sampling_config.config_id to run
-    batch_id   : this cycle's batch/cohort identifier -- always present in
-                 the run_params every scope_sql/exclusion_sql sees
+    run_key    : opaque tracking/idempotency identifier for this run
+                 (embedded into sample_run_id, and recorded on gre_audit) --
+                 a batch id, a year+month pair, a specific date, or any
+                 other column/combination the caller wants; build one via
+                 shared/db_ops.py::build_run_key() or pass your own
+                 string. Deliberately NOT merged into run_params -- see
+                 run_params below -- if scope_sql/exclusion_sql need to
+                 reference the run's tracking value, pass it explicitly
+                 via run_params under whatever key they choose.
     cf         : ConnectionFactory, already loaded
     meta_conn  : adapter for the gre_ metadata store; defaults to
                  cf.get(gre_config.get_meta_connection_name())
@@ -424,12 +431,11 @@ def run_sampling(config_id, batch_id: str, cf, meta_conn=None, meta_db: str = No
                  gre_config.get_meta_db()
     seed       : explicit seed for RANDOM/SYSTEMATIC reproducibility; a
                  fresh one is generated and persisted if not supplied
-    run_params : optional dict of extra named values scope_sql/
-                 exclusion_sql can reference via "{key}" tokens -- merged
-                 with batch_id via shared.db_ops.build_run_params()
-                 (batch_id always wins on key collision). Lets each
-                 project scope its candidate universe however it needs,
-                 the same way rules_engine's run_params does.
+    run_params : optional dict of named values scope_sql/exclusion_sql can
+                 reference via "{key}" tokens -- passed through exactly as
+                 given, no reserved/required key. Lets each project scope
+                 its candidate universe however it needs, the same way
+                 rules_engine's run_params does.
 
     Returns
     -------
@@ -443,7 +449,7 @@ def run_sampling(config_id, batch_id: str, cf, meta_conn=None, meta_db: str = No
     if meta_conn is None:
         raise RuntimeError(f"Metadata connection '{gre_config.get_meta_connection_name()}' unavailable.")
 
-    resolved_params = build_run_params(batch_id, run_params)
+    resolved_params = dict(run_params or {})
 
     started_at = datetime.now()
     config, levels = load_sampling_config(meta_conn, meta_db, config_id)
@@ -456,13 +462,13 @@ def run_sampling(config_id, batch_id: str, cf, meta_conn=None, meta_db: str = No
     target_vol = int(config.get("target_volume") or 150)
     key_cols = [c.strip() for c in config["key_columns"].split(",") if c.strip()]
 
-    sample_run_id = f"{config.get('sample_name', 'SAMPLE')}_{batch_id}_{started_at.strftime('%Y%m%d_%H%M%S')}"
+    sample_run_id = f"{config.get('sample_name', 'SAMPLE')}_{run_key}_{started_at.strftime('%Y%m%d_%H%M%S')}"
 
     db_conn = cf.get(config["source_type"])
     if db_conn is None:
-        _log_sampling_error(meta_conn, meta_db, sample_run_id, config,
+        _log_sampling_error(meta_conn, meta_db, sample_run_id, run_key, config,
                             "CONNECTION_UNAVAILABLE", f"No connection '{config['source_type']}'")
-        _write_audit(meta_conn, meta_db, sample_run_id, config, method, None,
+        _write_audit(meta_conn, meta_db, sample_run_id, run_key, config, method, None,
                     target_vol, 0, 0, started_at, "ERROR")
         return {"sample_run_id": sample_run_id, "status": "ERROR", "candidates": 0, "selected": 0,
                "target_volume": target_vol, "by_stratum": {}, "seed": None}
@@ -478,14 +484,14 @@ def run_sampling(config_id, batch_id: str, cf, meta_conn=None, meta_db: str = No
         candidates = _pull_candidates(db_conn, config, levels, resolved_params)
     except Exception as exc:
         logger.error("Sampling config_id=%s: candidate pull failed: %s", config_id, exc, exc_info=True)
-        _log_sampling_error(meta_conn, meta_db, sample_run_id, config, "PULL_FAILURE", str(exc))
-        _write_audit(meta_conn, meta_db, sample_run_id, config, method, run_seed,
+        _log_sampling_error(meta_conn, meta_db, sample_run_id, run_key, config, "PULL_FAILURE", str(exc))
+        _write_audit(meta_conn, meta_db, sample_run_id, run_key, config, method, run_seed,
                     target_vol, 0, 0, started_at, "ERROR")
         return {"sample_run_id": sample_run_id, "status": "ERROR", "candidates": 0, "selected": 0,
                "target_volume": target_vol, "by_stratum": {}, "seed": run_seed}
 
     if not candidates:
-        _write_audit(meta_conn, meta_db, sample_run_id, config, method, run_seed,
+        _write_audit(meta_conn, meta_db, sample_run_id, run_key, config, method, run_seed,
                     target_vol, 0, 0, started_at, "COMPLETED")
         return {"sample_run_id": sample_run_id, "status": "COMPLETED", "candidates": 0, "selected": 0,
                "target_volume": target_vol, "by_stratum": {}, "seed": run_seed}
@@ -511,7 +517,7 @@ def run_sampling(config_id, batch_id: str, cf, meta_conn=None, meta_db: str = No
 
     _persist_selections(meta_conn, meta_db, sample_run_id, config, levels, key_cols,
                         candidates, selected_keys, started_at.date())
-    _write_audit(meta_conn, meta_db, sample_run_id, config, method, run_seed,
+    _write_audit(meta_conn, meta_db, sample_run_id, run_key, config, method, run_seed,
                 target_vol, len(candidates), len(selected), started_at, "COMPLETED")
 
     logger.info(

@@ -12,7 +12,7 @@ import pytest
 
 from shared.db_ops import (
     execute_query, bulk_insert, bulk_insert_or_skip,
-    _substitute_params, build_run_params,
+    _substitute_params, build_run_key,
 )
 
 
@@ -23,12 +23,12 @@ def _conn():
             record_id BIGINT, run_id VARCHAR, rule_id INTEGER, table_name VARCHAR,
             element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
-            batch_id VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
+            run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
             etl_load_dt DATE, etl_last_updt_dt TIMESTAMP,
             natural_key_value VARCHAR, created_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
-    conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, batch_id, natural_key_value)")
+    conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, run_key, natural_key_value)")
     return conn
 
 
@@ -74,23 +74,24 @@ def test_substitute_params_empty_params_dict_with_no_tokens_ok():
     assert _substitute_params("SELECT 1", None) == "SELECT 1"
 
 
-# ── build_run_params ─────────────────────────────────────────────────────
+# ── build_run_key ─────────────────────────────────────────────────────────
 
-def test_build_run_params_merges_extra_with_batch_id():
-    assert build_run_params("B1", {"year": 2026}) == {"year": 2026, "batch_id": "B1"}
-
-
-def test_build_run_params_no_extra():
-    assert build_run_params("B1") == {"batch_id": "B1"}
-    assert build_run_params("B1", None) == {"batch_id": "B1"}
+def test_build_run_key_single_part():
+    assert build_run_key("BATCH_2026_08_19") == "BATCH_2026_08_19"
 
 
-def test_build_run_params_batch_id_always_wins_on_collision():
-    # A stray "batch_id" key inside extra_params can never silently
-    # override the dedicated, required batch_id argument.
-    assert build_run_params("REAL", {"batch_id": "STRAY", "year": 2026}) == {
-        "batch_id": "REAL", "year": 2026,
-    }
+def test_build_run_key_multiple_parts_default_delimiter():
+    assert build_run_key(2026, 8) == "2026_8"
+    assert build_run_key("NORTHEAST", 2026, 8) == "NORTHEAST_2026_8"
+
+
+def test_build_run_key_custom_delimiter():
+    assert build_run_key(2026, 8, 19, delimiter="-") == "2026-8-19"
+
+
+def test_build_run_key_zero_parts_raises():
+    with pytest.raises(ValueError):
+        build_run_key()
 
 
 # ── bulk writes ───────────────────────────────────────────────────────────
@@ -101,7 +102,7 @@ def test_bulk_insert_batches_across_multiple_chunks():
     sql = """
         INSERT INTO gre_exceptions (
             run_id, rule_id, table_name, element_name, source_name,
-            issue_desc, batch_id, natural_key_value
+            issue_desc, run_key, natural_key_value
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
     bulk_insert(conn, sql, rows, chunk_size=2)   # 7 rows, chunk_size=2 -> 4 chunks
@@ -114,7 +115,7 @@ def test_bulk_insert_or_skip_chunk_falls_back_on_duplicate():
     sql = """
         INSERT INTO gre_exceptions (
             run_id, rule_id, table_name, element_name, source_name,
-            issue_desc, batch_id, natural_key_value
+            issue_desc, run_key, natural_key_value
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
     first = [["RUN1", 1, "t", "e", "s", "d", "B1", "claim_id=C1"],

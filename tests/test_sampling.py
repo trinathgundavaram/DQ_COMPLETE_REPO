@@ -83,7 +83,7 @@ def _gre_meta_tables(conn):
     conn.execute("""
         CREATE TABLE gre_audit (
             run_id VARCHAR, run_type VARCHAR DEFAULT 'RULE_GROUP', rule_group VARCHAR,
-            batch_id VARCHAR, started_at TIMESTAMP, ended_at TIMESTAMP, status VARCHAR,
+            run_key VARCHAR, started_at TIMESTAMP, ended_at TIMESTAMP, status VARCHAR,
             total_rules INTEGER, rules_succeeded INTEGER, rules_errored INTEGER,
             sample_config_id INTEGER, sampling_method VARCHAR, random_seed BIGINT,
             target_volume INTEGER, total_candidates INTEGER, total_selected INTEGER,
@@ -93,7 +93,7 @@ def _gre_meta_tables(conn):
     conn.execute("""
         CREATE TABLE gre_errors (
             error_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
-            batch_id VARCHAR, error_type VARCHAR, error_message VARCHAR,
+            run_key VARCHAR, error_type VARCHAR, error_message VARCHAR,
             error_detail VARCHAR, occurred_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
@@ -153,6 +153,22 @@ def _build_universe(conn, n=1000, table="case_universe"):
             1 if i % 50 == 0 else 0,
         ))
     conn.executemany(f"INSERT INTO {table} VALUES (?, ?, ?, ?, ?, ?)", rows)
+
+
+def _run_sampling(config_id, run_key, cf, **kwargs):
+    """
+    Test convenience wrapper: run_key is no longer auto-injected into
+    run_params (see sampling/sampling.py::run_sampling()'s docstring --
+    doing so would corrupt _pull_candidates()'s substitution for any
+    scope_sql/exclusion_sql that doesn't reference a run_key-shaped token).
+    Most fixture configs' scope_sql references a "{batch_id}" token, so
+    default run_params={"batch_id": run_key} here (matching the OLD
+    build_run_params() auto-injection behavior) unless the caller passes
+    their own run_params, in which case merge rather than replace.
+    """
+    run_params = {"batch_id": run_key}
+    run_params.update(kwargs.pop("run_params", None) or {})
+    return run_sampling(config_id, run_key, cf, run_params=run_params, **kwargs)
 
 
 # ── _target_for_bucket / rounding ────────────────────────────────────────
@@ -361,7 +377,7 @@ def test_run_sampling_ranked_end_to_end():
     _insert_strata(conn, 2, 1, 1, "area", "area", {"Area A": 0.13, "Area B": 0.08})
 
     cf = _FakeConnectionFactory(conn)
-    result = run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
+    result = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
 
     assert result["status"] == "COMPLETED"
     assert result["candidates"] > 0
@@ -399,8 +415,8 @@ def test_run_sampling_random_is_reproducible_across_reruns_with_same_seed():
     _insert_strata(conn, 1, 1, 0, "category", "category", {"Denied": 0.80, "Withdrawn": 0.20})
     cf = _FakeConnectionFactory(conn)
 
-    r1 = run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB, seed=12345)
-    r2 = run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB, seed=12345)
+    r1 = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB, seed=12345)
+    r2 = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB, seed=12345)
 
     assert r1["seed"] == 12345 and r2["seed"] == 12345
     keys1 = {r[0] for r in conn.execute(
@@ -419,7 +435,7 @@ def test_run_sampling_systematic_persists_seed():
     _insert_strata(conn, 1, 1, 0, "category", "category", {"Denied": 0.80, "Withdrawn": 0.20})
     cf = _FakeConnectionFactory(conn)
 
-    result = run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
+    result = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
     assert result["status"] == "COMPLETED"
     assert result["seed"] is not None
 
@@ -436,7 +452,7 @@ def test_run_sampling_zero_strata_runs_on_whole_pool():
     # No gre_sampling_strata rows inserted at all.
     cf = _FakeConnectionFactory(conn)
 
-    result = run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
+    result = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
     assert result["status"] == "COMPLETED"
     assert result["selected"] == 25
     assert result["by_stratum"] == {"ALL": {"candidates": result["candidates"], "selected": 25}}
@@ -453,7 +469,7 @@ def test_switching_method_is_config_only():
         conn.execute("DELETE FROM gre_sampling_mix")
         _insert_config(conn, target_volume=40, sampling_method=method, priority_rank_sql=priority)
         _insert_strata(conn, 1, 1, 0, "category", "category", {"Denied": 0.80, "Withdrawn": 0.20})
-        result = run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
+        result = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
         assert result["status"] == "COMPLETED", method
         assert result["selected"] <= 40, method
 
@@ -467,22 +483,63 @@ def test_run_sampling_extra_run_params_key_reaches_scope_sql():
                    scope_sql="pull_date = '{batch_id}' AND {min_revision} <= revision")
     cf = _FakeConnectionFactory(conn)
 
-    result = run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB,
-                          run_params={"min_revision": 0})
+    result = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB,
+                            run_params={"min_revision": 0})
     assert result["status"] == "COMPLETED"
     assert result["candidates"] > 0
 
 
-def test_run_sampling_stray_batch_id_in_run_params_never_overrides_the_real_one():
+def test_run_sampling_run_key_and_run_params_batch_id_are_decoupled():
+    # run_key is no longer merged into run_params (see
+    # sampling/sampling.py::run_sampling()'s docstring), so a run_key value
+    # different from run_params["batch_id"] doesn't collide with anything --
+    # scope_sql's {batch_id} token is driven purely by the explicit
+    # run_params value, independent of run_key/gre_audit.run_key tracking.
     conn = _conn()
     _build_universe(conn)
     _insert_config(conn, target_volume=25, sampling_method="RANKED")
     cf = _FakeConnectionFactory(conn)
 
-    result = run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB,
-                          run_params={"batch_id": "SOME_OTHER_DATE"})
+    result = run_sampling(1, "TRACKING_KEY", cf, meta_conn=conn, meta_db=META_DB,
+                           run_params={"batch_id": "2026-08-01"})
     assert result["status"] == "COMPLETED"
-    assert result["candidates"] > 0   # still pulled against the real batch_id ('2026-08-01')
+    assert result["candidates"] > 0   # scope_sql pulled against the real pull_date ('2026-08-01')
+
+    audit_run_key = conn.execute(
+        "SELECT run_key FROM gre_audit WHERE run_id = ?", [result["sample_run_id"]]
+    ).fetchone()[0]
+    assert audit_run_key == "TRACKING_KEY"   # gre_audit tracked by run_key, not the business batch_id
+
+
+def test_run_sampling_with_year_month_run_key_not_a_batch_id():
+    # run_key doesn't have to be a "batch" at all -- a year+month composite
+    # (built via shared/db_ops.py::build_run_key()) works identically, and
+    # gre_audit/gre_sample_selections/gre_sample_selection_attrs all track
+    # correctly off it, with the sample_run_id embedding it too.
+    from shared.db_ops import build_run_key
+
+    conn = _conn()
+    _build_universe(conn)
+    _insert_config(conn, target_volume=25, sampling_method="RANKED")
+    cf = _FakeConnectionFactory(conn)
+
+    run_key = build_run_key(2026, 8)
+    assert run_key == "2026_8"
+
+    result = run_sampling(1, run_key, cf, meta_conn=conn, meta_db=META_DB,
+                           run_params={"batch_id": "2026-08-01"})
+    assert result["status"] == "COMPLETED"
+    assert run_key in result["sample_run_id"]
+
+    audit_run_key = conn.execute(
+        "SELECT run_key FROM gre_audit WHERE run_id = ?", [result["sample_run_id"]]
+    ).fetchone()[0]
+    assert audit_run_key == run_key
+
+    rows = conn.execute(
+        "SELECT COUNT(*) FROM gre_sample_selections WHERE sample_run_id = ?", [result["sample_run_id"]]
+    ).fetchone()[0]
+    assert rows == result["candidates"]
 
 
 def test_run_sampling_unresolved_scope_token_routes_to_pull_failure():
@@ -492,7 +549,7 @@ def test_run_sampling_unresolved_scope_token_routes_to_pull_failure():
                    scope_sql="pull_date = '{batch_id}' AND revision = {min_revision}")
     cf = _FakeConnectionFactory(conn)
 
-    result = run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)  # min_revision not supplied
+    result = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)  # min_revision not supplied
     assert result["status"] == "ERROR"
     errors = conn.execute("SELECT error_type, error_message FROM gre_errors").fetchall()
     assert len(errors) == 1 and errors[0][0] == "PULL_FAILURE"
@@ -505,7 +562,7 @@ def test_ranked_without_priority_rank_sql_raises_clear_error():
     _insert_config(conn, sampling_method="RANKED", priority_rank_sql=None)
     cf = _FakeConnectionFactory(conn)
 
-    result = run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
+    result = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
     assert result["status"] == "ERROR"
     errors = conn.execute("SELECT error_type FROM gre_errors").fetchall()
     assert len(errors) == 1 and errors[0][0] == "PULL_FAILURE"
@@ -553,7 +610,7 @@ def test_um_regression_matches_frozen_dq_stratified_sampling_output():
     _insert_strata(conn, 1, 1, 0, "category", "category",
                    {"Denied": 0.80, "Withdrawn": 0.10, "Dismissed": 0.02, "Approved": 0.08})
     _insert_strata(conn, 2, 1, 1, "area", "area", {"Area A": 0.13, "Area B": 0.08})
-    gre_result = run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
+    gre_result = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
 
     assert gre_result["candidates"] == _FROZEN_DQ_CANDIDATES
 

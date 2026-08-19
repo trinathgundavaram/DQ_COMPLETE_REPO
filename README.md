@@ -5,7 +5,7 @@ infrastructure layer:
 
 - **[`rules_engine/`](rules_engine/README.md)** -- the Generic Rules
   Engine (GRE). `gre_rules` rows define a negative SQL SELECT per rule;
-  the engine runs each active rule for a `rule_group`/`batch_id`, writes
+  the engine runs each active rule for a `rule_group`/`run_key`, writes
   every violating row to `gre_exceptions`, evaluates a threshold, and
   upserts a `gre_results` verdict.
 - **[`sampling/`](sampling/README.md)** -- generic stratified sampling.
@@ -79,30 +79,46 @@ from sampling.sampling import run_sampling
 cf = ConnectionFactory()
 cf.load()                                    # brings up every configured source_type
 
-batch_id = "BATCH_2026_08_14"
+# run_key is an opaque tracking/idempotency identifier YOU construct --
+# there's no fixed shape to it. shared/db_ops.py::build_run_key() is a
+# convenience formatter for joining parts together, but a plain string you
+# already have works just as well.
+from shared.db_ops import build_run_key
+
+run_key = build_run_key("BATCH_2026_08_14")     # a plain batch id, or...
+run_key = build_run_key(2026, 8)                # ...a year+month scope ("2026_8"), or...
+run_key = "2026-08-14"                          # ...just use an existing date/id string directly.
 
 # Rules: one specific rule_group ---------------------------------------
-summary = run_rule_group("claims_dq", batch_id, cf)
+summary = run_rule_group("claims_dq", run_key, cf)
 print(summary["status"], summary["succeeded"], summary["errored"])
 
 # Rules: every active rule_group for one project, in one call -----------
 meta_conn = cf.get(gre_config.get_meta_connection_name())
 outcome = run_all_active_groups(
-    meta_conn, gre_config.get_meta_db(), batch_id, cf,
+    meta_conn, gre_config.get_meta_db(), run_key, cf,
     project_name="HEALTHSPRING_UM",
 )
 for rule_group, group_summary in outcome["rule_groups"].items():
     print(rule_group, group_summary["status"])
 
 # Sampling: one sampling config -----------------------------------------
-result = run_sampling(config_id=1, batch_id="2026-08-14", cf=cf)
+result = run_sampling(config_id=1, run_key="2026-08-14", cf=cf)
 print(result["status"], result["selected"], "/", result["target_volume"])
 ```
+
+`run_key` is deliberately NOT merged into `run_params` -- `run_params` is
+a completely free-form dict used only for `{key}` substitution in
+`rule_sql`/`scope_sql`/`exclusion_sql`, and doubles as the equality
+filters for the auto-generated total-record count. If a rule's SQL needs
+to reference the run's tracking value as a literal column filter, pass it
+explicitly via `run_params` under whatever key matches an actual column
+(e.g. `run_params={"batch_id": "BATCH_2026_08_14"}`).
 
 Nothing here needs the two engines to run together or in a particular
 order -- `rules_engine/` and `sampling/` are independent (see each
 package's own README) and neither imports the other. A caller driving both
-against the same batch just calls into each in whatever order its own
+against the same run just calls into each in whatever order its own
 schedule requires. See [`rules_engine/README.md`](rules_engine/README.md)
 for `rule_variant`/`project_name`/`process_name` scoping and the
 multi-group fan-out (`run_all_active_groups()`), and
@@ -167,7 +183,7 @@ Teradata/Postgres/etc. connection is needed.
 | Test file | Covers |
 |---|---|
 | `test_shared_config.py` | `shared/config.py` -- `.env` loading, metadata connection/db resolution, batch-readiness checks. |
-| `test_shared_db_ops.py` | `shared/db_ops.py` -- bulk writes with duplicate-key tolerance, `{key}` run_params substitution (`_substitute_params`/`build_run_params`). |
+| `test_shared_db_ops.py` | `shared/db_ops.py` -- bulk writes with duplicate-key tolerance, `{key}` run_params substitution (`_substitute_params`/`build_run_key`). |
 | `test_rules_engine_rules.py` | `rules_engine/rules.py` -- `load_rules()`'s group/active_flag filtering, ordering, and `rule_variant` selection (universal vs. exact-match). |
 | `test_rules_engine_executor.py` | `rules_engine/executor.py` -- threshold evaluation, natural-key building, `execute_rule()` end-to-end, the single-scan/memoized-total big-dataset path, run_params substitution and its fail-fast `PARAM_SUBSTITUTION_ERROR`. |
 | `test_rules_engine_runner.py` | `rules_engine/runner.py` -- checkpoint/resume, `sequencing_mode` (`halt_group` vs. `skip_and_continue`), the shared `total_cache`, `rule_variant` end-to-end, `run_params` threading. |

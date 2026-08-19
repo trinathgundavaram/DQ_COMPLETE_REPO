@@ -14,12 +14,18 @@ optimization, gre_exceptions/gre_results writers -- lives in
 rules_engine/executor.py instead, even though it's built on top of these
 same primitives. See shared/README.md for the full split rationale.
 
-Run-parameter substitution (_substitute_params / build_run_params) is the
-one mechanism both packages use to let a project scope its data however
-it needs to -- a month/year pair, a batch_id + run_type combination, a
-region/contract column, or nothing at all -- without the engine hardcoding
-any one project's notion of "scope" as a schema column. See that
-function's docstring below for the mechanics.
+Run-parameter substitution (_substitute_params) is the one mechanism both
+packages use to let a project scope its data however it needs to -- a
+month/year pair, a specific date, a region/contract column, or nothing at
+all -- without the engine hardcoding any one project's notion of "scope"
+as a schema column. `run_params` has zero reserved keys of its own; the
+one identifier the tracking/idempotency schema (gre_log, gre_exceptions,
+gre_results, gre_audit) keys off -- `run_key` -- is a separate, explicit
+parameter passed alongside run_params, not a required member of it. See
+_substitute_params()'s docstring below for the substitution mechanics,
+and build_run_key() for a convenience way to build a run_key out of
+whatever column(s) a caller wants (a batch id, a year+month pair, a
+specific date, or any other combination).
 """
 
 import logging
@@ -167,15 +173,15 @@ def bulk_insert_or_skip(conn, sql: str, rows: list, chunk_size: int = None) -> i
     """
     Chunked executemany() with duplicate-key tolerance -- the bulk analog of
     _insert_or_skip(), used by rules_engine/executor.py for gre_exceptions
-    where gre_exceptions_uix (rule_id, batch_id, natural_key_value) is what
+    where gre_exceptions_uix (rule_id, run_key, natural_key_value) is what
     makes a rerun idempotent.
 
     Tries each chunk as one executemany() batch first (cheap: one round
     trip for up to `chunk_size` rows). If a chunk raises -- in practice
     almost always because one row in it collides with a natural key
-    committed by an EARLIER attempt on this batch_id -- it falls back to
+    committed by an EARLIER attempt on this run_key -- it falls back to
     row-by-row _insert_or_skip() for JUST that chunk, so one stale
-    duplicate never costs the other rows in the same batch. Any non
+    duplicate never costs the other rows in the same run. Any non
     duplicate-key error still propagates (same contract as
     _insert_or_skip()).
 
@@ -228,15 +234,17 @@ def bulk_insert_or_skip(conn, sql: str, rows: list, chunk_size: int = None) -> i
 # ---------------------------------------------------------------------------
 # v1 supported exactly one substitutable value ({batch_id}), passed as a
 # scalar all the way down. Different projects scope their data differently
-# -- a month/year pair, a batch_id + run_type combination, a region or
-# contract column, or no filter at all -- so v2 generalizes this to an
-# arbitrary dict of named values: a rule/config author embeds whichever
-# "{key}" tokens their SQL needs, and the caller supplies a matching dict
-# at run time. batch_id remains a required, always-present key (see
-# build_run_params() below) since it's still the one value the
-# idempotency/checkpoint schema (gre_exceptions_uix, gre_log, gre_audit,
-# sample_run_id) keys off -- but it is no longer the ONLY value a rule can
-# reference.
+# -- a month/year pair, a specific date, a region or contract column, or no
+# filter at all -- so v2 generalizes this to an arbitrary dict of named
+# values: a rule/config author embeds whichever "{key}" tokens their SQL
+# needs, and the caller supplies a matching dict at run time. There is no
+# reserved/required key -- run_params is entirely up to the rule/config
+# author. The one value the idempotency/checkpoint schema (gre_exceptions,
+# gre_log, gre_results, gre_audit) keys off is `run_key`, a separate
+# explicit parameter callers pass to rules_engine/runner.py and
+# sampling/sampling.py's entry points -- see build_run_key() below for a
+# convenience way to build one out of a batch id, a year+month pair, a
+# specific date, or any other column/combination.
 
 _TOKEN_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 
@@ -271,7 +279,7 @@ def _substitute_params(sql: str, params: dict) -> str:
     Replace every literal "{key}" token in `sql` with the escaped string
     value of params[key], for every key present in `params`. Rule/config
     authors are responsible for their own quoting (e.g.
-    `WHERE batch_id = '{batch_id}'`) -- this only does the swap.
+    `WHERE run_date = '{run_date}'`) -- this only does the swap.
 
     Raises ValueError if, after substitution, any "{token}"-shaped text
     remains -- fail fast with a clear message naming the missing
@@ -296,20 +304,28 @@ def _substitute_params(sql: str, params: dict) -> str:
     return resolved
 
 
-def build_run_params(batch_id: str, extra_params: dict = None) -> dict:
+def build_run_key(*parts, delimiter: str = "_") -> str:
     """
-    Merge an optional caller-supplied `extra_params` dict with the
-    required `batch_id` value, used identically by
-    rules_engine/runner.py::run_rule_group() and
-    sampling/sampling.py::run_sampling() -- one implementation instead of
-    two copies that could drift.
+    Join one or more values into a single opaque tracking/idempotency key
+    -- gre_log, gre_exceptions, gre_results, and gre_audit all key off
+    this ONE value, however the caller chooses to construct it. There is
+    no fixed shape: a plain batch id, a year+month pair, a specific date,
+    a region, or any combination all work equally well.
 
-    `batch_id` always wins on key collision: it's resolved from the
-    dedicated, required `batch_id` argument both entry points already
-    take (for tracking/idempotency), so a stray "batch_id" key inside
-    extra_params can never silently override it.
+        build_run_key("BATCH_2026_08_19")   -> "BATCH_2026_08_19"
+        build_run_key(2026, 8)              -> "2026_8"
+        build_run_key("2026-08-19")         -> "2026-08-19"
+        build_run_key(region, year, month)  -> e.g. "NORTHEAST_2026_8"
+
+    Purely a convenience formatter (str(...) + join) -- callers are free
+    to build their own string directly instead (e.g. reuse an existing
+    date/batch value) and skip this helper entirely. Raises ValueError if
+    called with zero parts, since an empty run_key can't meaningfully
+    track/dedupe anything.
     """
-    return {**(extra_params or {}), "batch_id": batch_id}
+    if not parts:
+        raise ValueError("build_run_key() needs at least one part to build a run_key from.")
+    return delimiter.join(str(p) for p in parts)
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +341,7 @@ def _run_source_query(db_conn, sql: str) -> list:
 # gre_errors -- shared error log
 # ---------------------------------------------------------------------------
 
-def log_error(meta_conn, meta_db: str, run_id, rule_id, rule_group, batch_id,
+def log_error(meta_conn, meta_db: str, run_id, rule_id, rule_group, run_key,
               error_type: str, message: str, detail: str = None) -> None:
     """
     Insert one gre_errors row from explicit scalar fields. Never raises --
@@ -341,10 +357,10 @@ def log_error(meta_conn, meta_db: str, run_id, rule_id, rule_group, batch_id,
     """
     sql = f"""
         INSERT INTO {meta_db}.gre_errors (
-            run_id, rule_id, rule_group, batch_id, error_type, error_message, error_detail
+            run_id, rule_id, rule_group, run_key, error_type, error_message, error_detail
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
     """
     try:
-        execute_dml(meta_conn, sql, [run_id, rule_id, rule_group, batch_id, error_type, message, detail])
+        execute_dml(meta_conn, sql, [run_id, rule_id, rule_group, run_key, error_type, message, detail])
     except Exception as exc:
         logger.error("Failed to write gre_errors row (run_id=%s rule_id=%s): %s", run_id, rule_id, exc)
