@@ -17,10 +17,11 @@ infrastructure layer:
   share: low-level DB helpers (`db_ops.py`), local `.env` credential
   loading + metadata-store resolution (`config.py`), and the two tables
   written to by both (`gre_audit`, `gre_errors`).
-- **`db/`** -- `adapters.py` + `connection_factory.py`, reused as-is from
-  the dq_* engine this repo originally sat alongside. This is the ONLY
-  code either package depends on outside its own folder (plus `shared/`)
-  -- neither `rules_engine/` nor `sampling/` modifies these two files.
+- **`db/connection_factory.py`** -- every source adapter (Teradata,
+  Postgres, S3, file) plus `ConnectionFactory`, in one file. Exactly ONE
+  connection per source_type -- no named/multi-connection setup. This is
+  the ONLY code either package depends on outside its own folder (plus
+  `shared/`).
 
 Each package is independently testable and has its own DDL -- see
 `tests/` and each package's `schema.sql`/`schema_drop.sql`.
@@ -43,13 +44,17 @@ Each package is independently testable and has its own DDL -- see
    dev-only credential path -- see "Credentials" below for the planned
    pivot to a secrets manager.
 
-3. **Connection names**: `DQ_CONNECTION_NAMES` (comma-separated) lists
-   every named connection `db/connection_factory.py` should build; each
-   needs its own `DQ_<NAME>_TYPE`/`DQ_<NAME>_HOST`/... block. See
-   `dev.env.example` for the shape.
+3. **Connections**: exactly one connection per source_type -- `teradata`,
+   `postgres` (AWS RDS/Aurora-compatible), `s3`, `file`. Fill in only the
+   type(s) this deployment needs (`TERADATA_HOST`/`POSTGRES_HOST`/`S3_*`/
+   `FILE_BASE_PATH`, see `dev.env.example`); `ConnectionFactory.load()`
+   skips and logs any type that isn't configured rather than failing.
+   A rule or sampling config selects its source_type directly
+   (`gre_rules.sql_dialect` / `gre_sampling_config.source_type`) -- there
+   is no separate named-connection column or setup step.
 
-4. **Metadata connection/db**: both packages default to the connection
-   named `"teradata"` and schema `CMSUNIV_FILELAND_DEV_T`. Override with
+4. **Metadata connection/db**: both packages default to source_type
+   `"teradata"` and schema `CMSUNIV_FILELAND_DEV_T`. Override with
    `GRE_META_CONNECTION`/`GRE_META_DB` if the `gre_*` tables live
    somewhere else.
 
@@ -72,7 +77,7 @@ from rules_engine.runner import run_rule_group, run_all_active_groups
 from sampling.sampling import run_sampling
 
 cf = ConnectionFactory()
-cf.load()                                    # brings up every DQ_CONNECTION_NAMES connection
+cf.load()                                    # brings up every configured source_type
 
 batch_id = "BATCH_2026_08_14"
 
@@ -138,17 +143,16 @@ table** -- at that point, schema changes should become real migrations
 ## Credentials
 
 Today: local `.env` file (`dev.env`), loaded by `shared/config.py` via
-`python-dotenv`, into the exact env var names `db/adapters.py` and
-`db/connection_factory.py` already expect -- see `shared/config.py`'s
-docstring for the full mechanics. Neither of those two reused files was
-touched to support this.
+`python-dotenv`, into the exact env var names `db/connection_factory.py`
+already expects -- see `shared/config.py`'s docstring for the full
+mechanics.
 
 Planned pivot: AWS Secrets Manager (or similar), for non-local
 deployments. This only requires changing `shared/config.py`'s
 `_load_env_file()` to populate the same env var names from Secrets
-Manager instead of a file -- `db/adapters.py`, `db/connection_factory.py`,
-`rules_engine/`, and `sampling/` all only ever see already-populated env
-vars either way, so none of them need to change.
+Manager instead of a file -- `db/connection_factory.py`, `rules_engine/`,
+and `sampling/` all only ever see already-populated env vars either way,
+so none of them need to change.
 
 ## Running the tests
 
@@ -163,7 +167,7 @@ Teradata/Postgres/etc. connection is needed.
 | Test file | Covers |
 |---|---|
 | `test_shared_config.py` | `shared/config.py` -- `.env` loading, metadata connection/db resolution, batch-readiness checks. |
-| `test_shared_db_ops.py` | `shared/db_ops.py` -- bulk writes with duplicate-key tolerance, the dialect guard, `{key}` run_params substitution (`_substitute_params`/`build_run_params`). |
+| `test_shared_db_ops.py` | `shared/db_ops.py` -- bulk writes with duplicate-key tolerance, `{key}` run_params substitution (`_substitute_params`/`build_run_params`). |
 | `test_rules_engine_rules.py` | `rules_engine/rules.py` -- `load_rules()`'s group/active_flag filtering, ordering, and `rule_variant` selection (universal vs. exact-match). |
 | `test_rules_engine_executor.py` | `rules_engine/executor.py` -- threshold evaluation, natural-key building, `execute_rule()` end-to-end, the single-scan/memoized-total big-dataset path, run_params substitution and its fail-fast `PARAM_SUBSTITUTION_ERROR`. |
 | `test_rules_engine_runner.py` | `rules_engine/runner.py` -- checkpoint/resume, `sequencing_mode` (`halt_group` vs. `skip_and_continue`), the shared `total_cache`, `rule_variant` end-to-end, `run_params` threading. |

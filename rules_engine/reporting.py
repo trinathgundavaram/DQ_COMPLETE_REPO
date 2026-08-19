@@ -172,6 +172,15 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, batch_id: 
                 f"rule_id={rule_id} batch_id={batch_id} exceptions back to source records."
             )
 
+        # source_name is gre_exceptions' copy of the rule's sql_dialect
+        # (source_type) at write time -- a file/S3 rule needs its DuckDB
+        # view re-registered here the same way execute_rule() does, via
+        # the shim dict below (all qualified_name()/prepare() need is
+        # database_name/table_name); a no-op for teradata/postgres.
+        table_ref_rule = {"database_name": database_name, "table_name": table_name}
+        db_conn.prepare(table_ref_rule)
+        table_ref = db_conn.qualified_name(table_ref_rule)
+
         keys = [parse_natural_key(exc["natural_key_value"]) for exc in group]
         cols = list(keys[0].keys())
         by_natural_key = {exc["natural_key_value"]: exc for exc in group}
@@ -180,7 +189,7 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, batch_id: 
         for chunk_start in range(0, len(keys), EXCEPTION_CHUNK):
             chunk = keys[chunk_start:chunk_start + EXCEPTION_CHUNK]
             where = _build_natural_key_where(chunk)
-            query = f"SELECT * FROM {database_name}.{table_name} WHERE {where}"
+            query = f"SELECT * FROM {table_ref} WHERE {where}"
             for row in _run_source_query(db_conn, query):
                 nk = _format_natural_key(cols, row)
                 exc = by_natural_key.get(nk)

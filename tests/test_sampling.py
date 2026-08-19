@@ -28,7 +28,7 @@ import duckdb
 import pytest
 
 from sampling.sampling import (
-    _target_for_bucket, _select, _stratify, run_sampling, load_sampling_config,
+    _target_for_bucket, _select, _stratify, run_sampling,
     _pull_candidates,
 )
 
@@ -47,7 +47,7 @@ def _gre_meta_tables(conn):
     conn.execute("""
         CREATE TABLE gre_sampling_config (
             config_id INTEGER, project_name VARCHAR, process_name VARCHAR,
-            sample_name VARCHAR, connection_name VARCHAR, universe_table VARCHAR,
+            sample_name VARCHAR, source_type VARCHAR, universe_table VARCHAR,
             key_columns VARCHAR, scope_sql VARCHAR, exclusion_sql VARCHAR,
             target_volume INTEGER, sampling_method VARCHAR, priority_rank_sql VARCHAR,
             rounding_mode VARCHAR, schedule_cron VARCHAR, active_flag INTEGER,
@@ -111,7 +111,7 @@ def _insert_config(conn, config_id=1, sampling_method="RANKED", priority_rank_sq
                    scope_sql="pull_date = '{batch_id}'"):
     conn.execute("""
         INSERT INTO gre_sampling_config (
-            config_id, project_name, process_name, sample_name, connection_name,
+            config_id, project_name, process_name, sample_name, source_type,
             universe_table, key_columns, scope_sql, exclusion_sql, target_volume,
             sampling_method, priority_rank_sql, rounding_mode, active_flag
         ) VALUES (?, 'ANY_PROJECT', 'WEEKLY_REVIEW_SAMPLE', 'weekly_review_sample', 'duckdb_test',

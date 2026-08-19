@@ -1,16 +1,15 @@
 """
 rules_engine/executor.py tests: threshold evaluation, natural-key
 building, and execute_rule() end-to-end, including the big-dataset path
-(single-scan evaluation, memoized total counts) and the dialect guard.
-No live DB connection required -- DuckDB stands in for both the source
-table and the gre_ metadata store (schema-qualified as "main", DuckDB's
-default schema, so the f"{meta_db}.table" pattern the engine uses in
-production works unchanged here).
+(single-scan evaluation, memoized total counts). No live DB connection
+required -- DuckDB stands in for both the source table and the gre_
+metadata store (schema-qualified as "main", DuckDB's default schema, so
+the f"{meta_db}.table" pattern the engine uses in production works
+unchanged here).
 
-Generic DB-helper behavior (bulk writes, check_dialect() itself, {key}
-run_params substitution) is covered in tests/test_shared_db_ops.py instead
--- this file only exercises rule-specific behavior built on top of those
-primitives.
+Generic DB-helper behavior (bulk writes, {key} run_params substitution) is
+covered in tests/test_shared_db_ops.py instead -- this file only exercises
+rule-specific behavior built on top of those primitives.
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,15 +27,17 @@ from shared.db_ops import execute_query
 META_DB = "main"
 
 
-class _SourceTypeWrapper:
+class _Adapter:
     """
-    Wraps a DuckDB connection so it reports a specific `.source_type`, for
-    testing the dialect guard without needing a real db/adapters.py
-    adapter (a raw duckdb.Connection has no source_type attribute at all).
+    Minimal SourceAdapter shim wrapping a raw DuckDB connection: adds the
+    prepare()/qualified_name() surface execute_rule()/_compute_total() call
+    directly (db.connection_factory.SourceAdapter's interface). A raw
+    duckdb.Connection can't be passed as db_conn anymore -- it has its own
+    unrelated .prepare() (for prepared statements) and no qualified_name()
+    at all.
     """
-    def __init__(self, conn, source_type):
+    def __init__(self, conn):
         self._conn = conn
-        self.source_type = source_type
 
     def cursor(self):
         return self._conn.cursor()
@@ -44,8 +45,14 @@ class _SourceTypeWrapper:
     def commit(self):
         self._conn.commit()
 
+    def prepare(self, rule: dict) -> None:
+        pass   # no-op, same default as SourceAdapter -- these tests use real tables
 
-class _CursorCountingWrapper:
+    def qualified_name(self, rule: dict) -> str:
+        return f"{rule['database_name']}.{rule['table_name']}"
+
+
+class _CursorCountingWrapper(_Adapter):
     """
     Wraps a DuckDB connection and counts how many times .cursor() is
     called on it -- one call per distinct query execution issued through
@@ -53,15 +60,12 @@ class _CursorCountingWrapper:
     number of source-side queries it claims to, not more.
     """
     def __init__(self, conn):
-        self._conn = conn
+        super().__init__(conn)
         self.cursor_calls = 0
 
     def cursor(self):
         self.cursor_calls += 1
         return self._conn.cursor()
-
-    def commit(self):
-        self._conn.commit()
 
 
 def _conn():
@@ -133,8 +137,7 @@ def _rule(**overrides):
         "rule_name": "Denied claim missing denial_reason",
         "database_name": "main",   # DuckDB's default schema -- see _conn()
         "table_name": "claims",
-        "source_connection": "duckdb_test",
-        "sql_dialect": "ansi",
+        "sql_dialect": "teradata",   # also picks the one connection this rule runs against
         "rule_sql": "SELECT claim_id, denial_reason FROM claims "
                     "WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
         # No scope_sql column anymore -- _compute_total() auto-builds the
@@ -232,7 +235,7 @@ def test_execute_rule_writes_exceptions_and_result():
     conn = _conn()
     rule = _rule(threshold_pct=25)  # 2/4 = 50% > 25% -> FAIL
 
-    status = execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
 
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
@@ -262,8 +265,8 @@ def test_execute_rule_is_idempotent_on_rerun():
     conn = _conn()
     rule = _rule(threshold_pct=25)
 
-    execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
-    execute_rule(rule, conn, conn, "RUN2", {"batch_id": "B1"}, META_DB)  # simulate a rerun of the same batch
+    execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    execute_rule(rule, _Adapter(conn), conn, "RUN2", {"batch_id": "B1"}, META_DB)  # simulate a rerun of the same batch
 
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
     assert len(exceptions) == 2   # not duplicated
@@ -280,8 +283,8 @@ def test_execute_rule_batches_are_isolated():
     conn = _conn()
     rule = _rule(threshold_pct=25)
 
-    execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
-    execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B2"}, META_DB)
+    execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B2"}, META_DB)
 
     b1 = execute_query(conn, "SELECT * FROM gre_exceptions WHERE batch_id = 'B1'")
     b2 = execute_query(conn, "SELECT * FROM gre_exceptions WHERE batch_id = 'B2'")
@@ -293,7 +296,7 @@ def test_execute_rule_no_threshold_fallback_not_written_when_partial_failure():
     conn = _conn()
     rule = _rule(threshold_pct=None, threshold_count=None)  # 2/4 fail, no threshold
 
-    status = execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
 
     # Exceptions are still written regardless of any threshold...
@@ -309,7 +312,7 @@ def test_execute_rule_sql_error_routes_to_errors_and_logs():
     conn = _conn()
     rule = _rule(rule_sql="SELECT * FROM no_such_table WHERE batch_id = '{batch_id}'")
 
-    status = execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
     assert status == "ERROR"
 
     errors = execute_query(conn, "SELECT * FROM gre_errors WHERE rule_id = 1")
@@ -339,7 +342,7 @@ def test_write_exceptions_dedupes_natural_key_within_one_pull():
                  "SELECT claim_id, denial_reason FROM claims "
                  "WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
     )
-    status = execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
 
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
@@ -356,7 +359,7 @@ def test_max_exceptions_cap_keeps_failed_records_true_but_caps_detail_rows(monke
     monkeypatch.setattr(rules_engine_executor, "MAX_EXCEPTIONS", 1)
     rule = _rule(threshold_pct=0)   # any failure breaches -> a gre_results row is written
 
-    status = execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
 
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
@@ -369,19 +372,25 @@ def test_max_exceptions_cap_keeps_failed_records_true_but_caps_detail_rows(monke
     assert logs[0]["rowcount"] == 1   # "rows written to gre_exceptions this attempt" == the capped count
 
 
-# ── dialect guard (as exercised through execute_rule) ────────────────────
+# ── source prepare (STEP 0 of execute_rule) ──────────────────────────────
 
-def test_execute_rule_dialect_mismatch_routes_to_errors_before_any_query():
+def test_execute_rule_prepare_failure_routes_to_errors_before_any_query():
+    # A file/S3 rule whose prepare() fails (e.g. missing table_name) must
+    # fail BEFORE any query runs -- same fail-fast contract the old dialect
+    # guard had, now covering source setup instead of a dialect mismatch.
     conn = _conn()
-    db_conn = _SourceTypeWrapper(conn, "postgresql")
-    rule = _rule(sql_dialect="teradata", threshold_pct=25)
 
-    status = execute_rule(rule, db_conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    class _FailingAdapter(_Adapter):
+        def prepare(self, rule):
+            raise ValueError("table_name is empty -- cannot prepare file source.")
+
+    rule = _rule(threshold_pct=25)
+    status = execute_rule(rule, _FailingAdapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
     assert status == "ERROR"
 
     errors = execute_query(conn, "SELECT * FROM gre_errors WHERE rule_id = 1")
     assert len(errors) == 1
-    assert errors[0]["error_type"] == "DIALECT_MISMATCH"
+    assert errors[0]["error_type"] == "SOURCE_PREPARE_ERROR"
 
     logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1")
     assert len(logs) == 1 and logs[0]["status"] == "ERROR"
@@ -391,22 +400,22 @@ def test_execute_rule_dialect_mismatch_routes_to_errors_before_any_query():
     assert execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1") == []
 
 
-def test_execute_rule_ansi_dialect_runs_against_any_source():
+def test_execute_rule_calls_prepare_before_scanning():
+    # prepare() is a no-op for a real-database rule (see _Adapter), but
+    # must still be called -- proves execute_rule() doesn't skip STEP 0
+    # just because the adapter happens not to need it.
     conn = _conn()
-    db_conn = _SourceTypeWrapper(conn, "postgresql")
-    rule = _rule(sql_dialect="ansi", threshold_pct=25)
 
-    status = execute_rule(rule, db_conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
+    calls = []
+
+    class _TrackingAdapter(_Adapter):
+        def prepare(self, rule):
+            calls.append(rule["rule_id"])
+
+    rule = _rule(threshold_pct=25)
+    status = execute_rule(rule, _TrackingAdapter(conn), conn, "RUN1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
-
-
-def test_execute_rule_unrecognised_source_type_skips_dialect_check():
-    conn = _conn()
-    db_conn = _SourceTypeWrapper(conn, "some_future_adapter")
-    rule = _rule(sql_dialect="teradata", threshold_pct=25)
-
-    status = execute_rule(rule, db_conn, conn, "RUN1", {"batch_id": "B1"}, META_DB)
-    assert status == "SUCCESS"   # unrecognised source_type -> warn and skip, not a hard failure
+    assert calls == [1]
 
 
 # ── _compute_total: auto-derived from database_name.table_name + run_params ──
@@ -418,8 +427,8 @@ def test_compute_total_auto_filters_by_every_run_params_key():
     # scope_sql override used to, with nothing hand-written.
     conn = _conn()
     rule = _rule()
-    assert _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=None) == 4
-    assert _compute_total(conn, rule, {"batch_id": "B2"}, total_cache=None) == 1
+    assert _compute_total(_Adapter(conn), rule, {"batch_id": "B1"}, total_cache=None) == 4
+    assert _compute_total(_Adapter(conn), rule, {"batch_id": "B2"}, total_cache=None) == 1
 
 
 def test_compute_total_multiple_run_params_keys_are_anded_together():
@@ -428,22 +437,22 @@ def test_compute_total_multiple_run_params_keys_are_anded_together():
     # denial_reason isn't a real scoping dimension for this fixture, but
     # proves every key in run_params becomes its own AND'd equality filter,
     # not just batch_id.
-    assert _compute_total(conn, rule, {"batch_id": "B1", "denial_reason": "X"}, total_cache=None) == 1
-    assert _compute_total(conn, rule, {"batch_id": "B1", "claim_id": "C1"}, total_cache=None) == 1
-    assert _compute_total(conn, rule, {"batch_id": "B1", "claim_id": "NO_SUCH_ID"}, total_cache=None) == 0
+    assert _compute_total(_Adapter(conn), rule, {"batch_id": "B1", "denial_reason": "X"}, total_cache=None) == 1
+    assert _compute_total(_Adapter(conn), rule, {"batch_id": "B1", "claim_id": "C1"}, total_cache=None) == 1
+    assert _compute_total(_Adapter(conn), rule, {"batch_id": "B1", "claim_id": "NO_SUCH_ID"}, total_cache=None) == 0
 
 
 def test_compute_total_uses_database_name_and_table_name():
     conn = _conn()
     rule = _rule(database_name="main", table_name="claims")
-    assert _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=None) == 4
+    assert _compute_total(_Adapter(conn), rule, {"batch_id": "B1"}, total_cache=None) == 4
 
     # A wrong database_name/table_name should surface as a real query
     # failure, not silently return something -- proves the auto-built
     # query actually uses the fields, not a hardcoded table reference.
     bad_rule = _rule(database_name="main", table_name="no_such_table")
     with pytest.raises(Exception):
-        _compute_total(conn, bad_rule, {"batch_id": "B1"}, total_cache=None)
+        _compute_total(_Adapter(conn), bad_rule, {"batch_id": "B1"}, total_cache=None)
 
 
 def test_compute_total_is_memoized_within_a_shared_cache():
@@ -451,29 +460,29 @@ def test_compute_total_is_memoized_within_a_shared_cache():
     rule = _rule()
     cache = {}
 
-    total1 = _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=cache)
+    total1 = _compute_total(_Adapter(conn), rule, {"batch_id": "B1"}, total_cache=cache)
     assert total1 == 4
     assert len(cache) == 1
 
     # Mutate the underlying table -- a fresh (uncached) count would change.
     conn.execute("INSERT INTO claims VALUES ('C99', NULL, 'B1')")
 
-    total2 = _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=cache)
+    total2 = _compute_total(_Adapter(conn), rule, {"batch_id": "B1"}, total_cache=cache)
     assert total2 == 4   # served from cache, not re-queried -- proves memoization
 
-    total3 = _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=None)
+    total3 = _compute_total(_Adapter(conn), rule, {"batch_id": "B1"}, total_cache=None)
     assert total3 == 5   # no cache passed -> fresh query, reflects the mutation
 
 
-def test_compute_total_cache_is_keyed_by_source_connection_and_query():
+def test_compute_total_cache_is_keyed_by_sql_dialect_and_query():
     # Different run_params -> different auto-built query text -> different
     # cache key, not collapsed together.
     conn = _conn()
     cache = {}
     rule = _rule()
 
-    assert _compute_total(conn, rule, {"batch_id": "B1"}, total_cache=cache) == 4
-    assert _compute_total(conn, rule, {"batch_id": "B2"}, total_cache=cache) == 1   # only C5 is in B2
+    assert _compute_total(_Adapter(conn), rule, {"batch_id": "B1"}, total_cache=cache) == 4
+    assert _compute_total(_Adapter(conn), rule, {"batch_id": "B2"}, total_cache=cache) == 1   # only C5 is in B2
     assert len(cache) == 2   # different resolved query -> different cache key, not collapsed together
 
 
@@ -486,8 +495,8 @@ def test_compute_total_query_text_is_deterministic_regardless_of_dict_order():
     rule = _rule()
     cache = {}
 
-    _compute_total(conn, rule, {"batch_id": "B1", "claim_id": "C1"}, total_cache=cache)
-    _compute_total(conn, rule, {"claim_id": "C1", "batch_id": "B1"}, total_cache=cache)
+    _compute_total(_Adapter(conn), rule, {"batch_id": "B1", "claim_id": "C1"}, total_cache=cache)
+    _compute_total(_Adapter(conn), rule, {"claim_id": "C1", "batch_id": "B1"}, total_cache=cache)
     assert len(cache) == 1   # same effective filters, same cache entry
 
 
@@ -550,7 +559,7 @@ def test_execute_rule_uses_extra_run_params_key_beyond_batch_id():
         rule_sql="SELECT claim_id, denial_reason FROM claims "
                  "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' AND '{run_type}' = 'MONTHLY'",
     )
-    status = execute_rule(rule, conn, conn, "RUN1", {"batch_id": "B1", "run_type": "MONTHLY"}, META_DB)
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", {"batch_id": "B1", "run_type": "MONTHLY"}, META_DB)
     assert status == "SUCCESS"
 
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")

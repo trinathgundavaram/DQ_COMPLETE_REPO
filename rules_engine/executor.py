@@ -11,9 +11,9 @@ one rule. See execute_rule() for why that's safe under a crash/resume.
 
 Built on shared/db_ops.py
 ---------------------------
-The low-level DB helpers (execute_query/execute_dml/bulk_insert*), the
-dialect guard, {key} run_params substitution (_substitute_params), and the
-retry-wrapped source query all live in shared/db_ops.py -- used identically
+The low-level DB helpers (execute_query/execute_dml/bulk_insert*), {key}
+run_params substitution (_substitute_params), and the retry-wrapped
+source query all live in shared/db_ops.py -- used identically
 by sampling/sampling.py. Everything in THIS file is specific to rule
 evaluation: the single-scan optimization, natural-key building, threshold
 evaluation, and the gre_exceptions/gre_results/gre_log writers.
@@ -55,7 +55,7 @@ from datetime import datetime
 
 from shared.db_ops import (
     execute_dml, bulk_insert_or_skip, _is_duplicate_key_error,
-    _substitute_params, _run_source_query, check_dialect, DialectMismatchError,
+    _substitute_params, _run_source_query,
     log_error, EXCEPTION_CHUNK,
 )
 
@@ -367,7 +367,7 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, batch_id
             rule.get("project_name"),
             rule.get("process_name"),
             rule.get("element_name"),
-            rule.get("source_connection"),
+            rule.get("sql_dialect"),
             issue_desc,
             batch_id,
             nk,
@@ -442,19 +442,23 @@ def _log_attempt(meta_conn, meta_db: str, run_id: str, rule: dict, batch_id: str
 # Total in-scope record count
 # ---------------------------------------------------------------------------
 
-def _build_total_query(database_name: str, table_name: str, run_params: dict) -> str:
+def _build_total_query(table_ref: str, run_params: dict) -> str:
     """
-    "SELECT COUNT(*) AS total_count FROM {database_name}.{table_name}
-    WHERE k1 = '{k1}' AND k2 = '{k2}' ..." built straight from run_params'
-    OWN keys -- there is no separate scope_sql to hand-author or keep in
-    sync. The dict that scopes rule_sql already says what's "in scope"
-    for this run, so re-deriving that as a second, independently-written
-    SQL blob was pure duplication with real drift risk (rule_sql's WHERE
-    and scope_sql's WHERE could silently disagree over time). Every key
-    present in run_params (batch_id included) is treated as a literal
-    column name on this rule's table and applied as an equality filter,
-    AND'd together -- a project's run_params IS its scoping definition,
-    for the rule_sql substitution AND the denominator alike.
+    "SELECT COUNT(*) AS total_count FROM {table_ref} WHERE k1 = '{k1}' AND
+    k2 = '{k2}' ..." built straight from run_params' OWN keys -- there is
+    no separate scope_sql to hand-author or keep in sync. The dict that
+    scopes rule_sql already says what's "in scope" for this run, so
+    re-deriving that as a second, independently-written SQL blob was pure
+    duplication with real drift risk (rule_sql's WHERE and scope_sql's
+    WHERE could silently disagree over time). Every key present in
+    run_params (batch_id included) is treated as a literal column name on
+    this rule's table and applied as an equality filter, AND'd together --
+    a project's run_params IS its scoping definition, for the rule_sql
+    substitution AND the denominator alike.
+
+    table_ref is the adapter's own FROM-clause identifier for this rule
+    (SourceAdapter.qualified_name()) -- "database_name.table_name" for a
+    real database, or the prepared view name for a file/S3 source.
 
     Sorted key order makes the resulting query text deterministic
     regardless of run_params' own insertion order, so _compute_total()'s
@@ -463,35 +467,32 @@ def _build_total_query(database_name: str, table_name: str, run_params: dict) ->
     logic rule_sql substitution uses) rather than reimplemented here.
     """
     where_clause = " AND ".join(f"{key} = '{{{key}}}'" for key in sorted(run_params)) or "1=1"
-    template = f"SELECT COUNT(*) AS total_count FROM {database_name}.{table_name} WHERE {where_clause}"
+    template = f"SELECT COUNT(*) AS total_count FROM {table_ref} WHERE {where_clause}"
     return _substitute_params(template, run_params)
 
 
 def _compute_total(db_conn, rule: dict, run_params: dict, total_cache: dict = None) -> int:
     """
-    total_records = COUNT(*) FROM {database_name}.{table_name}, filtered
-    by the SAME run_params dict used to scope rule_sql -- see
-    _build_total_query()'s docstring. database_name is a required
-    gre_rules column (alongside table_name) precisely so this query can
-    be built fully-qualified without guessing which schema the table
-    lives in.
+    total_records = COUNT(*) FROM the rule's table (db_conn.qualified_name(rule)),
+    filtered by the SAME run_params dict used to scope rule_sql -- see
+    _build_total_query()'s docstring.
 
     total_cache: an optional dict shared across every rule in one
-    run_rule_group() call (see runner.py), keyed by
-    (source_connection, effective query text). Multiple rules in a group
-    very often ask the identical question -- same table + the same
-    run_params -- so caching by the actual resolved query (not just
-    table_name) reuses the COUNT(*) result across every rule that would
-    otherwise re-run the exact same scan. A fresh cache per run means
-    this never sees stale data across runs; within one run the source
-    isn't expected to change mid-run anyway (the same assumption
-    gre_exceptions' idempotency already relies on). Callers that don't
-    pass a cache (e.g. direct execute_rule() calls in tests) get the old
-    always-fresh-query behavior unchanged.
+    run_rule_group() call (see runner.py), keyed by (sql_dialect,
+    effective query text). Multiple rules in a group very often ask the
+    identical question -- same table + the same run_params -- so caching
+    by the actual resolved query (not just table_name) reuses the
+    COUNT(*) result across every rule that would otherwise re-run the
+    exact same scan. A fresh cache per run means this never sees stale
+    data across runs; within one run the source isn't expected to change
+    mid-run anyway (the same assumption gre_exceptions' idempotency
+    already relies on). Callers that don't pass a cache (e.g. direct
+    execute_rule() calls in tests) get the old always-fresh-query
+    behavior unchanged.
     """
-    query = _build_total_query(rule["database_name"], rule["table_name"], run_params)
+    query = _build_total_query(db_conn.qualified_name(rule), run_params)
 
-    cache_key = (rule.get("source_connection"), query)
+    cache_key = (rule.get("sql_dialect"), query)
     if total_cache is not None and cache_key in total_cache:
         return total_cache[cache_key]
 
@@ -515,15 +516,15 @@ def _compute_total(db_conn, rule: dict, run_params: dict, total_cache: dict = No
 def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, meta_db: str,
                   total_cache: dict = None) -> str:
     """
-    Execute one rule end-to-end: check its declared dialect against the
-    source connection, substitute run_params into rule_sql, run it, write
-    every violating row to gre_exceptions, evaluate the rule-level
+    Execute one rule end-to-end: prepare its source (file/S3 rules register
+    their DuckDB view here), substitute run_params into rule_sql, run it,
+    write every violating row to gre_exceptions, evaluate the rule-level
     threshold, upsert gre_results, and log the attempt.
 
     Parameters
     ----------
     rule        : one row from gre_rules (dict)
-    db_conn     : SourceAdapter for rule['source_connection'] -- READS ONLY
+    db_conn     : SourceAdapter for rule['sql_dialect'] -- READS ONLY
     meta_conn   : SourceAdapter for the gre_ metadata store -- all writes go here
     run_id      : id for this run (assigned by rules_engine/runner.py)
     run_params  : dict of named values substituted into rule_sql's "{key}"
@@ -579,13 +580,15 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, 
     start = time.time()
     batch_id = run_params["batch_id"]
 
-    # ── STEP 0: dialect guard -- fail fast, never mid-run ─────────────────────
-    source_type = getattr(db_conn, "source_type", "unknown")
+    # ── STEP 0: prepare the source -- fail fast, never mid-run ───────────────
+    # No-op for teradata/postgres; a file/S3 rule registers its DuckDB view
+    # here, driven entirely by rule['database_name']/rule['table_name'] --
+    # see db/connection_factory.py's FileAdapter/S3Adapter.prepare().
     try:
-        check_dialect(rule, source_type)
-    except DialectMismatchError as exc:
-        logger.error("Rule %s: dialect check failed: %s", rule.get("rule_id"), exc)
-        _log_error(meta_conn, meta_db, run_id, rule, batch_id, "DIALECT_MISMATCH", str(exc))
+        db_conn.prepare(rule)
+    except Exception as exc:
+        logger.error("Rule %s: source prepare failed: %s", rule.get("rule_id"), exc, exc_info=True)
+        _log_error(meta_conn, meta_db, run_id, rule, batch_id, "SOURCE_PREPARE_ERROR", str(exc))
         _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, start, str(exc))
         return "ERROR"
 

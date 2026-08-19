@@ -28,8 +28,11 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_config (
     project_name         VARCHAR(100) NOT NULL,
     process_name         VARCHAR(100) NOT NULL,
     sample_name          VARCHAR(100) NOT NULL,
-    connection_name      VARCHAR(100) NOT NULL,   -- see db/connection_factory.py
-    universe_table       VARCHAR(200) NOT NULL,
+    source_type          VARCHAR(20)  NOT NULL,   -- 'teradata' | 'postgres' | 's3' | 'file' -- picks
+                                                    -- the one connection this config runs against; see
+                                                    -- db/connection_factory.py (one connection per type,
+                                                    -- no separate named-connection column)
+    universe_table       VARCHAR(200) NOT NULL,   -- fully-qualified FROM target, e.g. "db.schema.table"
     key_columns          VARCHAR(500) NOT NULL,   -- entity key column(s), CSV
     scope_sql            CLOB,                    -- WHERE-fragment; may embed any number of
                                                     -- "{key}" tokens (e.g. {batch_id}, {year}),

@@ -45,9 +45,11 @@
 --     AND'd together -- see rules_engine/executor.py::_build_total_query().
 --     A project whose table doesn't carry a column for one of its
 --     run_params keys should not pass that key for rules on this table.
---   * source_connection names a connection already configured via
---     DQ_CONNECTION_NAMES / db/connection_factory.py -- the SAME connector
---     layer dq_* uses, imported directly, not reimplemented.
+--   * There is no separate named-connection column. sql_dialect ('teradata'
+--     | 'postgres' | 's3' | 'file') selects the one connection this rule
+--     runs against -- db/connection_factory.py builds exactly one
+--     connection per source_type, so a rule needs nothing more than its
+--     dialect to pick its source.
 --   * natural_key_columns is this engine's analog of dq_rules'
 --     primary_key_columns: a comma-separated list of column names present
 --     in the rule's own SELECT output, used to build a deterministic
@@ -83,12 +85,23 @@
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_rules (
     rule_id              INTEGER NOT NULL,
     rule_name            VARCHAR(500) NOT NULL,
-    database_name        VARCHAR(200) NOT NULL,    -- schema the table below lives in; combined with
-                                                    -- table_name for the auto total-record count query
-    table_name           VARCHAR(200) NOT NULL,
-    source_connection    VARCHAR(100) NOT NULL,   -- named connection, see db/connection_factory.py
-    sql_dialect          VARCHAR(20)  NOT NULL,   -- 'teradata' | 'postgres' | 'ansi'
-    rule_sql             CLOB NOT NULL,            -- the negative SELECT; never mutates data
+    database_name        VARCHAR(200) NOT NULL,    -- teradata/postgres: schema the table lives in.
+                                                    -- file: the directory. s3: the s3:// prefix/bucket.
+                                                    -- Combined with table_name for the auto total-record
+                                                    -- count query (db/connection_factory.py's
+                                                    -- SourceAdapter.qualified_name()).
+    table_name           VARCHAR(200) NOT NULL,    -- teradata/postgres: table name. file: filename.
+                                                    -- s3: object key/glob. The metadata table IS the
+                                                    -- source path for file/s3 rules -- no separate setup.
+    sql_dialect          VARCHAR(20)  NOT NULL,   -- 'teradata' | 'postgres' | 's3' | 'file' -- ALSO
+                                                    -- selects the one connection this rule runs
+                                                    -- against (see db/connection_factory.py -- exactly
+                                                    -- one connection per value, no separate named-
+                                                    -- connection column).
+    rule_sql             CLOB NOT NULL,            -- the negative SELECT; never mutates data. For a
+                                                    -- file/s3 rule, FROM the view name
+                                                    -- db/connection_factory.py::_view_name(table_name)
+                                                    -- derives from table_name.
     project_name         VARCHAR(100) NOT NULL,    -- e.g. HEALTHSPRING_UM -- reporting/scoping dimension,
                                                     -- NOT the filter key load_rules() uses (see design
                                                     -- notes above); mirrors gre_sampling_config

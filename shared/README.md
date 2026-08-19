@@ -7,7 +7,7 @@ each, or force-fit under one of them.
 | File | What |
 |---|---|
 | `config.py` | Local `.env` credential loading (see `dev.env.example` at the repo root) + `GRE_META_CONNECTION`/`GRE_META_DB` resolution + the batch-readiness extension point. Both `rules_engine/runner.py` and `sampling/sampling.py` import this. |
-| `db_ops.py` | Low-level DB helpers: `execute_query`/`execute_dml`, chunked `bulk_insert`/`bulk_insert_or_skip`, the dialect guard (`check_dialect`/`DialectMismatchError`), `{key}` run_params token substitution (`_substitute_params`/`build_run_params`), the retry-wrapped `_run_source_query`, and `log_error()` (the one shared `gre_errors` write path). |
+| `db_ops.py` | Low-level DB helpers: `execute_query`/`execute_dml`, chunked `bulk_insert`/`bulk_insert_or_skip`, `{key}` run_params token substitution (`_substitute_params`/`build_run_params`), the retry-wrapped `_run_source_query`, and `log_error()` (the one shared `gre_errors` write path). |
 | `schema.sql` | `gre_audit` and `gre_errors` -- the two tables both packages write to. |
 | `schema_drop.sql` | Drops both tables (see the file for redeploy ordering). |
 

@@ -21,6 +21,28 @@ from shared.db_ops import execute_dml
 META_DB = "main"
 
 
+class _Adapter:
+    """
+    Minimal SourceAdapter shim wrapping a raw DuckDB connection: adds the
+    prepare()/qualified_name() surface get_source_records_for_rule() calls
+    directly (db.connection_factory.SourceAdapter's interface).
+    """
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return self._conn.cursor()
+
+    def commit(self):
+        self._conn.commit()
+
+    def prepare(self, rule: dict) -> None:
+        pass
+
+    def qualified_name(self, rule: dict) -> str:
+        return f"{rule['database_name']}.{rule['table_name']}"
+
+
 class _FakeConnectionFactory:
     """Every named connection resolves to the same DuckDB connection, unless overridden to return None."""
     def __init__(self, conn, missing_names=()):
@@ -28,7 +50,7 @@ class _FakeConnectionFactory:
         self._missing_names = set(missing_names)
 
     def get(self, name):
-        return None if name in self._missing_names else self._conn
+        return None if name in self._missing_names else _Adapter(self._conn)
 
 
 def _conn():

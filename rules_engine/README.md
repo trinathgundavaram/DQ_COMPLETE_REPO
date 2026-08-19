@@ -28,18 +28,52 @@ summary = run_rule_group(
 
 An unresolved `"{token}"` (a rule references a key the run didn't supply)
 fails that rule attempt immediately with a `PARAM_SUBSTITUTION_ERROR`,
-before any query reaches the source database -- the same
-fail-fast-before-any-query philosophy as the dialect guard.
+before any query reaches the source database.
 
 There is no separate `scope_sql` column to author for the total-record
 (denominator) count. Each `gre_rules` row names its `database_name` +
-`table_name`, and the engine builds `SELECT COUNT(*) FROM
-{database_name}.{table_name} WHERE ...` automatically, applying every key
-in `run_params` as an equality filter (AND'd together) -- the SAME dict
-that scopes `rule_sql` already says what's in scope for the total, so
-there's nothing left to hand-write. A rule's table needs a real column
-for every key its run passes (e.g. if a table has no `batch_id` column,
-don't include one when scoping runs against it).
+`table_name`, and the engine builds `SELECT COUNT(*) FROM {table_ref}
+WHERE ...` automatically (`table_ref` is `database_name.table_name` for a
+real database, or the prepared view name for a file/S3 source -- see
+"One connection per source: `sql_dialect`" below), applying every key in
+`run_params` as an equality filter (AND'd together) -- the SAME dict that
+scopes `rule_sql` already says what's in scope for the total, so there's
+nothing left to hand-write. A rule's table needs a real column for every
+key its run passes (e.g. if a table has no `batch_id` column, don't
+include one when scoping runs against it).
+
+## One connection per source: `sql_dialect`
+
+There is no separate named-connection column. `sql_dialect` -- `'teradata'
+| 'postgres' | 's3' | 'file'` -- both tells the engine how `rule_sql` is
+written AND selects the one connection this rule runs against:
+`db/connection_factory.py`'s `ConnectionFactory` builds exactly ONE
+connection per source_type, so a rule needs nothing more than its dialect
+to pick its source (`cf.get(rule["sql_dialect"])`).
+
+For `teradata`/`postgres`, `database_name`/`table_name` are the schema and
+table exactly as they'd appear in `database_name.table_name`. For `file`/
+`s3`, they drive the source path directly -- **the metadata table IS the
+per-rule configuration, nothing else to set up**:
+
+- `file`: `database_name` = the directory the file lives in (absolute, or
+  relative to `FILE_BASE_PATH`), `table_name` = the filename (e.g.
+  `"claims.csv"`).
+- `s3`: `database_name` = the `s3://` prefix/bucket, `table_name` = the
+  object key or glob under it (e.g. `"pull_date=*/*.parquet"`).
+
+Before `rule_sql` runs, `execute_rule()` calls `db_conn.prepare(rule)`,
+which for `file`/`s3` registers a DuckDB view from those two columns --
+the view name is derived from `table_name` (see
+`db/connection_factory.py::_view_name()`), and `rule_sql` references that
+same name in its `FROM` clause:
+
+```sql
+-- gre_rules row: database_name='/data/inbound', table_name='claims.csv',
+-- sql_dialect='file'
+SELECT claim_id FROM claims WHERE denial_reason IS NULL AND batch_id = '{batch_id}'
+--                   ^^^^^^ view name = _view_name('claims.csv') = 'claims'
+```
 
 ## Selecting which rules run: `rule_variant`
 
@@ -120,7 +154,7 @@ versa.
 | File | What |
 |---|---|
 | `rules.py` | `load_rules()` -- loads active `gre_rules` rows for a rule_group (+ optional `rule_variant` filter), ordered by `seq_no`. |
-| `executor.py` | `execute_rule()` -- runs one rule end-to-end: dialect guard, `run_params` substitution, single-scan evaluation (`_scan_violations`), threshold evaluation, `gre_exceptions`/`gre_results`/`gre_log` writes. |
+| `executor.py` | `execute_rule()` -- runs one rule end-to-end: source prepare (`db_conn.prepare(rule)`), `run_params` substitution, single-scan evaluation (`_scan_violations`), threshold evaluation, `gre_exceptions`/`gre_results`/`gre_log` writes. |
 | `runner.py` | `run_rule_group()` -- orchestration entry point: readiness gate, checkpoint/resume, sequencing_mode-aware loop over `execute_rule()`, `gre_audit` start/finish. `discover_rule_groups()`/`run_all_active_groups()` -- multi-group fan-out by project/process (see "Running multiple projects/processes" above). Also the opt-in parallel path (`_run_pending_parallel()`) -- see "Parallel rule execution" below. |
 | `parallel.py` | `ConnectionPool`/`build_pools()`/`close_pools()` -- the bounded per-connection connection pooling the parallel path uses instead of the single shared `cf.get()` connection. |
 | `reporting.py` | `get_breaches()` / `get_records_for_result()` -- thin read-only queries against `gre_results`/`gre_exceptions`. `get_source_records_for_rule()` -- ties `gre_exceptions` back to the live source record (see "Tying exceptions back to source records" below). |
@@ -136,20 +170,19 @@ used ONLY for `sequencing_mode='independent'` groups:
 
 ```
 GRE_MAX_PARALLEL_RULES=4          # up to 4 rules executing concurrently
-DQ_CLAIMS_PG_MAX_PARALLEL=2       # but never more than 2 of those hitting claims_pg at once
-DQ_TERADATA_MAX_PARALLEL=8        # the warehouse can take more concurrent load
+GRE_POSTGRES_MAX_PARALLEL=2       # but never more than 2 of those hitting postgres at once
+GRE_TERADATA_MAX_PARALLEL=8       # the warehouse can take more concurrent load
 ```
 
 The two settings compose: `GRE_MAX_PARALLEL_RULES` caps how many rules in
-a group may run at the same time at all; `DQ_<NAME>_MAX_PARALLEL` (same
-naming convention `db/connection_factory.py` already uses for
-`DQ_<NAME>_TYPE`/`DQ_<NAME>_HOST`) further caps how many of those
+a group may run at the same time at all; `GRE_<TYPE>_MAX_PARALLEL` (same
+`GRE_<TYPE>_*` naming `db/connection_factory.py` already uses for that
+source_type's other settings) further caps how many of those
 concurrently-running rules may simultaneously hold a session against one
-*specific* named connection. Both default to `1`, so raising the
-group-wide cap alone changes nothing for a connection until that
-connection's own cap is raised too -- a source system that wasn't sized
-for concurrent load never gets hit harder just because a `rule_group`'s
-worker count went up.
+*specific* source_type. Both default to `1`, so raising the group-wide
+cap alone changes nothing for a source until that source's own cap is
+raised too -- a source system that wasn't sized for concurrent load never
+gets hit harder just because a `rule_group`'s worker count went up.
 
 `sequencing_mode='sequential'` groups never take this path, regardless of
 either setting -- their entire purpose (a guaranteed run order, plus
@@ -157,17 +190,17 @@ either setting -- their entire purpose (a guaranteed run order, plus
 of order.
 
 **How it stays safe to run concurrently.** The single shared connection
-`cf.get(name)` normally hands back (reused for the whole run in the
-sequential path -- see the earlier discussion in this README, or ask the
-engine to explain its own connection lifecycle) is NOT safe for two
+`cf.get(source_type)` normally hands back (reused for the whole run in
+the sequential path -- see the earlier discussion in this README, or ask
+the engine to explain its own connection lifecycle) is NOT safe for two
 threads to query at once. So the parallel path never uses `cf.get()` for
 a connection a worker will run a query on; `rules_engine/parallel.py`'s
-`ConnectionPool` instead builds up to `DQ_<NAME>_MAX_PARALLEL` genuinely
-independent connections per name via `cf.new_connection()` -- capped by
-`GRE_MAX_PARALLEL_RULES` too, so a pool is never sized larger than the
-group could ever use concurrently -- and hands them out through a
-blocking queue, whose `get()` is what actually enforces the per-connection
-cap. This applies to the metadata connection too: every worker gets its
+`ConnectionPool` instead builds up to `GRE_<TYPE>_MAX_PARALLEL` genuinely
+independent connections per source_type via `cf.new_connection()` --
+capped by `GRE_MAX_PARALLEL_RULES` too, so a pool is never sized larger
+than the group could ever use concurrently -- and hands them out through
+a blocking queue, whose `get()` is what actually enforces the
+per-connection cap. This applies to the metadata connection too: every worker gets its
 own pooled connection for writing to `gre_exceptions`/`gre_results`/
 `gre_log`, not the single connection the top-level run uses for
 `gre_audit` bookkeeping. Every pooled connection is closed once the group
@@ -267,4 +300,4 @@ print(summary["status"], summary["succeeded"], summary["errored"])
 #                                  "BATCH_2026_08_14", cf, project_name="HEALTHSPRING_UM")
 ```
 
-See the repo root README for environment setup (`dev.env`, `DQ_CONNECTION_NAMES`, etc.), and its "Running the engines end to end" section for a full worked example wiring up `ConnectionFactory` and calling into both packages.
+See the repo root README for environment setup (`dev.env`, one connection per source_type, etc.), and its "Running the engines end to end" section for a full worked example wiring up `ConnectionFactory` and calling into both packages.

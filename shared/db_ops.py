@@ -2,24 +2,17 @@
 shared/db_ops.py
 -----------------
 Low-level DB helpers used by BOTH rules_engine/ and sampling/ -- the one
-place either package goes for cursor/commit mechanics, dialect safety, and
-error logging, instead of each keeping its own copy.
+place either package goes for cursor/commit mechanics and error logging,
+instead of each keeping its own copy.
 
 What lives here vs. what doesn't
 ---------------------------------
-Everything below is genuinely dialect/table-agnostic or writes to a table
-BOTH packages write to (gre_errors). Anything that only makes sense for
-one side -- rule-level threshold evaluation, the single-scan rule
+Everything below is genuinely table-agnostic or writes to a table BOTH
+packages write to (gre_errors). Anything that only makes sense for one
+side -- rule-level threshold evaluation, the single-scan rule
 optimization, gre_exceptions/gre_results writers -- lives in
 rules_engine/executor.py instead, even though it's built on top of these
 same primitives. See shared/README.md for the full split rationale.
-
-execute_query/execute_dml and the tenacity retry decorator are written
-fresh in this file rather than imported from core/executor.py -- importing
-anything under core/ would violate this project's scope boundary (only
-db/adapters.py and db/connection_factory.py are reusable from the dq_*
-engine this sits alongside). The patterns are intentionally the same; the
-code is not shared.
 
 Run-parameter substitution (_substitute_params / build_run_params) is the
 one mechanism both packages use to let a project scope its data however
@@ -40,11 +33,10 @@ MAX_RETRIES = int(os.getenv("GRE_QUERY_MAX_RETRIES", "3"))
 
 # Chunk size for all executemany()-based bulk writes across both packages
 # (rules_engine's gre_exceptions writer, sampling's gre_sample_selections /
-# gre_sample_selection_attrs writers). Mirrors DQ_EXCEPTION_CHUNK's role in
-# core/executor.py.
+# gre_sample_selection_attrs writers).
 EXCEPTION_CHUNK = int(os.getenv("GRE_EXCEPTION_CHUNK", "500"))
 
-# ── Optional tenacity retry (mirrors core/executor.py's _source_retry) ─────
+# ── Optional tenacity retry ─────────────────────────────────────────────────
 try:
     from tenacity import (
         retry,
@@ -66,81 +58,6 @@ except ImportError:
 
     def _source_retry(fn):
         return fn
-
-
-# ---------------------------------------------------------------------------
-# Dialect safety
-# ---------------------------------------------------------------------------
-# gre_rules.sql_dialect is NOT NULL in rules_engine/schema.sql -- every rule
-# declares which SQL flavor rule_sql is written in. Fresh
-# implementation here (not imported from core/rule_sql.py -- see this
-# module's docstring on the scope boundary) but the same shape/behavior as
-# the proven dq_* pattern: 'ansi' is accepted everywhere, an unrecognised
-# source_type is skipped with a warning rather than guessed at, and the
-# check is meant to run BEFORE any query reaches the database, so a
-# mismatch is always a clear, fast, pre-execution error -- never a
-# confusing mid-run syntax error from the wrong SQL dialect hitting the
-# wrong engine.
-
-class DialectMismatchError(Exception):
-    """Raised when a rule's declared sql_dialect cannot run against its target connection."""
-
-
-VALID_DIALECTS = {"teradata", "postgres", "ansi"}
-
-# source_type (SourceAdapter.source_type, see db/adapters.py) -> set of
-# sql_dialect values safe to execute against it. 'ansi' is always accepted
-# by definition. databricks/sqlserver are deliberately NOT listed --
-# db/adapters.py itself notes they're "included and fully functional, but
-# not catalogued/tested for the current use case," so guessing a dialect
-# compatibility for them would be worse than the unrecognised-source_type
-# skip-with-warning path below.
-DIALECT_COMPATIBILITY = {
-    "teradata":   {"teradata", "ansi"},
-    "postgresql": {"postgres", "ansi"},
-    "postgres":   {"postgres", "ansi"},   # alias
-    "aurora":     {"postgres", "ansi"},   # Aurora PG-compatible
-    # FileAdapter/S3Adapter are both DuckDB-backed, which implements a
-    # Postgres-flavoured SQL surface -- 'postgres'-dialect rules run
-    # unmodified against either.
-    "file":       {"postgres", "ansi"},
-    "s3":         {"postgres", "ansi"},
-    "duckdb":     {"postgres", "ansi"},   # alias, in case an adapter reports this directly
-}
-
-
-def check_dialect(rule: dict, source_type: str) -> None:
-    """
-    Raise DialectMismatchError if rule['sql_dialect'] cannot run against a
-    connection reporting `source_type`. No-op for a rule with no
-    sql_dialect set (defensive only -- gre_rules.sql_dialect is NOT NULL)
-    or an unrecognised source_type (logged, not raised -- let the query
-    itself surface any real incompatibility rather than guessing).
-    """
-    dialect = (rule.get("sql_dialect") or "").strip().lower()
-    if not dialect:
-        return
-
-    if dialect not in VALID_DIALECTS:
-        raise DialectMismatchError(
-            f"rule_id={rule.get('rule_id')}: invalid sql_dialect '{dialect}'. "
-            f"Must be one of: {', '.join(sorted(VALID_DIALECTS))}."
-        )
-
-    st = (source_type or "").strip().lower()
-    allowed = DIALECT_COMPATIBILITY.get(st)
-    if allowed is None:
-        logger.warning(
-            "Dialect check skipped for rule_id=%s -- unrecognised source_type '%s'.",
-            rule.get("rule_id"), source_type,
-        )
-        return
-
-    if dialect not in allowed:
-        raise DialectMismatchError(
-            f"rule_id={rule.get('rule_id')} is written for sql_dialect='{dialect}', cannot run "
-            f"against a '{st}' connection. Allowed dialects for '{st}': {', '.join(sorted(allowed))}."
-        )
 
 
 # ---------------------------------------------------------------------------

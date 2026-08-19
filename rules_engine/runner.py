@@ -17,7 +17,7 @@ Raising GRE_MAX_PARALLEL_RULES above its default of 1 (see
 shared/config.py) turns on a second path, used ONLY for
 sequencing_mode='independent' groups: rules run concurrently across a
 bounded thread pool, with per-connection concurrency additionally capped
-by DQ_<NAME>_MAX_PARALLEL so a source system that can't tolerate much
+by GRE_<TYPE>_MAX_PARALLEL so a source system that can't tolerate much
 concurrent load (e.g. an OLTP Postgres source, vs. a Teradata warehouse)
 isn't hit harder just because the group-wide worker count went up. See
 rules_engine/parallel.py's module docstring for the connection-pooling
@@ -118,7 +118,7 @@ def _run_one_pending_rule(rule, source_pools, meta_pool, meta_db, run_id, batch_
     _run_pending_parallel() below -- so by the time this runs, both pools
     passed in are guaranteed usable.
     """
-    source_pool = source_pools[rule["source_connection"]]
+    source_pool = source_pools[rule["sql_dialect"]]
     db_conn = source_pool.acquire()
     worker_meta_conn = meta_pool.acquire()
     try:
@@ -168,7 +168,7 @@ def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, batch_id, res
     runnable = []
     source_names = set()
     for rule in pending:
-        source_names.add(rule["source_connection"])
+        source_names.add(rule["sql_dialect"])
 
     source_pools = build_pools(cf, source_names, max_workers)
     meta_pool = build_pools(cf, {gre_config.get_meta_connection_name()}, max_workers)[
@@ -200,20 +200,20 @@ def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, batch_id, res
             return results, succeeded, errored
 
         for rule in pending:
-            if source_pools[rule["source_connection"]].available:
+            if source_pools[rule["sql_dialect"]].available:
                 runnable.append(rule)
             else:
                 unavailable.append(rule)
 
         for rule in unavailable:
             logger.error(
-                "rule_id=%s: source_connection '%s' unavailable -- logging as ERROR.",
-                rule["rule_id"], rule["source_connection"],
+                "rule_id=%s: source_type '%s' unavailable -- logging as ERROR.",
+                rule["rule_id"], rule["sql_dialect"],
             )
             _log_error(meta_conn, meta_db, run_id, rule, batch_id,
-                       "CONNECTION_UNAVAILABLE", f"No connection '{rule['source_connection']}'")
+                       "CONNECTION_UNAVAILABLE", f"No connection '{rule['sql_dialect']}'")
             _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, time.time(),
-                        f"No connection '{rule['source_connection']}'")
+                        f"No connection '{rule['sql_dialect']}'")
             results[rule["rule_id"]] = "ERROR"
             errored += 1
 
@@ -269,7 +269,7 @@ def run_rule_group(
                    always present in the run_params every rule sees (see
                    run_params below).
     cf           : a db.connection_factory.ConnectionFactory, already loaded,
-                   used to resolve each rule's source_connection to an adapter
+                   used to resolve each rule's sql_dialect (source_type) to an adapter
     meta_conn    : adapter for the gre_ metadata store; defaults to
                    cf.get(gre_config.get_meta_connection_name())
     meta_db      : schema the gre_ tables live in; defaults to
@@ -386,16 +386,16 @@ def run_rule_group(
         )
     else:
         for rule in pending:
-            db_conn = cf.get(rule["source_connection"])
+            db_conn = cf.get(rule["sql_dialect"])
             if db_conn is None:
                 logger.error(
-                    "rule_id=%s: source_connection '%s' unavailable -- logging as ERROR.",
-                    rule["rule_id"], rule["source_connection"],
+                    "rule_id=%s: source_type '%s' unavailable -- logging as ERROR.",
+                    rule["rule_id"], rule["sql_dialect"],
                 )
                 _log_error(meta_conn, meta_db, run_id, rule, batch_id,
-                           "CONNECTION_UNAVAILABLE", f"No connection '{rule['source_connection']}'")
+                           "CONNECTION_UNAVAILABLE", f"No connection '{rule['sql_dialect']}'")
                 _log_attempt(meta_conn, meta_db, run_id, rule, batch_id, "ERROR", 0, time.time(),
-                            f"No connection '{rule['source_connection']}'")
+                            f"No connection '{rule['sql_dialect']}'")
                 status = "ERROR"
             else:
                 status = execute_rule(rule, db_conn, meta_conn, run_id, resolved_params, meta_db,

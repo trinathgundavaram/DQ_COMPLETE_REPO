@@ -1,8 +1,8 @@
 """
 shared/db_ops.py tests: the low-level DB helpers used by BOTH
-rules_engine/ and sampling/ -- bulk writes with duplicate-key tolerance,
-the dialect guard, and {key} run_params token substitution. No live DB
-connection required -- DuckDB stands in for the metadata store.
+rules_engine/ and sampling/ -- bulk writes with duplicate-key tolerance
+and {key} run_params token substitution. No live DB connection required --
+DuckDB stands in for the metadata store.
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -12,7 +12,7 @@ import pytest
 
 from shared.db_ops import (
     execute_query, bulk_insert, bulk_insert_or_skip,
-    check_dialect, DialectMismatchError, _substitute_params, build_run_params,
+    _substitute_params, build_run_params,
 )
 
 
@@ -137,33 +137,3 @@ def test_bulk_insert_or_skip_chunk_falls_back_on_duplicate():
     assert total == 3   # C1, C2, C3 -- no duplicate row, no lost row
     keys = {r["natural_key_value"] for r in execute_query(conn, "SELECT natural_key_value FROM gre_exceptions")}
     assert keys == {"claim_id=C1", "claim_id=C2", "claim_id=C3"}
-
-
-# ── dialect guard ─────────────────────────────────────────────────────────
-
-def test_check_dialect_ansi_accepted_everywhere():
-    check_dialect({"rule_id": 1, "sql_dialect": "ansi"}, "postgresql")
-    check_dialect({"rule_id": 1, "sql_dialect": "ansi"}, "teradata")
-    check_dialect({"rule_id": 1, "sql_dialect": "ansi"}, "some_future_adapter")
-
-
-def test_check_dialect_matching_dialect_passes():
-    check_dialect({"rule_id": 1, "sql_dialect": "teradata"}, "teradata")
-    check_dialect({"rule_id": 1, "sql_dialect": "postgres"}, "postgresql")
-    check_dialect({"rule_id": 1, "sql_dialect": "postgres"}, "s3")   # DuckDB-backed
-
-
-def test_check_dialect_mismatch_raises():
-    with pytest.raises(DialectMismatchError):
-        check_dialect({"rule_id": 1, "sql_dialect": "teradata"}, "postgresql")
-
-
-def test_check_dialect_invalid_value_raises():
-    with pytest.raises(DialectMismatchError):
-        check_dialect({"rule_id": 1, "sql_dialect": "mysql"}, "teradata")
-
-
-def test_check_dialect_unrecognised_source_type_is_a_no_op():
-    # databricks/sqlserver are deliberately not in DIALECT_COMPATIBILITY --
-    # skip with a warning rather than guess.
-    check_dialect({"rule_id": 1, "sql_dialect": "teradata"}, "databricks")

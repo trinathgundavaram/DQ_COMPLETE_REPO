@@ -124,20 +124,20 @@ def test_get_max_parallel_rules_never_below_one(monkeypatch):
 
 
 def test_get_max_parallel_for_connection_default_is_one():
-    assert shared_config.get_max_parallel_for_connection("claims_pg") == 1
+    assert shared_config.get_max_parallel_for_connection("postgres") == 1
 
 
 def test_get_max_parallel_for_connection_env_override(monkeypatch):
-    monkeypatch.setenv("DQ_CLAIMS_PG_MAX_PARALLEL", "3")
-    assert shared_config.get_max_parallel_for_connection("claims_pg") == 3
-    # Case-insensitive connection name, same as DQ_<NAME>_TYPE elsewhere.
-    assert shared_config.get_max_parallel_for_connection("CLAIMS_PG") == 3
+    monkeypatch.setenv("GRE_POSTGRES_MAX_PARALLEL", "3")
+    assert shared_config.get_max_parallel_for_connection("postgres") == 3
+    # Case-insensitive source_type, same as elsewhere.
+    assert shared_config.get_max_parallel_for_connection("POSTGRES") == 3
 
 
-def test_get_max_parallel_for_connection_is_independent_per_name(monkeypatch):
-    monkeypatch.setenv("DQ_TERADATA_MAX_PARALLEL", "10")
+def test_get_max_parallel_for_connection_is_independent_per_type(monkeypatch):
+    monkeypatch.setenv("GRE_TERADATA_MAX_PARALLEL", "10")
     assert shared_config.get_max_parallel_for_connection("teradata") == 10
-    assert shared_config.get_max_parallel_for_connection("some_other_conn") == 1
+    assert shared_config.get_max_parallel_for_connection("s3") == 1
 
 
 def test_check_batch_ready_defaults_true_when_unregistered():

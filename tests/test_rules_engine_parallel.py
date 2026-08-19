@@ -8,14 +8,12 @@ and the unavailable-connection path can be asserted directly.
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import pytest
-
 from rules_engine.parallel import ConnectionPool, build_pools, close_pools
-from db.adapters import FileAdapter
+from db.connection_factory import FileAdapter
 
 
 class _StubAdapter:
-    """Minimal stand-in for a db.adapters.SourceAdapter -- just tracks close() calls."""
+    """Minimal stand-in for a db.connection_factory.SourceAdapter -- just tracks close() calls."""
     def __init__(self, name, seq):
         self.name = name
         self.seq = seq
@@ -140,14 +138,14 @@ def test_pool_close_skips_file_adapter_singleton():
 # ── build_pools / close_pools ────────────────────────────────────────────
 
 def test_build_pools_sizes_by_min_of_configured_cap_and_max_workers(monkeypatch):
-    monkeypatch.setenv("DQ_CLAIMS_PG_MAX_PARALLEL", "2")
-    monkeypatch.setenv("DQ_TERADATA_MAX_PARALLEL", "10")
+    monkeypatch.setenv("GRE_CLAIMS_PG_MAX_PARALLEL", "2")
+    monkeypatch.setenv("GRE_TERADATA_MAX_PARALLEL", "10")
     cf = _FakeCF()
 
     pools = build_pools(cf, {"claims_pg", "teradata"}, max_workers=5)
 
-    assert cf.calls["claims_pg"] == 2    # capped by DQ_CLAIMS_PG_MAX_PARALLEL, below max_workers
-    assert cf.calls["teradata"] == 5     # capped by max_workers, below DQ_TERADATA_MAX_PARALLEL
+    assert cf.calls["claims_pg"] == 2    # capped by GRE_CLAIMS_PG_MAX_PARALLEL, below max_workers
+    assert cf.calls["teradata"] == 5     # capped by max_workers, below GRE_TERADATA_MAX_PARALLEL
     close_pools(pools)
 
 
@@ -161,8 +159,8 @@ def test_build_pools_one_pool_per_name():
 def test_close_pools_closes_every_pool(monkeypatch):
     # Default per-connection cap is 1 -- raise it so 2 acquire()s per pool
     # don't block waiting for a slot that was never released.
-    monkeypatch.setenv("DQ_A_MAX_PARALLEL", "2")
-    monkeypatch.setenv("DQ_B_MAX_PARALLEL", "2")
+    monkeypatch.setenv("GRE_A_MAX_PARALLEL", "2")
+    monkeypatch.setenv("GRE_B_MAX_PARALLEL", "2")
     cf = _FakeCF()
     pools = build_pools(cf, {"a", "b"}, max_workers=2)
     adapters_a = [pools["a"].acquire() for _ in range(2)]

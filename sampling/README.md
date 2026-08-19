@@ -94,4 +94,4 @@ result = run_sampling(config_id=1, batch_id="2026-08-14", cf=cf)
 print(result["status"], result["selected"], "/", result["target_volume"])
 ```
 
-See the repo root README for environment setup (`dev.env`, `DQ_CONNECTION_NAMES`, etc.).
+See the repo root README for environment setup (`dev.env`, one connection per source_type, etc.).

@@ -18,13 +18,37 @@ from shared.db_ops import execute_query
 META_DB = "main"
 
 
+class _Adapter:
+    """
+    Minimal SourceAdapter shim wrapping a raw DuckDB connection/cursor: adds
+    the prepare()/qualified_name() surface execute_rule()/_compute_total()
+    call directly (db.connection_factory.SourceAdapter's interface) -- see
+    test_rules_engine_executor.py's twin for why a raw duckdb object can't
+    be handed to execute_rule() as db_conn anymore.
+    """
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return self._conn.cursor()
+
+    def commit(self):
+        self._conn.commit()
+
+    def prepare(self, rule: dict) -> None:
+        pass
+
+    def qualified_name(self, rule: dict) -> str:
+        return f"{rule['database_name']}.{rule['table_name']}"
+
+
 class _FakeConnectionFactory:
-    """Every named connection resolves to the same DuckDB connection."""
+    """Every source_type resolves to the same underlying DuckDB connection."""
     def __init__(self, conn):
         self._conn = conn
 
     def get(self, name):
-        return self._conn
+        return _Adapter(self._conn)
 
     def new_connection(self, name):
         # A fresh DuckDB cursor sharing the same in-memory database -- this
@@ -33,7 +57,7 @@ class _FakeConnectionFactory:
         # threads, standing in here for what ConnectionFactory.
         # new_connection() does for a real adapter (build a genuinely
         # separate connection, not hand back the single shared one).
-        return self._conn.cursor()
+        return _Adapter(self._conn.cursor())
 
 
 class _CountingFakeConnectionFactory(_FakeConnectionFactory):
@@ -72,7 +96,7 @@ def _conn():
     conn.execute("""
         CREATE TABLE gre_rules (
             rule_id INTEGER, rule_name VARCHAR, database_name VARCHAR, table_name VARCHAR,
-            source_connection VARCHAR, sql_dialect VARCHAR, rule_sql VARCHAR,
+            sql_dialect VARCHAR, rule_sql VARCHAR,
             project_name VARCHAR, process_name VARCHAR,
             rule_group VARCHAR, rule_variant VARCHAR,
             seq_no INTEGER, sequencing_mode VARCHAR, on_failure VARCHAR,
@@ -141,15 +165,16 @@ def _conn():
 
 def _insert_rule(conn, rule_id, rule_sql, seq_no, sequencing_mode="independent",
                   on_failure="skip_and_continue", rule_group="claims_dq", rule_variant=None,
-                  project_name="HEALTHSPRING_UM", process_name="UNIVERSE_VALIDATION"):
+                  project_name="HEALTHSPRING_UM", process_name="UNIVERSE_VALIDATION",
+                  sql_dialect="teradata"):
     conn.execute("""
         INSERT INTO gre_rules (
-            rule_id, rule_name, database_name, table_name, source_connection, sql_dialect, rule_sql,
+            rule_id, rule_name, database_name, table_name, sql_dialect, rule_sql,
             project_name, process_name, rule_group, rule_variant, seq_no, sequencing_mode, on_failure,
             natural_key_columns, active_flag
-        ) VALUES (?, ?, 'main', 'claims', 'duckdb_test', 'ansi', ?, ?, ?, ?, ?, ?, ?, ?, 'claim_id', 1)
-    """, [rule_id, f"rule {rule_id}", rule_sql, project_name, process_name, rule_group, rule_variant,
-          seq_no, sequencing_mode, on_failure])
+        ) VALUES (?, ?, 'main', 'claims', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claim_id', 1)
+    """, [rule_id, f"rule {rule_id}", sql_dialect, rule_sql, project_name, process_name, rule_group,
+          rule_variant, seq_no, sequencing_mode, on_failure])
 
 
 _MISSING_REASON_SQL = "SELECT claim_id FROM claims WHERE denial_reason IS NULL AND batch_id = '{batch_id}'"
@@ -343,8 +368,8 @@ def test_run_params_stray_batch_id_key_never_overrides_the_real_one():
 
 
 # ── Parallel execution (opt-in via GRE_MAX_PARALLEL_RULES) ──────────────
-# All source_connection values below are still "duckdb_test" -- _insert_rule's
-# default -- so _CountingFakeConnectionFactory.calls["duckdb_test"] counts
+# All sql_dialect values below are still "teradata" -- _insert_rule's
+# default -- so _CountingFakeConnectionFactory.calls["teradata"] counts
 # every new_connection() call made for the SOURCE side across a run; the
 # meta side is counted separately under get_meta_connection_name()'s value
 # ("teradata", shared.config's default -- these tests never override
@@ -392,7 +417,7 @@ def test_parallel_enabled_runs_every_independent_rule(monkeypatch):
     assert {r["rule_id"] for r in exceptions} == {1, 2}
     # The pool did open independent connections this time (both source and
     # meta side), proving the parallel path was actually taken.
-    assert cf.calls.get("duckdb_test", 0) > 0
+    assert cf.calls.get("teradata", 0) > 0
     assert cf.calls.get(_META_NAME, 0) > 0
 
 
@@ -414,13 +439,13 @@ def test_parallel_never_applies_to_sequential_mode_even_when_enabled(monkeypatch
     assert cf.calls == {}                        # sequential path -- pools never built
 
 
-def test_parallel_source_connection_unavailable_marks_rule_error_without_deadlock(monkeypatch):
+def test_parallel_sql_dialect_unavailable_marks_rule_error_without_deadlock(monkeypatch):
     monkeypatch.setenv("GRE_MAX_PARALLEL_RULES", "4")
     conn = _conn()
-    # duckdb_test can never build even one connection -- every rule using it
+    # teradata can never build even one connection -- every rule using it
     # must come back ERROR/CONNECTION_UNAVAILABLE, same as the sequential
     # path's db_conn is None branch, and the run must still complete (not hang).
-    cf = _CountingFakeConnectionFactory(conn, max_builds={"duckdb_test": 0})
+    cf = _CountingFakeConnectionFactory(conn, max_builds={"teradata": 0})
     _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, sequencing_mode="independent")
     _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, sequencing_mode="independent")
 
@@ -461,11 +486,11 @@ def test_parallel_respects_per_connection_max_parallel_cap(monkeypatch):
 
     assert summary["status"] == "COMPLETED"
     assert summary["succeeded"] == 5
-    # Only 2 source connections were ever built for 'duckdb_test', even
+    # Only 2 source connections were ever built for 'teradata', even
     # though 5 rules ran and GRE_MAX_PARALLEL_RULES allowed 6 concurrent --
     # proves DQ_<NAME>_MAX_PARALLEL, not just the group-wide cap, bounds
     # how many sessions land on one connection.
-    assert cf.calls["duckdb_test"] == 2
+    assert cf.calls["teradata"] == 2
 
 
 def test_parallel_closes_pooled_connections_after_the_run(monkeypatch):

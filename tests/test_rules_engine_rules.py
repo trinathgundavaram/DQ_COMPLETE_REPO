@@ -19,7 +19,7 @@ def _conn():
     conn.execute("""
         CREATE TABLE gre_rules (
             rule_id INTEGER, rule_name VARCHAR, database_name VARCHAR, table_name VARCHAR,
-            source_connection VARCHAR, sql_dialect VARCHAR, rule_sql VARCHAR,
+            sql_dialect VARCHAR, rule_sql VARCHAR,
             rule_group VARCHAR, rule_variant VARCHAR,
             seq_no INTEGER, sequencing_mode VARCHAR, on_failure VARCHAR,
             threshold_pct DOUBLE, threshold_count INTEGER, threshold_operator VARCHAR,
@@ -34,9 +34,9 @@ def _conn():
 def _insert(conn, rule_id, rule_group="claims_dq", seq_no=100, active_flag=1, rule_variant=None):
     conn.execute("""
         INSERT INTO gre_rules (
-            rule_id, rule_name, database_name, table_name, source_connection, sql_dialect, rule_sql,
+            rule_id, rule_name, database_name, table_name, sql_dialect, rule_sql,
             rule_group, rule_variant, seq_no, natural_key_columns, active_flag
-        ) VALUES (?, ?, 'main', 't', 'duckdb_test', 'ansi', 'SELECT 1', ?, ?, ?, 'k', ?)
+        ) VALUES (?, ?, 'main', 't', 'teradata', 'SELECT 1', ?, ?, ?, 'k', ?)
     """, [rule_id, f"rule {rule_id}", rule_group, rule_variant, seq_no, active_flag])
 
 

@@ -23,7 +23,7 @@
 -- ============================================================
 
 INSERT INTO CMSUNIV_FILELAND_DEV_T.gre_sampling_config (
-    config_id, project_name, process_name, sample_name, connection_name,
+    config_id, project_name, process_name, sample_name, source_type,
     universe_table, key_columns, scope_sql, exclusion_sql, target_volume,
     sampling_method, priority_rank_sql, rounding_mode, schedule_cron, active_flag
 ) VALUES (

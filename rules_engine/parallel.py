@@ -45,7 +45,7 @@ instances are skipped even then, for the same shared-singleton reason.
 import logging
 import queue
 
-from db.adapters import FileAdapter, S3Adapter
+from db.connection_factory import FileAdapter, S3Adapter
 from shared.config import get_max_parallel_for_connection
 
 logger = logging.getLogger(__name__)
@@ -107,7 +107,7 @@ class ConnectionPool:
 def build_pools(cf, names: set, max_workers: int) -> dict:
     """
     One ConnectionPool per name in `names`, each sized to the SMALLER of
-    that connection's own configured cap (DQ_<NAME>_MAX_PARALLEL) and
+    that connection's own configured cap (GRE_<TYPE>_MAX_PARALLEL) and
     max_workers -- no point building more slots for a connection than the
     group-wide worker count could ever use concurrently anyway.
     """

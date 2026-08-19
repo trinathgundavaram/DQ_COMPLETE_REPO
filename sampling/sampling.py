@@ -458,10 +458,10 @@ def run_sampling(config_id, batch_id: str, cf, meta_conn=None, meta_db: str = No
 
     sample_run_id = f"{config.get('sample_name', 'SAMPLE')}_{batch_id}_{started_at.strftime('%Y%m%d_%H%M%S')}"
 
-    db_conn = cf.get(config["connection_name"])
+    db_conn = cf.get(config["source_type"])
     if db_conn is None:
         _log_sampling_error(meta_conn, meta_db, sample_run_id, config,
-                            "CONNECTION_UNAVAILABLE", f"No connection '{config['connection_name']}'")
+                            "CONNECTION_UNAVAILABLE", f"No connection '{config['source_type']}'")
         _write_audit(meta_conn, meta_db, sample_run_id, config, method, None,
                     target_vol, 0, 0, started_at, "ERROR")
         return {"sample_run_id": sample_run_id, "status": "ERROR", "candidates": 0, "selected": 0,
