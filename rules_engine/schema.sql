@@ -283,6 +283,20 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_results (
     threshold_operator_used     CHAR(3),
     severity                    VARCHAR(50),
     status                      VARCHAR(10),  -- 'PASS' | 'FAIL' | 'WARN'
+    source_tieback_sql          CLOB,         -- generated (never executed) SQL TEXT that joins
+                                               -- this rule's source table straight to its
+                                               -- gre_exceptions rows for run_key, parsing
+                                               -- src_key_value back into its original column(s)
+                                               -- in-database via STRTOK (teradata) or split_part
+                                               -- (postgres) -- see rules_engine/executor.py::
+                                               -- build_source_tieback_sql()'s docstring. NULL for
+                                               -- a 'file'/'s3' rule (no durable table for a stored
+                                               -- SQL string to reference) or a rule with no
+                                               -- src_key_cols. Pull this straight out of
+                                               -- gre_results and run it in Toad/whatever SQL
+                                               -- client instead of hand-deriving the join.
+                                               -- ALTER TABLE ... ADD COLUMN on the real Teradata
+                                               -- instance for existing deploys.
     evaluated_at                TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 PRIMARY INDEX (rule_id, run_key);

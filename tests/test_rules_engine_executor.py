@@ -21,6 +21,7 @@ import rules_engine.executor as rules_engine_executor
 from rules_engine.executor import (
     evaluate_threshold, build_src_key,
     execute_rule, _compute_total, _scan_violations,
+    build_source_tieback_sql,
 )
 from shared.db_ops import execute_query
 
@@ -135,6 +136,7 @@ def _conn():
             total_records BIGINT, failed_records BIGINT, failure_pct DOUBLE,
             threshold_pct_used DOUBLE, threshold_count_used INTEGER,
             threshold_operator_used VARCHAR, severity VARCHAR, status VARCHAR,
+            source_tieback_sql VARCHAR,
             evaluated_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
@@ -271,6 +273,83 @@ def test_execute_rule_writes_exceptions_and_result():
     assert logs[0]["rowcount"] == 2
     assert logs[0]["project_name"] == "HEALTHSPRING_UM"
     assert logs[0]["process_name"] == "UNIVERSE_VALIDATION"
+
+
+# ── build_source_tieback_sql: generated (never executed) join SQL ────────
+
+def test_build_source_tieback_sql_teradata_single_column_key():
+    rule = _rule(rule_id=7, database_name="CMSUNIV_FILELAND_DEV_T", src_tbl_nm="claims_universe",
+                src_key_cols="claim_id", sql_dialect="teradata")
+    sql = build_source_tieback_sql(rule, "B1", "CMSUNIV_FILELAND_DEV_T")
+
+    assert "FROM CMSUNIV_FILELAND_DEV_T.claims_universe s" in sql
+    assert "JOIN CMSUNIV_FILELAND_DEV_T.gre_exceptions e" in sql
+    assert "STRTOK(e.src_key_value, '=', 2)" in sql
+    assert "s.claim_id = STRTOK(e.src_key_value, '=', 2)" in sql
+    assert "e.rule_id = 7" in sql
+    assert "e.run_key = 'B1'" in sql
+    assert "e.etl_is_curr_ind = 'Y'" in sql
+    # Never touches the DB -- this is text generation only.
+    assert isinstance(sql, str)
+
+
+def test_build_source_tieback_sql_teradata_composite_key_uses_pipe_split():
+    rule = _rule(database_name="db", src_tbl_nm="order_lines",
+                src_key_cols="order_id, line_no", sql_dialect="teradata")
+    sql = build_source_tieback_sql(rule, "B1", "META_DB")
+
+    assert "STRTOK(STRTOK(e.src_key_value, '|', 1), '=', 2)" in sql
+    assert "STRTOK(STRTOK(e.src_key_value, '|', 2), '=', 2)" in sql
+    assert "s.order_id = STRTOK(STRTOK(e.src_key_value, '|', 1), '=', 2)" in sql
+    assert "s.line_no = STRTOK(STRTOK(e.src_key_value, '|', 2), '=', 2)" in sql
+
+
+def test_build_source_tieback_sql_postgres_uses_split_part():
+    rule = _rule(database_name="db", src_tbl_nm="claims", src_key_cols="claim_id", sql_dialect="postgres")
+    sql = build_source_tieback_sql(rule, "B1", "META_DB")
+
+    assert "split_part(e.src_key_value, '=', 2)" in sql
+    assert "STRTOK" not in sql
+
+
+def test_build_source_tieback_sql_handles_null_sentinel():
+    rule = _rule(database_name="db", src_tbl_nm="claims", src_key_cols="region", sql_dialect="teradata")
+    sql = build_source_tieback_sql(rule, "B1", "META_DB")
+
+    assert "CASE WHEN STRTOK(e.src_key_value, '=', 2) = 'NULL' THEN s.region IS NULL " \
+           "ELSE s.region = STRTOK(e.src_key_value, '=', 2) END" in sql
+
+
+def test_build_source_tieback_sql_none_for_file_and_s3_dialects():
+    for dialect in ("file", "s3"):
+        rule = _rule(src_key_cols="claim_id", sql_dialect=dialect)
+        assert build_source_tieback_sql(rule, "B1", "META_DB") is None
+
+
+def test_build_source_tieback_sql_none_when_no_src_key_cols():
+    rule = _rule(sql_dialect="teradata", src_key_cols="")
+    assert build_source_tieback_sql(rule, "B1", "META_DB") is None
+
+
+def test_build_source_tieback_sql_escapes_run_key():
+    rule = _rule(src_key_cols="claim_id", sql_dialect="teradata")
+    sql = build_source_tieback_sql(rule, "O'BRIEN", "META_DB")
+    assert "run_key = 'O''BRIEN'" in sql   # single quote doubled, not left unescaped
+
+
+def test_execute_rule_writes_source_tieback_sql_onto_gre_results():
+    conn = _conn()
+    rule = _rule(threshold_pct=25)   # 2/4 = 50% > 25% -> FAIL, write_result=True
+
+    execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
+    assert len(results) == 1
+    sql = results[0]["source_tieback_sql"]
+    assert sql is not None
+    assert "e.rule_id = 1" in sql
+    assert "e.run_key = 'B1'" in sql
+    assert "s.claim_id = STRTOK(e.src_key_value, '=', 2)" in sql
 
 
 def test_execute_rule_is_idempotent_on_rerun():

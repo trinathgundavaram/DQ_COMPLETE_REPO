@@ -55,7 +55,7 @@ from datetime import datetime
 
 from shared.db_ops import (
     execute_dml, execute_query, bulk_insert_or_skip, bulk_execute, _is_duplicate_key_error,
-    _substitute_params, _run_source_query,
+    _substitute_params, _run_source_query, _escape_sql_literal,
     log_error, EXCEPTION_CHUNK,
 )
 
@@ -242,6 +242,114 @@ def parse_src_key(src_key_value: str) -> dict:
         col, _, val = segment.partition("=")
         parsed[col] = None if val == "NULL" else val
     return parsed
+
+
+# Dialects whose source table is itself a durable, directly-queryable
+# object an analyst can connect to and run a stored SQL string against
+# LATER, independent of this Python process -- see
+# build_source_tieback_sql()'s docstring for why 'file'/'s3' are excluded.
+_TIEBACK_SQL_DIALECTS = {"teradata", "postgres"}
+
+
+def _tieback_split_expr(dialect: str, src_key_value_expr: str, token_index: int, token_count: int) -> str:
+    """
+    dialect-appropriate "give me the value half of the token_index'th
+    '|'-delimited COLUMN=VALUE segment of src_key_value_expr" expression.
+    1-indexed (both STRTOK and split_part are 1-indexed) -- token_index=1
+    for a single-column key skips the outer split entirely (nothing to
+    split on '|' when there's only ever one segment).
+    """
+    token = src_key_value_expr if token_count == 1 else None
+    if dialect == "teradata":
+        if token is None:
+            token = f"STRTOK({src_key_value_expr}, '|', {token_index})"
+        return f"STRTOK({token}, '=', 2)"
+    # postgres -- and, incidentally, duckdb, which implements the same
+    # split_part(string, delimiter, position) signature, so this branch
+    # would also work if _TIEBACK_SQL_DIALECTS ever grows to include it.
+    if token is None:
+        token = f"split_part({src_key_value_expr}, '|', {token_index})"
+    return f"split_part({token}, '=', 2)"
+
+
+def build_source_tieback_sql(rule: dict, run_key: str, meta_db: str) -> str:
+    """
+    Build (never execute) the SQL TEXT that joins this rule's source table
+    directly to its gre_exceptions rows for `run_key`, parsing
+    src_key_value back into its original column(s) in-database via a
+    dialect-appropriate string-split function -- the generic, automated
+    version of the STRTOK join an analyst would otherwise hand-write in
+    Toad each time (see the conversation this generalizes, and
+    rules_engine/reporting.py::get_source_records_for_rule() for the
+    Python fetch-and-join equivalent of the same tie-back).
+
+    Returns SQL text ONLY -- this never opens a connection or runs
+    anything; see execute_rule()'s STEP 3.5 for where the returned string
+    gets persisted (gre_results.source_tieback_sql), so an analyst can
+    pull it straight out of gre_results and paste it into Toad/whatever
+    SQL client, without having to re-derive src_key_cols/database_name/
+    src_tbl_nm/rule_id by hand every time.
+
+    Only meaningful for a rule whose source table is itself a durable
+    object an analyst can query LATER, independent of this Python
+    process's lifetime:
+      - 'teradata' -- joins straight to {meta_db}.gre_exceptions, same
+        Teradata instance, using STRTOK.
+      - 'postgres' -- uses split_part; ASSUMES metadata_sync has mirrored
+        gre_exceptions into that Postgres schema (see
+        metadata_sync/README.md) -- the caller/analyst is responsible for
+        qualifying {meta_db} with wherever that mirror actually lives if
+        it differs from the rule's own database_name.
+      - 'file'/'s3' -- these run against an ephemeral DuckDB view
+        registered only for the duration of one Python process (see
+        db/connection_factory.py's FileAdapter/S3Adapter.prepare()) --
+        there is no persistent table for a stored SQL string to reference
+        after the process exits, so this returns None for those (and for
+        any other/unrecognized sql_dialect) rather than emitting SQL that
+        can never actually be run.
+
+    Also returns None if the rule has no src_key_cols (same "can't build
+    a natural key" case build_src_key() raises on) -- there is nothing to
+    join on.
+    """
+    dialect = (rule.get("sql_dialect") or "").lower()
+    if dialect not in _TIEBACK_SQL_DIALECTS:
+        return None
+
+    cols = [c.strip() for c in (rule.get("src_key_cols") or "").split(",") if c.strip()]
+    if not cols:
+        return None
+
+    rule_id = rule.get("rule_id")
+    database_name = rule.get("database_name")
+    src_tbl_nm = rule.get("src_tbl_nm")
+    src_table = f"{database_name}.{src_tbl_nm}" if database_name else src_tbl_nm
+
+    conditions = []
+    for i, col in enumerate(cols, start=1):
+        value_expr = _tieback_split_expr(dialect, "e.src_key_value", i, len(cols))
+        # A genuinely NULL key column is stored as the literal string
+        # "NULL" (see _format_src_key()'s docstring), not a real SQL NULL
+        # -- CASE this back to an IS NULL comparison so those rows still
+        # join instead of silently never matching (NULL = 'NULL' is never
+        # true in SQL).
+        conditions.append(
+            f"(CASE WHEN {value_expr} = 'NULL' THEN s.{col} IS NULL ELSE s.{col} = {value_expr} END)"
+        )
+    where_join = "\n  AND ".join(conditions)
+
+    return (
+        f"SELECT s.*, e.record_id AS _record_id, e.rule_id AS _rule_id, e.rule_nm AS _rule_nm,\n"
+        f"       e.process_name AS _process_name, e.project_name AS _project_name,\n"
+        f"       e.src_key_value AS _src_key_value, e.issue_desc AS _issue_desc,\n"
+        f"       e.exception_flag AS _exception_flag\n"
+        f"FROM {src_table} s\n"
+        f"JOIN {meta_db}.gre_exceptions e\n"
+        f"  ON {where_join}\n"
+        f"WHERE e.rule_id = {rule_id}\n"
+        f"  AND e.run_key = '{_escape_sql_literal(run_key)}'\n"
+        f"  AND e.etl_is_curr_ind = 'Y'"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -495,14 +603,14 @@ def _upsert_result(meta_conn, meta_db: str, row: dict) -> None:
         INSERT INTO {meta_db}.gre_results (
             rule_id, run_key, run_id, project_name, process_name, total_records, failed_records,
             failure_pct, threshold_pct_used, threshold_count_used,
-            threshold_operator_used, severity, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            threshold_operator_used, severity, status, source_tieback_sql
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = [
         row["rule_id"], row["run_key"], row["run_id"], row.get("project_name"), row.get("process_name"),
         row["total_records"], row["failed_records"], row["failure_pct"], row["threshold_pct_used"],
         row["threshold_count_used"], row["threshold_operator_used"],
-        row["severity"], row["status"],
+        row["severity"], row["status"], row.get("source_tieback_sql"),
     ]
     try:
         execute_dml(meta_conn, insert_sql, params)
@@ -515,7 +623,7 @@ def _upsert_result(meta_conn, meta_db: str, row: dict) -> None:
         UPDATE {meta_db}.gre_results
         SET run_id = ?, project_name = ?, process_name = ?, total_records = ?, failed_records = ?,
             failure_pct = ?, threshold_pct_used = ?, threshold_count_used = ?,
-            threshold_operator_used = ?, severity = ?, status = ?,
+            threshold_operator_used = ?, severity = ?, status = ?, source_tieback_sql = ?,
             evaluated_at = CURRENT_TIMESTAMP
         WHERE rule_id = ? AND run_key = ?
     """
@@ -523,7 +631,7 @@ def _upsert_result(meta_conn, meta_db: str, row: dict) -> None:
         row["run_id"], row.get("project_name"), row.get("process_name"), row["total_records"],
         row["failed_records"], row["failure_pct"],
         row["threshold_pct_used"], row["threshold_count_used"], row["threshold_operator_used"],
-        row["severity"], row["status"], row["rule_id"], row["run_key"],
+        row["severity"], row["status"], row.get("source_tieback_sql"), row["rule_id"], row["run_key"],
     ])
 
 
@@ -772,6 +880,23 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
 
     if verdict["write_result"]:
         failure_pct = round((failed / total * 100), 6) if total else 0.0
+
+        # Build (never execute) the STRTOK/split_part join text that ties
+        # this rule's gre_exceptions rows back to their live source
+        # records -- see build_source_tieback_sql()'s docstring. Best-
+        # effort: a failure here must never take down an otherwise-
+        # successful rule attempt, so it's logged and the result row is
+        # still written with source_tieback_sql=NULL rather than erroring
+        # the whole rule out.
+        try:
+            source_tieback_sql = build_source_tieback_sql(rule, run_key, meta_db)
+        except Exception as exc:
+            logger.warning(
+                "Rule %s: source_tieback_sql generation failed (non-fatal): %s",
+                rule.get("rule_id"), exc, exc_info=True,
+            )
+            source_tieback_sql = None
+
         try:
             _upsert_result(meta_conn, meta_db, {
                 "rule_id": rule.get("rule_id"),
@@ -787,6 +912,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
                 "threshold_operator_used": verdict["threshold_operator_used"],
                 "severity": rule.get("severity"),
                 "status": verdict["status"],
+                "source_tieback_sql": source_tieback_sql,
             })
         except Exception as exc:
             logger.error("Rule %s: gre_results upsert failed: %s", rule.get("rule_id"), exc, exc_info=True)
