@@ -107,10 +107,19 @@ ON CMSUNIV_FILELAND_DEV_T.gre_sampling_mix;
 
 
 -- ── 4. gre_sample_selections -- one row per candidate CONSIDERED ─────────
--- Every candidate, selected or not (audit defensibility). Never updated
--- after the run -- a rerun uses a fresh sample_run_id, unlike
--- rules_engine's gre_exceptions/gre_results which DO get updated on
--- rerun: a sample is a point-in-time draw, not a re-evaluated verdict.
+-- Every candidate, selected or not (audit defensibility). The row itself is
+-- never updated after the run -- a rerun always uses a fresh sample_run_id
+-- (unlike rules_engine's gre_exceptions/gre_results, which DO get updated
+-- in place on rerun) -- but etl_is_curr_ind IS flipped after the fact: when
+-- a later run reuses the same (config_id, run_key) -- e.g. today's cycle
+-- gets re-executed -- the PRIOR sample_run_id's rows here are set to
+-- etl_is_curr_ind='N' so exactly one run's selections read as "current" per
+-- (config_id, run_key) at a time, while every prior attempt's rows stay in
+-- the table for history/audit (soft-deactivate, never deleted -- same
+-- convention as rules_engine/schema.sql's gre_exceptions.etl_is_curr_ind).
+-- See sampling/sampling.py::_deactivate_prior_sampling_runs() -- prior
+-- sample_run_id's are found via gre_audit (run_type='SAMPLING',
+-- sample_config_id, run_key), since run_key isn't stored directly here.
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selections (
     sample_run_id         VARCHAR(200) NOT NULL,
     config_id             INTEGER,
@@ -123,7 +132,23 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selections (
     excluded_flag                 BYTEINT DEFAULT 0,
     exclusion_reason                 VARCHAR(500),
     selected_flag                       BYTEINT DEFAULT 0,
-    load_datetime                          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    etl_is_curr_ind                       CHAR(1) DEFAULT 'Y',  -- 'Y' = this run is the
+                                                        -- current/active one for its
+                                                        -- (config_id, run_key); 'N' = superseded
+                                                        -- by a later rerun of the same run_key.
+                                                        -- ALTER TABLE ... ADD COLUMN on the real
+                                                        -- Teradata instance for existing deploys.
+    load_datetime                          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_updated_datetime                     TIMESTAMP  -- bumped only by the
+                                                        -- etl_is_curr_ind deactivate UPDATE (NULL
+                                                        -- until then) -- same purpose as
+                                                        -- gre_exceptions.last_updated_datetime:
+                                                        -- lets metadata_sync's incremental watermark
+                                                        -- (COALESCE(last_updated_datetime,
+                                                        -- load_datetime)) pick up a flip that
+                                                        -- doesn't touch load_datetime. ALTER TABLE
+                                                        -- ... ADD COLUMN on the real Teradata
+                                                        -- instance for existing deploys.
 )
 PRIMARY INDEX (sample_run_id);
 
@@ -146,6 +171,18 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selection_attrs (
     strata_id             INTEGER NOT NULL,
     level_order            INTEGER,          -- denormalized for ordered reads without a join
     bucket_value              VARCHAR(200),
-    load_datetime                TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    etl_is_curr_ind               CHAR(1) DEFAULT 'Y',  -- mirrors gre_sample_selections.
+                                                    -- etl_is_curr_ind for the same sample_run_id
+                                                    -- -- kept in lockstep by
+                                                    -- _deactivate_prior_sampling_runs() so a
+                                                    -- consumer can filter either table
+                                                    -- independently. ALTER TABLE ... ADD COLUMN
+                                                    -- on the real Teradata instance for existing
+                                                    -- deploys.
+    load_datetime                TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_updated_datetime           TIMESTAMP  -- mirrors gre_sample_selections.
+                                                    -- last_updated_datetime -- see that column's
+                                                    -- comment. ALTER TABLE ... ADD COLUMN on the
+                                                    -- real Teradata instance for existing deploys.
 )
 PRIMARY INDEX (sample_run_id, case_key);

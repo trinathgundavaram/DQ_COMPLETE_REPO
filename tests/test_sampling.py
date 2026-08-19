@@ -23,6 +23,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import random as random_module
+import time
 
 import duckdb
 import pytest
@@ -70,14 +71,15 @@ def _gre_meta_tables(conn):
             sample_run_id VARCHAR, config_id INTEGER, project_name VARCHAR,
             process_name VARCHAR, sample_cycle DATE, case_key VARCHAR,
             priority_rank INTEGER, excluded_flag INTEGER, exclusion_reason VARCHAR,
-            selected_flag INTEGER, load_datetime TIMESTAMP DEFAULT current_timestamp
+            selected_flag INTEGER, etl_is_curr_ind VARCHAR DEFAULT 'Y',
+            load_datetime TIMESTAMP DEFAULT current_timestamp, last_updated_datetime TIMESTAMP
         )
     """)
     conn.execute("""
         CREATE TABLE gre_sample_selection_attrs (
             sample_run_id VARCHAR, case_key VARCHAR, strata_id INTEGER,
-            level_order INTEGER, bucket_value VARCHAR,
-            load_datetime TIMESTAMP DEFAULT current_timestamp
+            level_order INTEGER, bucket_value VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
+            load_datetime TIMESTAMP DEFAULT current_timestamp, last_updated_datetime TIMESTAMP
         )
     """)
     conn.execute("""
@@ -409,6 +411,105 @@ def test_run_sampling_ranked_end_to_end():
     excluded = {r[0] for r in conn.execute("SELECT case_id FROM case_universe WHERE auto_closed = 1").fetchall()}
     selected_ids = {r[0].split("=")[1] for r in rows if r[1] == 1}
     assert not (excluded & selected_ids)
+
+
+def test_run_sampling_rerun_deactivates_prior_sample_run_id_for_same_run_key():
+    """
+    Regression test for _deactivate_prior_sampling_runs(): running the SAME
+    (config_id, run_key) twice (e.g. a rerun of today's cycle) must leave
+    exactly one sample_run_id's rows active (etl_is_curr_ind='Y') in both
+    gre_sample_selections and gre_sample_selection_attrs -- the second
+    (newer) sample_run_id -- while the first run's rows stay in the tables
+    (soft-deactivated, etl_is_curr_ind='N'), never deleted.
+    """
+    conn = _conn()
+    _build_universe(conn)
+    _insert_config(conn, target_volume=150, sampling_method="RANKED")
+    _insert_strata(conn, 1, 1, 0, "category", "category",
+                   {"Denied": 0.80, "Withdrawn": 0.10, "Dismissed": 0.02, "Approved": 0.08})
+
+    cf = _FakeConnectionFactory(conn)
+    first = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
+    # sample_run_id is timestamp-suffixed at second precision -- sleep past a
+    # second boundary so the two calls can't collide onto the same id.
+    time.sleep(1.1)
+    second = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
+
+    assert first["status"] == "COMPLETED"
+    assert second["status"] == "COMPLETED"
+    assert first["sample_run_id"] != second["sample_run_id"]   # fresh id each call (timestamp-suffixed)
+
+    first_sel = conn.execute(
+        "SELECT DISTINCT etl_is_curr_ind FROM gre_sample_selections WHERE sample_run_id = ?",
+        [first["sample_run_id"]],
+    ).fetchall()
+    assert first_sel and all(r[0] == "N" for r in first_sel)   # prior run fully deactivated
+
+    first_attrs = conn.execute(
+        "SELECT DISTINCT etl_is_curr_ind FROM gre_sample_selection_attrs WHERE sample_run_id = ?",
+        [first["sample_run_id"]],
+    ).fetchall()
+    assert first_attrs and all(r[0] == "N" for r in first_attrs)
+
+    # last_updated_datetime bumped by the deactivate UPDATE -- lets
+    # metadata_sync's incremental watermark pick up this flip even though
+    # load_datetime (set once at insert) never changes.
+    first_bumped = conn.execute(
+        "SELECT COUNT(*) FROM gre_sample_selections "
+        "WHERE sample_run_id = ? AND last_updated_datetime IS NULL",
+        [first["sample_run_id"]],
+    ).fetchone()[0]
+    assert first_bumped == 0
+
+    second_sel = conn.execute(
+        "SELECT DISTINCT etl_is_curr_ind FROM gre_sample_selections WHERE sample_run_id = ?",
+        [second["sample_run_id"]],
+    ).fetchall()
+    assert second_sel == [("Y",)]   # new run is active
+
+    second_attrs = conn.execute(
+        "SELECT DISTINCT etl_is_curr_ind FROM gre_sample_selection_attrs WHERE sample_run_id = ?",
+        [second["sample_run_id"]],
+    ).fetchall()
+    assert second_attrs == [("Y",)]
+
+    # Rows from the first run are still THERE (soft-deactivate, not deleted).
+    first_row_count = conn.execute(
+        "SELECT COUNT(*) FROM gre_sample_selections WHERE sample_run_id = ?", [first["sample_run_id"]],
+    ).fetchone()[0]
+    assert first_row_count == first["candidates"]
+
+
+def test_run_sampling_different_run_key_does_not_deactivate_other_runs():
+    """
+    A different run_key for the same config_id is a distinct cycle, not a
+    rerun -- its rows must stay active and untouched by a later run's
+    reconciliation pass.
+    """
+    conn = _conn()
+    _build_universe(conn)
+    # scope_sql='1=1' (not keyed off pull_date) so both run_keys below pull the
+    # same non-empty candidate pool -- only run_key differs between the two calls.
+    _insert_config(conn, target_volume=150, sampling_method="RANKED", scope_sql="1=1")
+    _insert_strata(conn, 1, 1, 0, "category", "category",
+                   {"Denied": 0.80, "Withdrawn": 0.10, "Dismissed": 0.02, "Approved": 0.08})
+
+    cf = _FakeConnectionFactory(conn)
+    day1 = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
+    time.sleep(1.1)   # avoid colliding onto the same second-precision sample_run_id
+    day2 = _run_sampling(1, "2026-08-02", cf, meta_conn=conn, meta_db=META_DB)
+
+    day1_flag = conn.execute(
+        "SELECT DISTINCT etl_is_curr_ind FROM gre_sample_selections WHERE sample_run_id = ?",
+        [day1["sample_run_id"]],
+    ).fetchall()
+    assert day1_flag == [("Y",)]   # untouched -- different run_key, not a rerun
+
+    day2_flag = conn.execute(
+        "SELECT DISTINCT etl_is_curr_ind FROM gre_sample_selections WHERE sample_run_id = ?",
+        [day2["sample_run_id"]],
+    ).fetchall()
+    assert day2_flag == [("Y",)]
 
 
 def test_case_key_is_case_insensitive_and_stays_distinct_per_candidate():

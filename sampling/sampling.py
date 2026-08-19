@@ -80,6 +80,11 @@ from shared.db_ops import (
     _run_source_query, _substitute_params,
 )
 
+# gre_audit is written to via _write_audit() below with run_type='SAMPLING';
+# _deactivate_prior_sampling_runs() reads it back with this same literal to
+# find a config_id+run_key's prior sample_run_id(s).
+_SAMPLING_AUDIT_RUN_TYPE = "SAMPLING"
+
 logger = logging.getLogger(__name__)
 
 VALID_METHODS = {"RANKED", "RANDOM", "SYSTEMATIC"}
@@ -373,17 +378,24 @@ def _persist_selections(meta_conn, meta_db: str, sample_run_id: str, config: dic
     a fresh sample_run_id), so no duplicate-key fallback is needed here,
     unlike rules_engine/executor.py::_write_exceptions()'s
     bulk_insert_or_skip().
+
+    Every row is inserted with etl_is_curr_ind='Y' -- this is the run's
+    first (and only) INSERT, so it's unconditionally the current data for
+    its sample_run_id. Any PRIOR sample_run_id sharing this run's
+    (config_id, run_key) is deactivated separately, after this call
+    succeeds -- see _deactivate_prior_sampling_runs().
     """
     sel_sql = f"""
         INSERT INTO {meta_db}.gre_sample_selections (
             sample_run_id, config_id, project_name, process_name, sample_cycle,
-            case_key, priority_rank, excluded_flag, exclusion_reason, selected_flag
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)
+            case_key, priority_rank, excluded_flag, exclusion_reason, selected_flag,
+            etl_is_curr_ind
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, 'Y')
     """
     attr_sql = f"""
         INSERT INTO {meta_db}.gre_sample_selection_attrs (
-            sample_run_id, case_key, strata_id, level_order, bucket_value
-        ) VALUES (?, ?, ?, ?, ?)
+            sample_run_id, case_key, strata_id, level_order, bucket_value, etl_is_curr_ind
+        ) VALUES (?, ?, ?, ?, ?, 'Y')
     """
 
     sel_params = []
@@ -402,6 +414,72 @@ def _persist_selections(meta_conn, meta_db: str, sample_run_id: str, config: dic
 
     bulk_insert(meta_conn, sel_sql, sel_params)
     bulk_insert(meta_conn, attr_sql, attr_params)
+
+
+def _deactivate_prior_sampling_runs(meta_conn, meta_db: str, config_id, run_key: str,
+                                    current_sample_run_id: str) -> int:
+    """
+    Soft-deactivate every OTHER sample_run_id's rows in
+    gre_sample_selections/gre_sample_selection_attrs that share this run's
+    (config_id, run_key) -- the sampling analog of rules_engine/executor.py::
+    _write_exceptions()'s reconciliation, per the same "always re-execute,
+    deactivate stale, activate new" design.
+
+    run_key is not stored directly on gre_sample_selections (only embedded
+    inside the sample_run_id string), so prior sample_run_id(s) for this
+    (config_id, run_key) are found via gre_audit instead -- one row per
+    sampling run, with run_type='SAMPLING', sample_config_id, and run_key
+    all recorded by _write_audit(). Never deletes: a superseded run's rows
+    stay in both tables with etl_is_curr_ind='N' for history/audit.
+
+    Called AFTER this run's own rows are persisted as active (see
+    run_sampling()), so a failure here never leaves a (config_id, run_key)
+    with zero active rows -- worst case, both the old and new run are left
+    marked active, which a later rerun's own deactivation pass will
+    reconcile.
+
+    Returns the number of prior sample_run_id's deactivated (0 if this is
+    the first run for this (config_id, run_key)).
+    """
+    prior_runs = execute_query(
+        meta_conn,
+        f"""
+        SELECT DISTINCT run_id
+        FROM {meta_db}.gre_audit
+        WHERE run_type = ? AND sample_config_id = ? AND run_key = ? AND run_id <> ?
+        """,
+        [_SAMPLING_AUDIT_RUN_TYPE, config_id, run_key, current_sample_run_id],
+    )
+    prior_run_ids = [r["run_id"] for r in prior_runs]
+    if not prior_run_ids:
+        return 0
+
+    for prior_run_id in prior_run_ids:
+        # last_updated_datetime is bumped here (was NULL since insert) so
+        # metadata_sync's incremental watermark (COALESCE(last_updated_
+        # datetime, load_datetime)) picks up this flip -- load_datetime
+        # itself is set once at insert and never touched again, same
+        # convention as gre_exceptions.last_updated_datetime.
+        execute_dml(
+            meta_conn,
+            f"""
+            UPDATE {meta_db}.gre_sample_selections
+            SET etl_is_curr_ind = 'N', last_updated_datetime = CURRENT_TIMESTAMP
+            WHERE sample_run_id = ? AND etl_is_curr_ind = 'Y'
+            """,
+            [prior_run_id],
+        )
+        execute_dml(
+            meta_conn,
+            f"""
+            UPDATE {meta_db}.gre_sample_selection_attrs
+            SET etl_is_curr_ind = 'N', last_updated_datetime = CURRENT_TIMESTAMP
+            WHERE sample_run_id = ? AND etl_is_curr_ind = 'Y'
+            """,
+            [prior_run_id],
+        )
+
+    return len(prior_run_ids)
 
 
 def _write_audit(meta_conn, meta_db: str, sample_run_id: str, run_key: str, config: dict, method: str,
@@ -566,6 +644,27 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
                     target_vol, len(candidates), 0, started_at, "ERROR")
         return {"sample_run_id": sample_run_id, "status": "ERROR", "candidates": len(candidates), "selected": 0,
                "target_volume": target_vol, "by_stratum": {}, "seed": run_seed}
+
+    # This run's own rows are already persisted (and active) at this point --
+    # only now look for and deactivate a PRIOR run of this same
+    # (config_id, run_key), so a failure here never leaves the pair with
+    # zero active rows (see _deactivate_prior_sampling_runs()'s docstring).
+    # Deliberately non-fatal: reconciliation failing doesn't undo an
+    # otherwise-successful sample.
+    try:
+        deactivated = _deactivate_prior_sampling_runs(meta_conn, meta_db, config_id, run_key, sample_run_id)
+        if deactivated:
+            logger.info(
+                "Sampling config_id=%s run_key=%s: deactivated %d prior sample_run_id(s) "
+                "superseded by %s.", config_id, run_key, deactivated, sample_run_id,
+            )
+    except Exception as exc:
+        logger.error(
+            "Sampling config_id=%s run_key=%s: deactivating prior sample_run_id(s) failed: %s",
+            config_id, run_key, exc, exc_info=True,
+        )
+        _log_sampling_error(meta_conn, meta_db, sample_run_id, run_key, config,
+                            "DEACTIVATE_PRIOR_RUNS_FAILURE", str(exc))
 
     _write_audit(meta_conn, meta_db, sample_run_id, run_key, config, method, run_seed,
                 target_vol, len(candidates), len(selected), started_at, "COMPLETED")
