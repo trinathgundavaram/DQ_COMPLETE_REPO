@@ -170,13 +170,31 @@ def _format_src_key(cols: list, row: dict) -> str:
     row it fetched straight from the source table (not through a `rule`
     dict), to match it back to the gre_exceptions row it came from.
 
-    Explicit None -> 'NULL' (not just a missing-key default) so a
-    genuinely NULL key column is stable and human-readable in
-    gre_exceptions.src_key_value, not the string "None". See
-    parse_src_key() for the (best-effort) inverse.
+    `row`'s keys are always lowercased (see _scan_violations()/
+    shared/db_ops.py::execute_query()), but `cols` may not be -- it comes
+    straight from gre_rules.src_key_cols (build_src_key()) or from a
+    previously-stored src_key_value's original casing
+    (rules_engine/reporting.py::get_source_records_for_rule()). Look up
+    case-insensitively so authoring casing never silently breaks this.
+
+    A `cols` entry not present in `row` at all (case-insensitively) is a
+    rule misconfiguration -- src_key_cols naming a column rule_syntax
+    doesn't actually SELECT -- not a real NULL value, and is NOT written
+    as "NULL": that used to collapse into the same literal string as a
+    genuinely NULL column and was indistinguishable afterward. This now
+    raises instead, so callers fail loudly (logged to gre_log/gre_errors
+    via execute_rule()'s STEP 3) rather than writing/matching on a
+    corrupted key.
     """
     def _fmt(c):
-        v = row.get(c, "NULL")
+        key = c.lower()
+        if key not in row:
+            raise KeyError(
+                f"src_key_cols column '{c}' not found among this rule's result "
+                f"columns {sorted(row.keys())} -- gre_rules.src_key_cols must name "
+                "columns rule_syntax actually SELECTs (case-insensitive)."
+            )
+        v = row[key]
         return "NULL" if v is None else v
     return "|".join(f"{c}={_fmt(c)}" for c in cols)
 

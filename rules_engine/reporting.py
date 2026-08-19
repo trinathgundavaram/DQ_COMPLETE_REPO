@@ -191,7 +191,18 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, run_key: s
             where = _build_src_key_where(chunk)
             query = f"SELECT * FROM {table_ref} WHERE {where}"
             for row in _run_source_query(db_conn, query):
-                nk = _format_src_key(cols, row)
+                try:
+                    nk = _format_src_key(cols, row)
+                except KeyError as err:
+                    # src_key_cols no longer matches this table's live columns
+                    # (schema drift) -- skip this source row rather than
+                    # crashing the whole report; it still shows up in the
+                    # "missing" count logged below.
+                    logger.warning(
+                        "get_source_records_for_rule: rule_id=%s run_key=%s -- %s",
+                        rule_id, run_key, err,
+                    )
+                    continue
                 exc = by_src_key.get(nk)
                 matched_keys.add(nk)
                 merged = dict(row)
