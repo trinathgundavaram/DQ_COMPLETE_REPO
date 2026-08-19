@@ -15,6 +15,7 @@ import pytest
 import rules_engine.reporting as rules_engine_reporting
 from rules_engine.reporting import (
     get_breaches, get_records_for_result, get_source_records_for_rule,
+    get_source_records_for_process,
 )
 from shared.db_ops import execute_dml
 
@@ -81,7 +82,8 @@ def _conn():
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
             run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
             etl_load_dt DATE, etl_last_updt_dt TIMESTAMP,
-            src_key_value VARCHAR, load_datetime TIMESTAMP DEFAULT current_timestamp
+            src_key_value VARCHAR, load_datetime TIMESTAMP DEFAULT current_timestamp,
+            rule_nm VARCHAR, process_name VARCHAR, project_name VARCHAR
         )
     """)
 
@@ -103,15 +105,18 @@ _record_id_seq = [0]
 
 def _insert_exception(conn, rule_id, src_key_value, database_name="main", src_tbl_nm="claims",
                       source_name="duckdb_test", run_key="B1", issue_desc=None,
-                      exception_flag="OPEN", etl_is_curr_ind="Y"):
+                      exception_flag="OPEN", etl_is_curr_ind="Y",
+                      rule_nm=None, process_name=None, project_name=None):
     _record_id_seq[0] += 1
     execute_dml(conn, """
         INSERT INTO gre_exceptions (
             record_id, run_id, rule_id, database_name, src_tbl_nm, source_name,
-            issue_desc, exception_flag, run_key, etl_is_curr_ind, src_key_value
-        ) VALUES (?, 'RUN1', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            issue_desc, exception_flag, run_key, etl_is_curr_ind, src_key_value,
+            rule_nm, process_name, project_name
+        ) VALUES (?, 'RUN1', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [_record_id_seq[0], rule_id, database_name, src_tbl_nm, source_name,
-          issue_desc or f"rule {rule_id} violated", exception_flag, run_key, etl_is_curr_ind, src_key_value])
+          issue_desc or f"rule {rule_id} violated", exception_flag, run_key, etl_is_curr_ind, src_key_value,
+          rule_nm or f"RULE{rule_id}", process_name, project_name])
 
 
 def _insert_result(conn, rule_id, run_key, run_id, status):
@@ -223,6 +228,67 @@ def test_one_row_failing_two_rules_is_not_duplicated_and_ties_back_independently
     assert rule1_records[0]["claim_id"] == rule2_records[0]["claim_id"] == "C1"
     assert rule1_records[0]["_issue_desc"] == "rule 1 violated"
     assert rule2_records[0]["_issue_desc"] == "rule 2 violated"
+
+
+# ── get_source_records_for_process: per-rule fan-out, one process/run_key ──
+
+def test_get_source_records_for_process_ties_back_each_rule_independently():
+    # Two rules under the SAME process both failed on the SAME source
+    # record (C1) this run -- the per-rule tie-back must surface it TWICE,
+    # once per rule, each tagged with its own rule_id/rule_nm/issue_desc,
+    # never merged into one row.
+    conn = _conn()
+    _insert_exception(conn, 1, "claim_id=C1", issue_desc="rule 1 violated",
+                      rule_nm="ODAG3V22R16", process_name="ODAG3", project_name="HS_UM")
+    _insert_exception(conn, 2, "claim_id=C1", issue_desc="rule 2 violated",
+                      rule_nm="ODAG3V22R33", process_name="ODAG3", project_name="HS_UM")
+    cf = _FakeConnectionFactory(conn)
+
+    records = get_source_records_for_process(cf, conn, META_DB, "ODAG3", "B1")
+
+    assert len(records) == 2   # one row per rule, not deduped/merged across rules
+    by_rule = {r["_rule_id"]: r for r in records}
+    assert by_rule[1]["claim_id"] == by_rule[2]["claim_id"] == "C1"   # same source record
+    assert by_rule[1]["_rule_nm"] == "ODAG3V22R16" and by_rule[1]["_issue_desc"] == "rule 1 violated"
+    assert by_rule[2]["_rule_nm"] == "ODAG3V22R33" and by_rule[2]["_issue_desc"] == "rule 2 violated"
+    assert by_rule[1]["_process_name"] == by_rule[2]["_process_name"] == "ODAG3"
+
+
+def test_get_source_records_for_process_scoped_to_project_name():
+    conn = _conn()
+    _insert_exception(conn, 1, "claim_id=C1", rule_nm="R1", process_name="ODAG3", project_name="PROJ_A")
+    _insert_exception(conn, 2, "claim_id=C3", rule_nm="R2", process_name="ODAG3", project_name="PROJ_B")
+    cf = _FakeConnectionFactory(conn)
+
+    records = get_source_records_for_process(cf, conn, META_DB, "ODAG3", "B1", project_name="PROJ_A")
+    assert {r["_rule_id"] for r in records} == {1}
+
+
+def test_get_source_records_for_process_scoped_to_rule_nm():
+    conn = _conn()
+    _insert_exception(conn, 1, "claim_id=C1", rule_nm="ODAG3V22R16", process_name="ODAG3")
+    _insert_exception(conn, 2, "claim_id=C3", rule_nm="ODAG3V22R33", process_name="ODAG3")
+    cf = _FakeConnectionFactory(conn)
+
+    records = get_source_records_for_process(cf, conn, META_DB, "ODAG3", "B1", rule_nm="ODAG3V22R16")
+    assert {r["_rule_id"] for r in records} == {1}
+
+
+def test_get_source_records_for_process_ignores_other_processes_and_run_keys():
+    conn = _conn()
+    _insert_exception(conn, 1, "claim_id=C1", process_name="ODAG3", run_key="B1")
+    _insert_exception(conn, 2, "claim_id=C2", process_name="OTHER_PROCESS", run_key="B1")   # excluded
+    _insert_exception(conn, 3, "claim_id=C3", process_name="ODAG3", run_key="B2")           # excluded
+    cf = _FakeConnectionFactory(conn)
+
+    records = get_source_records_for_process(cf, conn, META_DB, "ODAG3", "B1")
+    assert {r["_rule_id"] for r in records} == {1}
+
+
+def test_get_source_records_for_process_no_exceptions_returns_empty_list():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    assert get_source_records_for_process(cf, conn, META_DB, "NO_SUCH_PROCESS", "B1") == []
 
 
 # ── composite (multi-column) src key ─────────────────────────────────────
