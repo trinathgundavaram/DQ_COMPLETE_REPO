@@ -62,6 +62,53 @@ once composes a single string (e.g. `"2026|MONTHLY"`), the same
 "SQL/config authors are self-contained" philosophy `rule_sql` already
 follows.
 
+## Project/process scoping: `project_name` / `process_name`
+
+Every `gre_rules` row also carries `project_name`/`process_name` (e.g.
+`HEALTHSPRING_UM` / `UNIVERSE_VALIDATION`) -- descriptive/reporting
+dimensions, mirroring what `sampling/`'s `gre_sampling_config` already
+carries, so both halves of this engine speak the same scoping vocabulary.
+They are **not** a second filter key: `rule_group` remains the one literal
+column `load_rules()` filters on. `run_rule_group()` reads them off the
+loaded rules (lowest `seq_no` wins if a group's rows disagree with
+themselves -- logged as a warning, same pattern as its `sequencing_mode`
+consistency check) and stamps them onto `gre_audit` for the run; every
+`gre_log`/`gre_exceptions`/`gre_results` row carries its own rule's
+`project_name`/`process_name` too, so any of those tables can be sliced or
+joined by project without a round trip back to `gre_rules`.
+
+## Running multiple projects/processes: `run_all_active_groups()`
+
+`run_rule_group()` is deliberately single-`rule_group`: one call, one
+checkpoint/resume scope, one `gre_audit` row. Driving several
+projects/processes through the engine in one operation (e.g. a nightly job
+covering more than one use case) is a thin orchestration layer on top,
+not a change to that contract:
+
+```python
+from rules_engine.runner import run_all_active_groups
+
+# Every active rule_group across every project/process:
+outcome = run_all_active_groups(meta_conn, meta_db, "BATCH_2026_08_14", cf)
+
+# Narrowed to one project (or project + process):
+outcome = run_all_active_groups(
+    meta_conn, meta_db, "BATCH_2026_08_14", cf,
+    project_name="HEALTHSPRING_UM",
+)
+
+for rule_group, summary in outcome["rule_groups"].items():
+    print(rule_group, summary["status"], summary["succeeded"], summary["errored"])
+```
+
+`discover_rule_groups(meta_conn, meta_db, project_name=None, process_name=None)`
+does the lookup alone (distinct, active `rule_group` values, via
+`gre_rules_project_process_ix` when either filter is supplied) if you want
+to inspect or reorder the group list yourself before running anything.
+Each discovered group still gets its own `run_id`, `gre_audit` row, and
+checkpoint/resume via an unmodified `run_rule_group()` call -- this is a
+fan-out, not a merged run, and one group erroring doesn't stop the rest.
+
 This package is deliberately independent of [`sampling/`](../sampling/README.md)
 -- the two share only what's in [`shared/`](../shared/README.md) (DB
 helpers, credential/config loading, and the `gre_audit`/`gre_errors`
@@ -74,10 +121,10 @@ versa.
 |---|---|
 | `rules.py` | `load_rules()` -- loads active `gre_rules` rows for a rule_group (+ optional `rule_variant` filter), ordered by `seq_no`. |
 | `executor.py` | `execute_rule()` -- runs one rule end-to-end: dialect guard, `run_params` substitution, single-scan evaluation (`_scan_violations`), threshold evaluation, `gre_exceptions`/`gre_results`/`gre_log` writes. |
-| `runner.py` | `run_rule_group()` -- orchestration entry point: readiness gate, checkpoint/resume, sequencing_mode-aware loop over `execute_rule()`, `gre_audit` start/finish. Also the opt-in parallel path (`_run_pending_parallel()`) -- see "Parallel rule execution" below. |
+| `runner.py` | `run_rule_group()` -- orchestration entry point: readiness gate, checkpoint/resume, sequencing_mode-aware loop over `execute_rule()`, `gre_audit` start/finish. `discover_rule_groups()`/`run_all_active_groups()` -- multi-group fan-out by project/process (see "Running multiple projects/processes" above). Also the opt-in parallel path (`_run_pending_parallel()`) -- see "Parallel rule execution" below. |
 | `parallel.py` | `ConnectionPool`/`build_pools()`/`close_pools()` -- the bounded per-connection connection pooling the parallel path uses instead of the single shared `cf.get()` connection. |
 | `reporting.py` | `get_breaches()` / `get_records_for_result()` -- thin read-only queries against `gre_results`/`gre_exceptions`. `get_source_records_for_rule()` -- ties `gre_exceptions` back to the live source record (see "Tying exceptions back to source records" below). |
-| `schema.sql` | `gre_rules`, `gre_log`, `gre_exceptions`, `gre_case`, `gre_results`. Deploy after `shared/schema.sql`. |
+| `schema.sql` | `gre_rules` (incl. `project_name`/`process_name`), `gre_log`, `gre_exceptions`, `gre_case`, `gre_results`. Deploy after `shared/schema.sql`. |
 | `schema_drop.sql` | Drops the 5 tables above, for the drop-and-recreate redeploy policy (see the repo root README). |
 
 ## Parallel rule execution (opt-in)
@@ -208,8 +255,16 @@ from rules_engine.runner import run_rule_group
 cf = ConnectionFactory()
 cf.load()
 
+# One rule_group:
 summary = run_rule_group("claims_dq", "BATCH_2026_08_14", cf)
 print(summary["status"], summary["succeeded"], summary["errored"])
+
+# Every active rule_group for one project (see "Running multiple
+# projects/processes" above):
+# from rules_engine.runner import run_all_active_groups
+# meta_conn = cf.get("teradata")  # or gre_config.get_meta_connection_name()
+# outcome = run_all_active_groups(meta_conn, "CMSUNIV_FILELAND_DEV_T",
+#                                  "BATCH_2026_08_14", cf, project_name="HEALTHSPRING_UM")
 ```
 
-See the repo root README for environment setup (`dev.env`, `DQ_CONNECTION_NAMES`, etc.).
+See the repo root README for environment setup (`dev.env`, `DQ_CONNECTION_NAMES`, etc.), and its "Running the engines end to end" section for a full worked example wiring up `ConnectionFactory` and calling into both packages.

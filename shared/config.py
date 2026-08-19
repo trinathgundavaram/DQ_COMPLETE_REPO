@@ -71,7 +71,7 @@ vars either way.
 import logging
 import os
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict
 
 logger = logging.getLogger(__name__)
 

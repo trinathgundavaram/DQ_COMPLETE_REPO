@@ -307,7 +307,6 @@ except ImportError:
     _PANDAS_AVAILABLE = False
     logger.warning("pandas not installed — file source connections unavailable.")
 
-_FILE_EXTENSIONS = {".csv", ".xlsx", ".xls", ".tsv", ".parquet"}
 _MAX_FILE_SIZE_MB = int(os.getenv("DQ_MAX_FILE_SIZE_MB", "500"))
 _FILE_ENCODING = os.getenv("DQ_FILE_ENCODING", "utf-8")
 
@@ -419,10 +418,6 @@ def _read_file(full_path: str):
     if ext == ".parquet":
         return pd.read_parquet(full_path)
     raise ValueError(f"Unsupported file extension '{ext}'. Supported: .csv, .tsv, .xlsx, .xls, .parquet")
-
-
-def is_file_source(src_tbl_nm: str) -> bool:
-    return Path(src_tbl_nm).suffix.lower() in _FILE_EXTENSIONS
 
 
 # =============================================================================

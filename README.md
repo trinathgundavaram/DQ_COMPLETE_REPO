@@ -58,6 +58,52 @@ Each package is independently testable and has its own DDL -- see
    capture cap per rule attempt, default 10000), `GRE_QUERY_MAX_RETRIES`
    (source-query retry attempts, default 3).
 
+## Running the engines end to end
+
+Both packages are libraries, not CLIs -- there's no `main.py`/entrypoint in
+this repo to run. A caller (your own script, scheduler job, Airflow task,
+etc.) builds one `ConnectionFactory` and calls into `rules_engine/` and/or
+`sampling/` directly:
+
+```python
+from db.connection_factory import ConnectionFactory
+from shared import config as gre_config
+from rules_engine.runner import run_rule_group, run_all_active_groups
+from sampling.sampling import run_sampling
+
+cf = ConnectionFactory()
+cf.load()                                    # brings up every DQ_CONNECTION_NAMES connection
+
+batch_id = "BATCH_2026_08_14"
+
+# Rules: one specific rule_group ---------------------------------------
+summary = run_rule_group("claims_dq", batch_id, cf)
+print(summary["status"], summary["succeeded"], summary["errored"])
+
+# Rules: every active rule_group for one project, in one call -----------
+meta_conn = cf.get(gre_config.get_meta_connection_name())
+outcome = run_all_active_groups(
+    meta_conn, gre_config.get_meta_db(), batch_id, cf,
+    project_name="HEALTHSPRING_UM",
+)
+for rule_group, group_summary in outcome["rule_groups"].items():
+    print(rule_group, group_summary["status"])
+
+# Sampling: one sampling config -----------------------------------------
+result = run_sampling(config_id=1, batch_id="2026-08-14", cf=cf)
+print(result["status"], result["selected"], "/", result["target_volume"])
+```
+
+Nothing here needs the two engines to run together or in a particular
+order -- `rules_engine/` and `sampling/` are independent (see each
+package's own README) and neither imports the other. A caller driving both
+against the same batch just calls into each in whatever order its own
+schedule requires. See [`rules_engine/README.md`](rules_engine/README.md)
+for `rule_variant`/`project_name`/`process_name` scoping and the
+multi-group fan-out (`run_all_active_groups()`), and
+[`sampling/README.md`](sampling/README.md) for `run_params`-based scoping
+of a sampling pull.
+
 ## Redeploying / changing the schema
 
 Since no `gre_*` table holds live/production data yet, this repo's DDL

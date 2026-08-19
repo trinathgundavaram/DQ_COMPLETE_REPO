@@ -73,7 +73,6 @@ parameters" requiring a replay rather than a single row lookup.
 import logging
 import math
 import random
-import time
 from datetime import datetime
 
 from shared.db_ops import (
