@@ -411,6 +411,113 @@ def test_run_sampling_ranked_end_to_end():
     assert not (excluded & selected_ids)
 
 
+def test_case_key_is_case_insensitive_and_stays_distinct_per_candidate():
+    """
+    Regression test for _case_key(): gre_sampling_config.key_columns is
+    free-text (authored independently of the physical column casing), but
+    every pulled row's dict keys are always lowercased (see
+    shared/db_ops.py::execute_query()/_run_source_query()). Before the
+    fix, a key_columns value like "Case_ID" (physical column: case_id)
+    made row.get("Case_ID") miss for every single candidate, collapsing
+    ALL of them onto the identical case_key "Case_ID=None" -- and because
+    that one degenerate key was "selected" as soon as any real candidate
+    was chosen, every candidate ended up persisted with selected_flag=1,
+    not just the ones actually selected. Assert none of that happens.
+    """
+    conn = _conn()
+    _build_universe(conn)
+    _insert_config(conn, target_volume=50, sampling_method="RANKED", key_columns="Case_ID")
+    _insert_strata(conn, 1, 1, 0, "category", "category",
+                   {"Denied": 0.80, "Withdrawn": 0.10, "Dismissed": 0.02, "Approved": 0.08})
+
+    cf = _FakeConnectionFactory(conn)
+    result = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
+
+    assert result["status"] == "COMPLETED"
+    assert result["selected"] == 50
+
+    rows = conn.execute(
+        "SELECT case_key, selected_flag FROM gre_sample_selections WHERE sample_run_id = ?",
+        [result["sample_run_id"]],
+    ).fetchall()
+
+    # every candidate must get its OWN case_key, not one shared degenerate value
+    distinct_keys = {r[0] for r in rows}
+    assert len(distinct_keys) == result["candidates"]
+    assert "Case_ID=None" not in distinct_keys
+
+    # case_key must carry the real case_id value, not a missing-column default
+    for case_key, _ in rows:
+        assert case_key.startswith("Case_ID=C")
+
+    # exactly the actually-selected rows are flagged -- not every candidate
+    selected_count = sum(1 for _, flag in rows if flag == 1)
+    assert selected_count == result["selected"] == 50
+
+
+def test_case_key_raises_when_key_columns_names_an_unselected_column():
+    """
+    A key_columns entry that doesn't match ANY pulled column at all (not
+    just a casing mismatch -- a genuine typo/config drift) must fail
+    loudly rather than silently writing a corrupted key.
+    """
+    from sampling.sampling import _case_key
+    with pytest.raises(KeyError):
+        _case_key({"case_id": "C1"}, ["not_a_real_column"])
+
+
+def test_run_sampling_select_persist_failure_writes_error_audit_not_crash(monkeypatch):
+    """
+    A failure during stratify/select/persist must be caught and logged
+    the same way _pull_candidates() failures already are -- previously
+    this stage had no try/except at all and would propagate straight out
+    of run_sampling() uncaught, unlike every other failure mode in this
+    function.
+
+    (A key_columns entry that's a genuine typo -- not just a casing
+    mismatch -- actually fails earlier, inside _pull_candidates()'s SQL
+    SELECT itself, which the pre-existing PULL_FAILURE handler already
+    covers; see test_run_sampling_unresolved_scope_token_routes_to_pull_failure
+    for that path. This test exercises the select/persist stage
+    specifically, by making _persist_selections() itself fail, the same
+    way any real bug or transient failure in that stage would.)
+    """
+    import sampling.sampling as sampling_mod
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated select/persist failure")
+    monkeypatch.setattr(sampling_mod, "_persist_selections", _boom)
+
+    conn = _conn()
+    _build_universe(conn)
+    _insert_config(conn, target_volume=50, sampling_method="RANKED")
+    _insert_strata(conn, 1, 1, 0, "category", "category",
+                   {"Denied": 0.80, "Withdrawn": 0.10, "Dismissed": 0.02, "Approved": 0.08})
+
+    cf = _FakeConnectionFactory(conn)
+    result = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
+
+    assert result["status"] == "ERROR"
+    assert result["selected"] == 0
+
+    audit = conn.execute(
+        "SELECT status FROM gre_audit WHERE run_id = ?", [result["sample_run_id"]],
+    ).fetchone()
+    assert audit == ("ERROR",)
+
+    error_row = conn.execute(
+        "SELECT error_type FROM gre_errors WHERE run_id = ?", [result["sample_run_id"]],
+    ).fetchone()
+    assert error_row == ("SELECT_PERSIST_FAILURE",)
+
+    # nothing should have been persisted to gre_sample_selections for this failed run
+    persisted = conn.execute(
+        "SELECT COUNT(*) FROM gre_sample_selections WHERE sample_run_id = ?",
+        [result["sample_run_id"]],
+    ).fetchone()[0]
+    assert persisted == 0
+
+
 def test_run_sampling_random_is_reproducible_across_reruns_with_same_seed():
     conn = _conn()
     _build_universe(conn)

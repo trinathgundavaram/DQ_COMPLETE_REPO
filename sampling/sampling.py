@@ -321,7 +321,41 @@ def _pull_candidates(db_conn, config: dict, levels: list, run_params: dict) -> l
 
 
 def _case_key(row: dict, key_cols: list) -> str:
-    return "|".join(f"{c}={row.get(c)}" for c in key_cols)
+    """
+    "col1=val1|col2=val2" for `key_cols`, in row-dict order -- sampling's
+    analog of rules_engine/executor.py::build_src_key()/_format_src_key(),
+    same fix applied for the same reason (see that function's docstring).
+
+    `row`'s keys are always lowercased (see shared/db_ops.py::execute_query()/
+    _run_source_query()), but `key_cols` comes straight from
+    gre_sampling_config.key_columns as authored -- look up case-
+    insensitively so casing in that column never silently breaks this.
+
+    A key_cols entry not present in `row` at all (case-insensitively) is a
+    config error -- key_columns naming a column _pull_candidates() doesn't
+    actually SELECT -- not a real NULL value. Previously this silently
+    fell back to dict.get()'s default of None, and EVERY affected row's
+    case_key collapsed to the identical degenerate string (e.g.
+    "claim_id=None") regardless of the row's real identity: distinct
+    candidates became indistinguishable, is_selected/shortfall top-up in
+    run_sampling() operated on one collapsed key instead of one per
+    candidate, and gre_sample_selections (which has no unique index on
+    case_key -- see sampling/schema.sql) silently accepted the resulting
+    duplicates. This now raises instead, so run_sampling() fails loud
+    (caught below, logged to gre_errors) rather than persisting
+    indistinguishable rows.
+    """
+    def _fmt(c):
+        key = c.lower()
+        if key not in row:
+            raise KeyError(
+                f"key_columns entry '{c}' not found among this config's pulled "
+                f"columns {sorted(row.keys())} -- gre_sampling_config.key_columns must "
+                "name columns _pull_candidates() actually SELECTs (case-insensitive)."
+            )
+        v = row[key]
+        return "NULL" if v is None else v
+    return "|".join(f"{c}={_fmt(c)}" for c in key_cols)
 
 
 # ---------------------------------------------------------------------------
@@ -496,27 +530,43 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
         return {"sample_run_id": sample_run_id, "status": "COMPLETED", "candidates": 0, "selected": 0,
                "target_volume": target_vol, "by_stratum": {}, "seed": run_seed}
 
-    by_stratum: dict = {}
-    selected = _stratify(candidates, levels, target_vol, method, rounding_mode, rng, by_stratum=by_stratum)
+    # Stratify/select/persist, wrapped the same way the candidate pull
+    # above is: a failure here (e.g. _case_key() raising on a
+    # key_columns/config mismatch -- see its docstring) previously
+    # propagated all the way out of run_sampling() uncaught, unlike every
+    # other failure mode in this function, which logs to gre_errors and
+    # writes an ERROR gre_audit row instead of crashing the caller.
+    try:
+        by_stratum: dict = {}
+        selected = _stratify(candidates, levels, target_vol, method, rounding_mode, rng,
+                             by_stratum=by_stratum)
 
-    # Shortfall top-up: if stratified quotas under-filled relative to
-    # target_vol (e.g. a thin cycle), top up from the remaining candidates
-    # overall, using the SAME method as the rest of the run -- ranked by
-    # remaining priority for RANKED/SYSTEMATIC, an additional random draw
-    # for RANDOM.
-    if len(selected) < target_vol:
+        # Shortfall top-up: if stratified quotas under-filled relative to
+        # target_vol (e.g. a thin cycle), top up from the remaining candidates
+        # overall, using the SAME method as the rest of the run -- ranked by
+        # remaining priority for RANKED/SYSTEMATIC, an additional random draw
+        # for RANDOM.
+        if len(selected) < target_vol:
+            selected_keys = {_case_key(r, key_cols) for r in selected}
+            remaining = [r for r in candidates if _case_key(r, key_cols) not in selected_keys]
+            if method == "RANKED":
+                remaining.sort(key=lambda r: r["_priority_rank"])
+            shortfall = target_vol - len(selected)
+            selected.extend(_select(remaining, shortfall, method, rng))
+
+        selected = selected[:target_vol]
         selected_keys = {_case_key(r, key_cols) for r in selected}
-        remaining = [r for r in candidates if _case_key(r, key_cols) not in selected_keys]
-        if method == "RANKED":
-            remaining.sort(key=lambda r: r["_priority_rank"])
-        shortfall = target_vol - len(selected)
-        selected.extend(_select(remaining, shortfall, method, rng))
 
-    selected = selected[:target_vol]
-    selected_keys = {_case_key(r, key_cols) for r in selected}
+        _persist_selections(meta_conn, meta_db, sample_run_id, config, levels, key_cols,
+                            candidates, selected_keys, started_at.date())
+    except Exception as exc:
+        logger.error("Sampling config_id=%s: select/persist failed: %s", config_id, exc, exc_info=True)
+        _log_sampling_error(meta_conn, meta_db, sample_run_id, run_key, config, "SELECT_PERSIST_FAILURE", str(exc))
+        _write_audit(meta_conn, meta_db, sample_run_id, run_key, config, method, run_seed,
+                    target_vol, len(candidates), 0, started_at, "ERROR")
+        return {"sample_run_id": sample_run_id, "status": "ERROR", "candidates": len(candidates), "selected": 0,
+               "target_volume": target_vol, "by_stratum": {}, "seed": run_seed}
 
-    _persist_selections(meta_conn, meta_db, sample_run_id, config, levels, key_cols,
-                        candidates, selected_keys, started_at.date())
     _write_audit(meta_conn, meta_db, sample_run_id, run_key, config, method, run_seed,
                 target_vol, len(candidates), len(selected), started_at, "COMPLETED")
 
