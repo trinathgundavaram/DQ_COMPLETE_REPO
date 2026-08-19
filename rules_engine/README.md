@@ -157,6 +157,26 @@ Each discovered group still gets its own `run_id`, `gre_audit` row, and
 checkpoint/resume via an unmodified `run_rule_group()` call -- this is a
 fan-out, not a merged run, and one group erroring doesn't stop the rest.
 
+`run_by_process_name(process_name, run_key, cf, meta_conn=None, meta_db=None,
+project_name=None, ...)` is a thin convenience layer on top of
+`run_all_active_groups()` for the common "run everything this process
+owns" case: it resolves `meta_conn`/`meta_db` from `cf`/`shared.config`
+itself if you don't pass them, and raises `ValueError` if no active
+`rule_group` matches the `process_name` (and `project_name`, if given) --
+almost always a typo, so it fails loudly instead of silently doing
+nothing:
+
+```python
+from rules_engine.runner import run_by_process_name
+
+outcome = run_by_process_name("UNIVERSE_VALIDATION", "BATCH_2026_08_14", cf)
+for rule_group, summary in outcome["rule_groups"].items():
+    print(rule_group, summary["status"])
+```
+
+The repo root's `run_by_process.py` wraps this in a CLI: `python
+run_by_process.py rules --process-name UNIVERSE_VALIDATION`.
+
 This package is deliberately independent of [`sampling/`](../sampling/README.md)
 -- the two share only what's in [`shared/`](../shared/README.md) (DB
 helpers, credential/config loading, and the `gre_audit`/`gre_errors`

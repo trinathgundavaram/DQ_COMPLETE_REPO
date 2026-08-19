@@ -110,4 +110,28 @@ result = run_sampling(config_id=1, run_key="2026-08-14", cf=cf)
 print(result["status"], result["selected"], "/", result["target_volume"])
 ```
 
+## Running everything one process owns: `run_sampling_for_process_name()`
+
+Mirrors `rules_engine/runner.py`'s `run_by_process_name()`: discovers
+every active `gre_sampling_config` scoped to one `process_name`
+(optionally narrowed further by `project_name`) and runs each against the
+same `run_key`/`run_params`/`seed`, resolving `meta_conn`/`meta_db` from
+`cf`/`shared.config` itself if you don't pass them:
+
+```python
+from sampling.sampling import run_sampling_for_process_name
+
+outcome = run_sampling_for_process_name("WEEKLY_REVIEW_SAMPLE", "2026-08-14", cf)
+for config_id, summary in outcome["sampling_configs"].items():
+    print(config_id, summary["status"], summary["selected"], "/", summary["target_volume"])
+```
+
+Raises `ValueError` if no active config matches the `process_name` (and
+`project_name`, if given) -- almost always a typo, so it fails loudly
+instead of silently doing nothing. `discover_sampling_configs(meta_conn,
+meta_db, project_name=None, process_name=None)` does the lookup alone if
+you want the matching `config_id`s without running them. The repo root's
+`run_by_process.py` wraps this in a CLI: `python run_by_process.py
+sampling --process-name WEEKLY_REVIEW_SAMPLE`.
+
 See the repo root README for environment setup (`dev.env`, one connection per source_type, etc.).

@@ -528,3 +528,67 @@ def run_all_active_groups(
         )
 
     return {"rule_groups": summaries}
+
+
+def run_by_process_name(
+    process_name: str,
+    run_key: str,
+    cf,
+    meta_conn=None,
+    meta_db: str = None,
+    project_name: str = None,
+    triggered_by: str = "SYSTEM",
+    run_params: dict = None,
+    rule_variant: str = None,
+) -> dict:
+    """
+    Thin convenience wrapper around run_all_active_groups(), scoped to one
+    process_name (e.g. "UNIVERSE_VALIDATION") -- the common case of "run
+    everything this process owns" without the caller having to resolve
+    meta_conn/meta_db themselves first.
+
+    process_name : which gre_rules.process_name to run every active
+                   rule_group for (required -- use run_all_active_groups()
+                   directly if you want every process, or discover_rule_groups()
+                   if you need the list of matching rule_groups without
+                   running them).
+    run_key      : opaque tracking/idempotency identifier for this run --
+                   see run_rule_group()'s docstring. build_run_key() in
+                   shared/db_ops.py can build one from parts (a batch id, a
+                   year+month pair, a specific date, or any combination).
+    cf           : a loaded db.connection_factory.ConnectionFactory.
+    meta_conn    : metadata connection to run against; defaults to
+                   cf.get(shared.config.get_meta_connection_name()) if not
+                   supplied, so callers with a plain ConnectionFactory don't
+                   need to resolve this themselves.
+    meta_db      : metadata schema/database name; defaults to
+                   shared.config.get_meta_db() if not supplied.
+    project_name : optional further narrowing to one project within this
+                   process_name; omit to run every project under it.
+    run_params   : free-form dict for rule_sql {key} substitution -- see
+                   run_rule_group()'s docstring. run_key is deliberately
+                   NOT merged into this.
+
+    Returns the same {"rule_groups": {...}} shape as run_all_active_groups().
+    Raises ValueError if no active rule_group matches this process_name
+    (and project_name, if given) -- most likely a typo'd process_name
+    rather than a legitimately empty run, so this fails loudly instead of
+    silently returning an empty result.
+    """
+    meta_conn = meta_conn or cf.get(gre_config.get_meta_connection_name())
+    meta_db = meta_db or gre_config.get_meta_db()
+
+    rule_groups = discover_rule_groups(meta_conn, meta_db, project_name=project_name,
+                                        process_name=process_name)
+    if not rule_groups:
+        raise ValueError(
+            f"run_by_process_name: no active rule_group found for process_name={process_name!r}"
+            f"{f' project_name={project_name!r}' if project_name else ''} -- check gre_rules for a typo, "
+            f"or use run_all_active_groups() directly if an empty result is actually expected."
+        )
+
+    return run_all_active_groups(
+        meta_conn, meta_db, run_key, cf,
+        project_name=project_name, process_name=process_name,
+        triggered_by=triggered_by, run_params=run_params, rule_variant=rule_variant,
+    )

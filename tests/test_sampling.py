@@ -29,7 +29,7 @@ import pytest
 
 from sampling.sampling import (
     _target_for_bucket, _select, _stratify, run_sampling,
-    _pull_candidates,
+    _pull_candidates, discover_sampling_configs, run_sampling_for_process_name,
 )
 
 META_DB = "main"
@@ -108,16 +108,19 @@ def _conn():
 def _insert_config(conn, config_id=1, sampling_method="RANKED", priority_rank_sql="revision DESC",
                    target_volume=150, rounding_mode="FLOOR", universe_table="case_universe",
                    key_columns="case_id", exclusion_sql="auto_closed = 1",
-                   scope_sql="pull_date = '{batch_id}'"):
+                   scope_sql="pull_date = '{batch_id}'",
+                   project_name="ANY_PROJECT", process_name="WEEKLY_REVIEW_SAMPLE",
+                   sample_name="weekly_review_sample", active_flag=1):
     conn.execute("""
         INSERT INTO gre_sampling_config (
             config_id, project_name, process_name, sample_name, source_type,
             universe_table, key_columns, scope_sql, exclusion_sql, target_volume,
             sampling_method, priority_rank_sql, rounding_mode, active_flag
-        ) VALUES (?, 'ANY_PROJECT', 'WEEKLY_REVIEW_SAMPLE', 'weekly_review_sample', 'duckdb_test',
-                  ?, ?, ?, ?, ?, ?, ?, ?, 1)
-    """, [config_id, universe_table, key_columns, scope_sql, exclusion_sql, target_volume,
-          sampling_method, priority_rank_sql, rounding_mode])
+        ) VALUES (?, ?, ?, ?, 'duckdb_test',
+                  ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [config_id, project_name, process_name, sample_name,
+          universe_table, key_columns, scope_sql, exclusion_sql, target_volume,
+          sampling_method, priority_rank_sql, rounding_mode, active_flag])
 
 
 def _insert_strata(conn, strata_id, config_id, level_order, level_name, stratify_expr, mix: dict):
@@ -472,6 +475,89 @@ def test_switching_method_is_config_only():
         result = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
         assert result["status"] == "COMPLETED", method
         assert result["selected"] <= 40, method
+
+
+# ── run_sampling_for_process_name(): convenience wrapper over run_sampling() ─
+
+def test_run_sampling_for_process_name_runs_every_config_for_that_process():
+    conn = _conn()
+    _build_universe(conn)
+    _insert_config(conn, config_id=1, target_volume=25, sampling_method="RANKED",
+                   project_name="PROJECT_A", process_name="WEEKLY_REVIEW_SAMPLE")
+    _insert_config(conn, config_id=2, target_volume=10, sampling_method="RANKED",
+                   project_name="PROJECT_B", process_name="WEEKLY_REVIEW_SAMPLE")
+    _insert_config(conn, config_id=3, target_volume=10, sampling_method="RANKED",
+                   project_name="PROJECT_A", process_name="OTHER_PROCESS")
+    cf = _FakeConnectionFactory(conn)
+
+    outcome = run_sampling_for_process_name("WEEKLY_REVIEW_SAMPLE", "2026-08-01", cf,
+                                             meta_conn=conn, meta_db=META_DB,
+                                             run_params={"batch_id": "2026-08-01"})
+
+    # config_id=3 belongs to a different process_name -- excluded.
+    assert set(outcome["sampling_configs"].keys()) == {1, 2}
+    assert outcome["sampling_configs"][1]["status"] == "COMPLETED"
+    assert outcome["sampling_configs"][2]["status"] == "COMPLETED"
+
+
+def test_run_sampling_for_process_name_scoped_to_one_project():
+    conn = _conn()
+    _build_universe(conn)
+    _insert_config(conn, config_id=1, target_volume=25, sampling_method="RANKED",
+                   project_name="PROJECT_A", process_name="WEEKLY_REVIEW_SAMPLE")
+    _insert_config(conn, config_id=2, target_volume=10, sampling_method="RANKED",
+                   project_name="PROJECT_B", process_name="WEEKLY_REVIEW_SAMPLE")
+    cf = _FakeConnectionFactory(conn)
+
+    outcome = run_sampling_for_process_name("WEEKLY_REVIEW_SAMPLE", "2026-08-01", cf,
+                                             meta_conn=conn, meta_db=META_DB,
+                                             project_name="PROJECT_A",
+                                             run_params={"batch_id": "2026-08-01"})
+
+    assert set(outcome["sampling_configs"].keys()) == {1}
+
+
+def test_run_sampling_for_process_name_resolves_meta_conn_and_db_from_cf_when_omitted(monkeypatch):
+    # meta_conn/meta_db aren't passed explicitly -- the wrapper must resolve
+    # them itself via cf.get(...)/shared.config, the whole point of this
+    # convenience function over calling run_sampling() per config directly.
+    conn = _conn()
+    _build_universe(conn)
+    _insert_config(conn, config_id=1, target_volume=25, sampling_method="RANKED",
+                   project_name="PROJECT_A", process_name="WEEKLY_REVIEW_SAMPLE")
+    cf = _FakeConnectionFactory(conn)
+
+    import shared.config as shared_config
+    monkeypatch.setattr(shared_config, "get_meta_db", lambda: META_DB)
+
+    outcome = run_sampling_for_process_name("WEEKLY_REVIEW_SAMPLE", "2026-08-01", cf,
+                                             run_params={"batch_id": "2026-08-01"})
+
+    assert set(outcome["sampling_configs"].keys()) == {1}
+    assert outcome["sampling_configs"][1]["status"] == "COMPLETED"
+
+
+def test_run_sampling_for_process_name_raises_clearly_when_no_match():
+    conn = _conn()
+    _build_universe(conn)
+    _insert_config(conn, config_id=1, project_name="PROJECT_A", process_name="WEEKLY_REVIEW_SAMPLE")
+    cf = _FakeConnectionFactory(conn)
+
+    with pytest.raises(ValueError, match="NO_SUCH_PROCESS"):
+        run_sampling_for_process_name("NO_SUCH_PROCESS", "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
+
+
+def test_discover_sampling_configs_filters_by_project_and_process():
+    conn = _conn()
+    _insert_config(conn, config_id=1, project_name="PROJECT_A", process_name="PROC_A")
+    _insert_config(conn, config_id=2, project_name="PROJECT_A", process_name="PROC_B")
+    _insert_config(conn, config_id=3, project_name="PROJECT_B", process_name="PROC_A")
+    _insert_config(conn, config_id=4, project_name="PROJECT_A", process_name="PROC_A", active_flag=0)
+
+    assert discover_sampling_configs(conn, META_DB) == [1, 2, 3]   # inactive config_id=4 excluded
+    assert discover_sampling_configs(conn, META_DB, project_name="PROJECT_A") == [1, 2]
+    assert discover_sampling_configs(conn, META_DB, process_name="PROC_A") == [1, 3]
+    assert discover_sampling_configs(conn, META_DB, project_name="PROJECT_A", process_name="PROC_A") == [1]
 
 
 # ── run_params threading (v2 scoping) ────────────────────────────────────

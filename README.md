@@ -125,6 +125,43 @@ multi-group fan-out (`run_all_active_groups()`), and
 [`sampling/README.md`](sampling/README.md) for `run_params`-based scoping
 of a sampling pull.
 
+## Running everything one process owns: `run_by_process_name()`
+
+The common case -- "run every active rule_group/sampling config a given
+process owns, without looking up which ones those are first" -- has a
+dedicated convenience wrapper in each package, resolving `meta_conn`/
+`meta_db` from `cf` automatically:
+
+```python
+from rules_engine.runner import run_by_process_name
+from sampling.sampling import run_sampling_for_process_name
+
+outcome = run_by_process_name("UNIVERSE_VALIDATION", run_key, cf)
+for rule_group, summary in outcome["rule_groups"].items():
+    print(rule_group, summary["status"])
+
+outcome = run_sampling_for_process_name("WEEKLY_REVIEW_SAMPLE", run_key, cf)
+for config_id, summary in outcome["sampling_configs"].items():
+    print(config_id, summary["status"])
+```
+
+Both accept an optional `project_name=` to narrow further, and raise
+`ValueError` if nothing active matches the `process_name` given (almost
+always a typo, so this fails loudly instead of silently doing nothing).
+
+**`run_by_process.py`** at the repo root is a thin CLI on top of both, for
+a quick local or scheduled run without writing a script:
+
+```bash
+python run_by_process.py rules --process-name UNIVERSE_VALIDATION
+python run_by_process.py rules --process-name UNIVERSE_VALIDATION --project-name HEALTHSPRING_UM --run-key BATCH_2026_08_19
+python run_by_process.py sampling --process-name WEEKLY_REVIEW_SAMPLE
+```
+
+`--run-key` defaults to today's date (`YYYY-MM-DD`) if omitted. Exit code
+is `0` if everything completed, `1` if any group/config errored or the
+`process_name` didn't match anything.
+
 ## Redeploying / changing the schema
 
 Since no `gre_*` table holds live/production data yet, this repo's DDL

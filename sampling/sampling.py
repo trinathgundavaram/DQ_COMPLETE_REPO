@@ -534,3 +534,122 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
         "by_stratum": by_stratum,
         "seed": run_seed,
     }
+
+
+# ---------------------------------------------------------------------------
+# Multi-config orchestration (project_name/process_name fan-out)
+# ---------------------------------------------------------------------------
+#
+# run_sampling() above is deliberately single-config: "one call = one
+# gre_sampling_config row" keeps its audit bookkeeping simple. Driving every
+# sampling config a process owns through the engine in one call is an
+# orchestration concern layered on TOP of that contract, not a change to
+# it -- mirrors rules_engine/runner.py's discover_rule_groups()/
+# run_all_active_groups()/run_by_process_name() shape exactly.
+
+def discover_sampling_configs(meta_conn, meta_db: str, project_name: str = None,
+                              process_name: str = None) -> list:
+    """
+    Active gre_sampling_config.config_id values, optionally narrowed to one
+    project_name and/or process_name. Returns config_ids sorted for a
+    deterministic run order.
+    """
+    where = ["active_flag = 1"]
+    params = []
+    if project_name is not None:
+        where.append("project_name = ?")
+        params.append(project_name)
+    if process_name is not None:
+        where.append("process_name = ?")
+        params.append(process_name)
+
+    sql = f"""
+        SELECT config_id
+        FROM {meta_db}.gre_sampling_config
+        WHERE {' AND '.join(where)}
+        ORDER BY config_id
+    """
+    rows = execute_query(meta_conn, sql, params)
+    return [r["config_id"] for r in rows]
+
+
+def run_sampling_for_process_name(
+    process_name: str,
+    run_key: str,
+    cf,
+    meta_conn=None,
+    meta_db: str = None,
+    project_name: str = None,
+    seed: int = None,
+    run_params: dict = None,
+) -> dict:
+    """
+    Thin convenience wrapper around run_sampling(): discovers every active
+    gre_sampling_config scoped to one process_name (optionally further
+    narrowed by project_name) and runs each, against the SAME
+    run_key/run_params/seed. Mirrors rules_engine/runner.py's
+    run_by_process_name() -- the common case of "run every sampling config
+    this process owns" without the caller resolving meta_conn/meta_db or
+    the matching config_ids themselves first.
+
+    process_name : which gre_sampling_config.process_name to run every
+                   active config for (required -- use run_sampling()
+                   directly for one specific config_id, or
+                   discover_sampling_configs() if you need the list of
+                   matching config_ids without running them).
+    run_key      : opaque tracking/idempotency identifier for this run --
+                   see run_sampling()'s docstring. The SAME run_key is used
+                   for every config found, so all of a process's samples
+                   this cycle share one tracking value.
+    cf           : a loaded db.connection_factory.ConnectionFactory.
+    meta_conn    : metadata connection; defaults to
+                   cf.get(shared.config.get_meta_connection_name()).
+    meta_db      : metadata schema/database name; defaults to
+                   shared.config.get_meta_db().
+    project_name : optional further narrowing to one project within this
+                   process_name; omit to run every project under it.
+    seed         : explicit seed passed through to every run_sampling()
+                   call (RANDOM/SYSTEMATIC only) -- omit to let each config
+                   generate its own independent seed.
+    run_params   : free-form dict for scope_sql/exclusion_sql {key}
+                   substitution, passed through to every run_sampling()
+                   call unchanged. run_key is deliberately NOT merged into
+                   this -- see run_sampling()'s docstring.
+
+    Returns {"sampling_configs": {config_id: run_sampling()'s own summary
+    dict, ...}} so a caller can inspect or aggregate per-config outcomes; a
+    config that errors doesn't stop the remaining configs from running.
+    Raises ValueError if no active config matches this process_name (and
+    project_name, if given) -- most likely a typo'd process_name rather
+    than a legitimately empty run.
+    """
+    from shared import config as gre_config
+
+    meta_conn = meta_conn or cf.get(gre_config.get_meta_connection_name())
+    meta_db = meta_db or gre_config.get_meta_db()
+
+    config_ids = discover_sampling_configs(meta_conn, meta_db, project_name=project_name,
+                                           process_name=process_name)
+    if not config_ids:
+        raise ValueError(
+            f"run_sampling_for_process_name: no active gre_sampling_config found for "
+            f"process_name={process_name!r}"
+            f"{f' project_name={project_name!r}' if project_name else ''} -- check "
+            f"gre_sampling_config for a typo, or use discover_sampling_configs() directly "
+            f"if an empty result is actually expected."
+        )
+
+    logger.info(
+        "run_sampling_for_process_name: %d config(s) in scope (project_name=%s process_name=%s) "
+        "for run_key=%s.",
+        len(config_ids), project_name, process_name, run_key,
+    )
+
+    summaries = {}
+    for config_id in config_ids:
+        summaries[config_id] = run_sampling(
+            config_id, run_key, cf,
+            meta_conn=meta_conn, meta_db=meta_db, seed=seed, run_params=run_params,
+        )
+
+    return {"sampling_configs": summaries}

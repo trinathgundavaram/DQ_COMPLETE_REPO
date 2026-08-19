@@ -12,7 +12,9 @@ import duckdb
 import pytest
 
 import rules_engine.executor as rules_engine_executor
-from rules_engine.runner import run_rule_group, discover_rule_groups, run_all_active_groups
+from rules_engine.runner import (
+    run_rule_group, discover_rule_groups, run_all_active_groups, run_by_process_name,
+)
 from shared.db_ops import execute_query
 
 META_DB = "main"
@@ -655,3 +657,66 @@ def test_run_all_active_groups_scoped_to_one_project():
     outcome = _run_all(conn, META_DB, "B1", cf, project_name="PROJECT_A")
 
     assert set(outcome["rule_groups"].keys()) == {"group_a"}
+
+
+# ── run_by_process_name(): convenience wrapper over run_all_active_groups ──
+
+def test_run_by_process_name_runs_every_group_for_that_process():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="UNIVERSE_VALIDATION")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=10, rule_group="group_b",
+                 project_name="PROJECT_B", process_name="UNIVERSE_VALIDATION")
+    _insert_rule(conn, 3, _MISSING_REASON_SQL, seq_no=10, rule_group="group_c",
+                 project_name="PROJECT_A", process_name="OTHER_PROCESS")
+
+    outcome = run_by_process_name("UNIVERSE_VALIDATION", "B1", cf, meta_conn=conn, meta_db=META_DB,
+                                   run_params={"batch_id": "B1"})
+
+    # group_c belongs to a different process_name -- excluded.
+    assert set(outcome["rule_groups"].keys()) == {"group_a", "group_b"}
+    assert outcome["rule_groups"]["group_a"]["status"] == "COMPLETED"
+    assert outcome["rule_groups"]["group_b"]["status"] == "COMPLETED"
+
+
+def test_run_by_process_name_scoped_to_one_project():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="UNIVERSE_VALIDATION")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=10, rule_group="group_b",
+                 project_name="PROJECT_B", process_name="UNIVERSE_VALIDATION")
+
+    outcome = run_by_process_name("UNIVERSE_VALIDATION", "B1", cf, meta_conn=conn, meta_db=META_DB,
+                                   project_name="PROJECT_A", run_params={"batch_id": "B1"})
+
+    assert set(outcome["rule_groups"].keys()) == {"group_a"}
+
+
+def test_run_by_process_name_resolves_meta_conn_and_db_from_cf_when_omitted(monkeypatch):
+    # meta_conn/meta_db aren't passed explicitly here -- the wrapper must
+    # resolve them itself via cf.get(...)/shared.config, the whole point of
+    # this convenience function over calling run_all_active_groups() directly.
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="UNIVERSE_VALIDATION")
+
+    import shared.config as shared_config
+    monkeypatch.setattr(shared_config, "get_meta_db", lambda: META_DB)
+
+    outcome = run_by_process_name("UNIVERSE_VALIDATION", "B1", cf, run_params={"batch_id": "B1"})
+
+    assert set(outcome["rule_groups"].keys()) == {"group_a"}
+    assert outcome["rule_groups"]["group_a"]["status"] == "COMPLETED"
+
+
+def test_run_by_process_name_raises_clearly_when_no_match():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="UNIVERSE_VALIDATION")
+
+    with pytest.raises(ValueError, match="NO_SUCH_PROCESS"):
+        run_by_process_name("NO_SUCH_PROCESS", "B1", cf, meta_conn=conn, meta_db=META_DB)
