@@ -1,0 +1,230 @@
+-- Postgres mirror of the gre_* metadata tables. Read-only from the rest
+-- of the app's perspective -- only metadata_sync/ writes here.
+-- {{SCHEMA}} is substituted by create_postgres_tables.py from
+-- METADATA_SYNC_PG_SCHEMA (default gre_mirror). Types translated from the
+-- Teradata source (rules_engine/schema.sql, shared/schema.sql,
+-- sampling/schema.sql): CLOB -> TEXT, BYTEINT -> SMALLINT, FLOAT ->
+-- DOUBLE PRECISION. IDENTITY columns (log_id, record_id, result_id,
+-- error_id) are plain BIGINT -- values are copied verbatim, never minted
+-- here.
+
+CREATE SCHEMA IF NOT EXISTS {{SCHEMA}};
+
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.metadata_sync_watermark (
+    table_name      VARCHAR(100) PRIMARY KEY,
+    last_watermark  TIMESTAMP,
+    last_synced_at  TIMESTAMP,
+    last_row_count  BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_rules (
+    rule_id                INTEGER PRIMARY KEY,
+    rule_nm                VARCHAR(500) NOT NULL,
+    database_name          VARCHAR(200) NOT NULL,
+    src_tbl_nm             VARCHAR(200) NOT NULL,
+    sql_dialect            VARCHAR(20)  NOT NULL,
+    rule_syntax            TEXT NOT NULL,
+    project_name           VARCHAR(100) NOT NULL,
+    process_name           VARCHAR(100) NOT NULL,
+    rule_group             VARCHAR(100) NOT NULL,
+    rule_variant           VARCHAR(100),
+    seq_no                 INTEGER,
+    sequencing_mode        VARCHAR(20),
+    on_failure             VARCHAR(20),
+    threshold_pct          DOUBLE PRECISION,
+    threshold_count        INTEGER,
+    threshold_operator     CHAR(3),
+    severity               VARCHAR(50),
+    src_key_cols           VARCHAR(500) NOT NULL,
+    element_name           VARCHAR(200),
+    act_ind                SMALLINT,
+    universe_version       VARCHAR(50),
+    universe_year          INTEGER,
+    dgr_nbr                VARCHAR(50),
+    issue_category_name    VARCHAR(200),
+    business_rule          VARCHAR(2000),
+    rule_description       VARCHAR(2000),
+    created_by              VARCHAR(100),
+    last_updated_by          VARCHAR(100),
+    load_datetime             TIMESTAMP,
+    last_updated_datetime      TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS gre_rules_group_variant_ix
+    ON {{SCHEMA}}.gre_rules (rule_group, act_ind, rule_variant);
+
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_log (
+    log_id          BIGINT PRIMARY KEY,
+    run_id          VARCHAR(200) NOT NULL,
+    rule_id         INTEGER NOT NULL,
+    rule_group      VARCHAR(100),
+    project_name    VARCHAR(100),
+    process_name    VARCHAR(100),
+    run_key         VARCHAR(100) NOT NULL,
+    seq_no          INTEGER,
+    start_time      TIMESTAMP,
+    end_time        TIMESTAMP,
+    status          VARCHAR(20),
+    rowcount        BIGINT,
+    error_message   VARCHAR(2000),
+    load_datetime   TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS gre_log_group_run_key_ix
+    ON {{SCHEMA}}.gre_log (rule_group, run_key, status);
+
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_exceptions (
+    record_id             BIGINT PRIMARY KEY,
+    run_id                VARCHAR(200),
+    rule_id               INTEGER NOT NULL,
+    database_name         VARCHAR(200),
+    src_tbl_nm            VARCHAR(200),
+    project_name          VARCHAR(200),
+    process_name          VARCHAR(200),
+    element_name          VARCHAR(200),
+    source_name           VARCHAR(100),
+    issue_desc            VARCHAR(2000),
+    exception_flag        VARCHAR(20),
+    exception_approver    VARCHAR(100),
+    run_key               VARCHAR(100) NOT NULL,
+    etl_is_curr_ind       CHAR(1),
+    etl_load_dt           DATE,
+    etl_last_updt_dt      TIMESTAMP,
+    src_key_value         VARCHAR(1000) NOT NULL,
+    rule_nm               VARCHAR(500),
+    dgr_nbr               VARCHAR(50),
+    universe_version      VARCHAR(50),
+    run_type              VARCHAR(50),
+    batch_schedule        VARCHAR(100),
+    load_datetime         TIMESTAMP,
+    last_updated_by       VARCHAR(100),
+    last_updated_datetime TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS gre_exceptions_uix
+    ON {{SCHEMA}}.gre_exceptions (rule_id, run_key, src_key_value);
+-- the point of the mirror: fast tie-back join to a Postgres source table
+CREATE INDEX IF NOT EXISTS gre_exceptions_src_key_value_ix
+    ON {{SCHEMA}}.gre_exceptions (src_key_value);
+
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_results (
+    result_id                BIGINT PRIMARY KEY,
+    rule_id                  INTEGER NOT NULL,
+    run_key                  VARCHAR(100) NOT NULL,
+    run_id                   VARCHAR(200) NOT NULL,
+    project_name             VARCHAR(100),
+    process_name             VARCHAR(100),
+    total_records            BIGINT,
+    failed_records           BIGINT,
+    failure_pct              DOUBLE PRECISION,
+    threshold_pct_used       DOUBLE PRECISION,
+    threshold_count_used     INTEGER,
+    threshold_operator_used  CHAR(3),
+    severity                 VARCHAR(50),
+    status                   VARCHAR(10),
+    evaluated_at             TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS gre_results_uix
+    ON {{SCHEMA}}.gre_results (rule_id, run_key);
+
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_audit (
+    run_id              VARCHAR(200) PRIMARY KEY,
+    run_type            VARCHAR(20),
+    rule_group          VARCHAR(100),
+    project_name        VARCHAR(100),
+    process_name        VARCHAR(100),
+    run_key             VARCHAR(100),
+    rule_variant        VARCHAR(100),
+    started_at          TIMESTAMP,
+    ended_at            TIMESTAMP,
+    status              VARCHAR(20),
+    total_rules         INTEGER,
+    rules_succeeded     INTEGER,
+    rules_errored       INTEGER,
+    sample_config_id    INTEGER,
+    sampling_method     VARCHAR(20),
+    random_seed         BIGINT,
+    target_volume       INTEGER,
+    total_candidates    INTEGER,
+    total_selected      INTEGER,
+    triggered_by        VARCHAR(100),
+    load_datetime       TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS gre_audit_status_ix ON {{SCHEMA}}.gre_audit (status);
+
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_errors (
+    error_id         BIGINT PRIMARY KEY,
+    run_id           VARCHAR(200),
+    rule_id          INTEGER,
+    rule_group       VARCHAR(100),
+    run_key          VARCHAR(100),
+    error_type       VARCHAR(50),
+    error_message    VARCHAR(2000),
+    error_detail     TEXT,
+    occurred_at      TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS gre_errors_run_rule_ix ON {{SCHEMA}}.gre_errors (run_id, rule_id);
+
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_sampling_config (
+    config_id           INTEGER PRIMARY KEY,
+    project_name        VARCHAR(100) NOT NULL,
+    process_name        VARCHAR(100) NOT NULL,
+    sample_name         VARCHAR(100) NOT NULL,
+    source_type         VARCHAR(20)  NOT NULL,
+    universe_table      VARCHAR(200) NOT NULL,
+    key_columns         VARCHAR(500) NOT NULL,
+    scope_sql           TEXT,
+    exclusion_sql       TEXT,
+    target_volume       INTEGER,
+    sampling_method     VARCHAR(20),
+    priority_rank_sql   TEXT,
+    rounding_mode       VARCHAR(10),
+    schedule_cron       VARCHAR(50),
+    act_ind             SMALLINT,
+    created_by          VARCHAR(100),
+    last_updated_by     VARCHAR(100),
+    load_datetime       TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_sampling_strata (
+    strata_id        INTEGER PRIMARY KEY,
+    config_id        INTEGER NOT NULL,
+    level_order      INTEGER NOT NULL,
+    level_name       VARCHAR(100),
+    stratify_expr    VARCHAR(1000) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS gre_sampling_strata_config_ix
+    ON {{SCHEMA}}.gre_sampling_strata (config_id, level_order);
+
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_sampling_mix (
+    mix_id           INTEGER PRIMARY KEY,
+    strata_id        INTEGER NOT NULL,
+    bucket_value     VARCHAR(200) NOT NULL,
+    target_fraction  DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS gre_sampling_mix_strata_ix
+    ON {{SCHEMA}}.gre_sampling_mix (strata_id);
+
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_sample_selections (
+    sample_run_id      VARCHAR(200) NOT NULL,
+    config_id          INTEGER,
+    project_name       VARCHAR(100),
+    process_name       VARCHAR(100),
+    sample_cycle       DATE,
+    case_key           VARCHAR(500) NOT NULL,
+    priority_rank      INTEGER,
+    excluded_flag      SMALLINT,
+    exclusion_reason   VARCHAR(500),
+    selected_flag      SMALLINT,
+    load_datetime      TIMESTAMP,
+    PRIMARY KEY (sample_run_id, case_key)
+);
+CREATE INDEX IF NOT EXISTS gre_sample_selections_lookup_ix
+    ON {{SCHEMA}}.gre_sample_selections (project_name, process_name, sample_cycle, selected_flag);
+
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_sample_selection_attrs (
+    sample_run_id    VARCHAR(200) NOT NULL,
+    case_key         VARCHAR(500) NOT NULL,
+    strata_id        INTEGER NOT NULL,
+    level_order      INTEGER,
+    bucket_value     VARCHAR(200),
+    load_datetime    TIMESTAMP,
+    PRIMARY KEY (sample_run_id, case_key, strata_id)
+);
