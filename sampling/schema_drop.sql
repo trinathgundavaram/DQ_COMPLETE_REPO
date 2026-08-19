@@ -13,7 +13,7 @@
 --
 -- Usage: run this, then re-run schema.sql. Does NOT touch shared/'s
 -- gre_audit/gre_errors or rules_engine/'s gre_rules/gre_log/
--- gre_exceptions/gre_case/gre_results -- see those packages' own
+-- gre_exceptions/gre_results -- see those packages' own
 -- schema_drop.sql for those.
 --
 -- In Teradata, DROP TABLE also drops every index defined on that table

@@ -119,7 +119,7 @@ rather than writing `ALTER TABLE` migrations. Each package has its own
 
 ```
 shared/schema_drop.sql          -- drop gre_audit, gre_errors
-rules_engine/schema_drop.sql    -- drop gre_rules, gre_log, gre_exceptions, gre_case, gre_results
+rules_engine/schema_drop.sql    -- drop gre_rules, gre_log, gre_exceptions, gre_results
 sampling/schema_drop.sql        -- drop the 5 gre_sampling_*/gre_sample_* tables
 
 -- then redeploy, shared first (rules_engine/ and sampling/ both assume

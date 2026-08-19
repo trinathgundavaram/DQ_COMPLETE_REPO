@@ -158,8 +158,8 @@ versa.
 | `runner.py` | `run_rule_group()` -- orchestration entry point: readiness gate, checkpoint/resume, sequencing_mode-aware loop over `execute_rule()`, `gre_audit` start/finish. `discover_rule_groups()`/`run_all_active_groups()` -- multi-group fan-out by project/process (see "Running multiple projects/processes" above). Also the opt-in parallel path (`_run_pending_parallel()`) -- see "Parallel rule execution" below. |
 | `parallel.py` | `ConnectionPool`/`build_pools()`/`close_pools()` -- the bounded per-connection connection pooling the parallel path uses instead of the single shared `cf.get()` connection. |
 | `reporting.py` | `get_breaches()` / `get_records_for_result()` -- thin read-only queries against `gre_results`/`gre_exceptions`. `get_source_records_for_rule()` -- ties `gre_exceptions` back to the live source record (see "Tying exceptions back to source records" below). |
-| `schema.sql` | `gre_rules` (incl. `project_name`/`process_name`), `gre_log`, `gre_exceptions`, `gre_case`, `gre_results`. Deploy after `shared/schema.sql`. |
-| `schema_drop.sql` | Drops the 5 tables above, for the drop-and-recreate redeploy policy (see the repo root README). |
+| `schema.sql` | `gre_rules` (incl. `project_name`/`process_name`), `gre_log`, `gre_exceptions`, `gre_results`. Deploy after `shared/schema.sql`. |
+| `schema_drop.sql` | Drops the 4 tables above, for the drop-and-recreate redeploy policy (see the repo root README). |
 
 ## Parallel rule execution (opt-in)
 

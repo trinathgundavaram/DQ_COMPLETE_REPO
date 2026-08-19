@@ -216,22 +216,7 @@ CREATE INDEX gre_exceptions_rule_batch_ix (rule_id, batch_id)
 ON CMSUNIV_FILELAND_DEV_T.gre_exceptions;
 
 
--- ── 4. gre_case -- reference table for shared entity identifiers ──────────
--- Pure lookup data: rules correlate findings across tables by joining to
--- this on case_id. Populated/maintained outside the engine; the engine
--- itself never writes to this table.
-CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_case (
-    case_id          VARCHAR(100) NOT NULL,
-    case_type        VARCHAR(50),          -- e.g. member | claim | provider | authorization
-    source_system    VARCHAR(100),
-    source_key       VARCHAR(200),
-    description      VARCHAR(500),
-    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-PRIMARY INDEX (case_id);
-
-
--- ── 5. gre_results -- one row per (rule_id, batch_id): rule-LEVEL verdict ──
+-- ── 4. gre_results -- one row per (rule_id, batch_id): rule-LEVEL verdict ──
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_results (
     result_id                 BIGINT GENERATED ALWAYS AS IDENTITY,
     rule_id                    INTEGER NOT NULL,
