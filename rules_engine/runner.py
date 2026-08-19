@@ -79,13 +79,15 @@ def _already_succeeded_rule_ids(meta_conn, meta_db: str, rule_group: str, batch_
 # ---------------------------------------------------------------------------
 
 def _start_audit(meta_conn, meta_db: str, run_id: str, rule_group: str, batch_id: str,
-                  total_rules: int, triggered_by: str, rule_variant: str = None) -> None:
+                  total_rules: int, triggered_by: str, rule_variant: str = None,
+                  project_name: str = None, process_name: str = None) -> None:
     execute_dml(meta_conn, f"""
         INSERT INTO {meta_db}.gre_audit (
-            run_id, rule_group, batch_id, rule_variant, started_at, status,
+            run_id, rule_group, project_name, process_name, batch_id, rule_variant, started_at, status,
             total_rules, rules_succeeded, rules_errored, triggered_by
-        ) VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, 0, 0, ?)
-    """, [run_id, rule_group, batch_id, rule_variant, datetime.now(), total_rules, triggered_by])
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, 0, 0, ?)
+    """, [run_id, rule_group, project_name, process_name, batch_id, rule_variant,
+          datetime.now(), total_rules, triggered_by])
 
 
 def _finish_audit(meta_conn, meta_db: str, run_id: str, status: str,
@@ -318,9 +320,24 @@ def run_rule_group(
 
     resolved_params = build_run_params(batch_id, run_params)
 
+    # project_name/process_name are descriptive/reporting dimensions carried
+    # on every gre_rules row (see rules_engine/schema.sql's design notes) --
+    # rule_group is still the one literal key load_rules() filters on. Take
+    # them from the first rule (lowest seq_no) and warn, same pattern as the
+    # sequencing_mode consistency check below, if the group disagrees with
+    # itself -- a rule_group is expected to belong to exactly one project/process.
+    project_name = rules[0].get("project_name")
+    process_name = rules[0].get("process_name")
+    if any(r.get("project_name") != project_name or r.get("process_name") != process_name for r in rules):
+        logger.warning(
+            "rule_group=%s has mixed project_name/process_name values across rules -- "
+            "using project_name=%s process_name=%s (from rule_id=%s, lowest seq_no) for gre_audit.",
+            rule_group, project_name, process_name, rules[0]["rule_id"],
+        )
+
     run_id = generate_run_id(rule_group, batch_id)
     _start_audit(meta_conn, meta_db, run_id, rule_group, batch_id, len(rules), triggered_by,
-                 rule_variant=rule_variant)
+                 rule_variant=rule_variant, project_name=project_name, process_name=process_name)
     logger.info("Starting GRE run: %s (%d rule(s))", run_id, len(rules))
 
     # Checkpoint/resume: skip rules that already succeeded for this batch.
@@ -419,3 +436,84 @@ def run_rule_group(
         "errored": errored,
         "results": results,
     }
+
+
+# ---------------------------------------------------------------------------
+# Multi-group orchestration (project_name/process_name fan-out)
+# ---------------------------------------------------------------------------
+#
+# run_rule_group() above is deliberately single-group: "one call = one
+# rule_group" keeps its checkpoint/resume and gre_audit bookkeeping simple
+# and easy to reason about. Driving multiple projects/processes through the
+# engine in one operation (e.g. a nightly job covering several use cases) is
+# an orchestration concern layered on TOP of that contract, not a change to
+# it -- discover_rule_groups()/run_all_active_groups() below just find which
+# rule_groups exist for a given project/process scope and call
+# run_rule_group() once per group, unchanged.
+
+def discover_rule_groups(meta_conn, meta_db: str, project_name: str = None,
+                          process_name: str = None) -> list:
+    """
+    Distinct, active rule_group values in gre_rules, optionally narrowed to
+    one project_name and/or process_name -- uses gre_rules_project_process_ix
+    when either filter is supplied. Returns rule_group names sorted for a
+    deterministic run order; callers needing a specific order should sort
+    rule_groups themselves before passing them to run_all_active_groups().
+    """
+    where = ["active_flag = 1"]
+    params = []
+    if project_name is not None:
+        where.append("project_name = ?")
+        params.append(project_name)
+    if process_name is not None:
+        where.append("process_name = ?")
+        params.append(process_name)
+
+    sql = f"""
+        SELECT DISTINCT rule_group
+        FROM {meta_db}.gre_rules
+        WHERE {' AND '.join(where)}
+        ORDER BY rule_group
+    """
+    rows = execute_query(meta_conn, sql, params)
+    return [r["rule_group"] for r in rows]
+
+
+def run_all_active_groups(
+    meta_conn,
+    meta_db: str,
+    batch_id: str,
+    cf,
+    project_name: str = None,
+    process_name: str = None,
+    triggered_by: str = "SYSTEM",
+    run_params: dict = None,
+    rule_variant: str = None,
+) -> dict:
+    """
+    Discover every active rule_group in scope (optionally filtered by
+    project_name/process_name) and call run_rule_group() once per group,
+    against the SAME batch_id/run_params/rule_variant. Each group still gets
+    its own run_id, its own gre_audit row, and its own checkpoint/resume --
+    this is a thin fan-out, not a merged run.
+
+    Returns {"rule_groups": {rule_group: run_rule_group()'s own summary dict, ...}}
+    so a caller can inspect or aggregate per-group outcomes; a group that
+    errors doesn't stop the remaining groups from running.
+    """
+    rule_groups = discover_rule_groups(meta_conn, meta_db, project_name=project_name,
+                                        process_name=process_name)
+    logger.info(
+        "run_all_active_groups: %d rule_group(s) in scope (project_name=%s process_name=%s) for batch_id=%s.",
+        len(rule_groups), project_name, process_name, batch_id,
+    )
+
+    summaries = {}
+    for rule_group in rule_groups:
+        summaries[rule_group] = run_rule_group(
+            rule_group, batch_id, cf,
+            meta_conn=meta_conn, meta_db=meta_db, triggered_by=triggered_by,
+            run_params=run_params, rule_variant=rule_variant,
+        )
+
+    return {"rule_groups": summaries}

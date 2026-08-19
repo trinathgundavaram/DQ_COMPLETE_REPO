@@ -50,7 +50,12 @@ def load_rules(meta_conn, meta_db: str, rule_group: str, rule_variant: str = Non
     and is harmless (a no-op ordering preference) for 'independent' groups.
 
     Returns a list of dicts (column names lowercased), matching the
-    row-as-dict convention used throughout this engine.
+    row-as-dict convention used throughout this engine. Every row carries
+    project_name/process_name straight through from gre_rules (SELECT *) --
+    they're descriptive/reporting dimensions, not part of this lookup's own
+    filter (see rules_engine/schema.sql's design notes); rules_engine/
+    runner.py reads them off these dicts to stamp gre_audit/gre_log/
+    gre_exceptions/gre_results for the run.
     """
     if rule_variant:
         sql = f"""

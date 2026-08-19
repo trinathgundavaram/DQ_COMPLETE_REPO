@@ -12,7 +12,7 @@ import duckdb
 import pytest
 
 import rules_engine.executor as rules_engine_executor
-from rules_engine.runner import run_rule_group
+from rules_engine.runner import run_rule_group, discover_rule_groups, run_all_active_groups
 from shared.db_ops import execute_query
 
 META_DB = "main"
@@ -73,6 +73,7 @@ def _conn():
         CREATE TABLE gre_rules (
             rule_id INTEGER, rule_name VARCHAR, database_name VARCHAR, table_name VARCHAR,
             source_connection VARCHAR, sql_dialect VARCHAR, rule_sql VARCHAR,
+            project_name VARCHAR, process_name VARCHAR,
             rule_group VARCHAR, rule_variant VARCHAR,
             seq_no INTEGER, sequencing_mode VARCHAR, on_failure VARCHAR,
             threshold_pct DOUBLE, threshold_count INTEGER, threshold_operator VARCHAR,
@@ -85,6 +86,7 @@ def _conn():
     conn.execute("""
         CREATE TABLE gre_exceptions (
             record_id BIGINT, run_id VARCHAR, rule_id INTEGER, database_name VARCHAR, table_name VARCHAR,
+            project_name VARCHAR, process_name VARCHAR,
             element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
             batch_id VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
@@ -97,6 +99,7 @@ def _conn():
     conn.execute("""
         CREATE TABLE gre_log (
             log_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
+            project_name VARCHAR, process_name VARCHAR,
             batch_id VARCHAR, seq_no INTEGER, start_time TIMESTAMP, end_time TIMESTAMP,
             status VARCHAR, rowcount BIGINT, error_message VARCHAR,
             created_at TIMESTAMP DEFAULT current_timestamp
@@ -114,6 +117,7 @@ def _conn():
     conn.execute("""
         CREATE TABLE gre_results (
             result_id BIGINT, rule_id INTEGER, batch_id VARCHAR, run_id VARCHAR,
+            project_name VARCHAR, process_name VARCHAR,
             total_records BIGINT, failed_records BIGINT, failure_pct DOUBLE,
             threshold_pct_used DOUBLE, threshold_count_used INTEGER,
             threshold_operator_used VARCHAR, severity VARCHAR, status VARCHAR,
@@ -124,7 +128,8 @@ def _conn():
 
     conn.execute("""
         CREATE TABLE gre_audit (
-            run_id VARCHAR, rule_group VARCHAR, batch_id VARCHAR, rule_variant VARCHAR,
+            run_id VARCHAR, rule_group VARCHAR, project_name VARCHAR, process_name VARCHAR,
+            batch_id VARCHAR, rule_variant VARCHAR,
             started_at TIMESTAMP, ended_at TIMESTAMP, status VARCHAR,
             total_rules INTEGER, rules_succeeded INTEGER, rules_errored INTEGER,
             triggered_by VARCHAR, created_at TIMESTAMP DEFAULT current_timestamp
@@ -135,14 +140,16 @@ def _conn():
 
 
 def _insert_rule(conn, rule_id, rule_sql, seq_no, sequencing_mode="independent",
-                  on_failure="skip_and_continue", rule_group="claims_dq", rule_variant=None):
+                  on_failure="skip_and_continue", rule_group="claims_dq", rule_variant=None,
+                  project_name="HEALTHSPRING_UM", process_name="UNIVERSE_VALIDATION"):
     conn.execute("""
         INSERT INTO gre_rules (
             rule_id, rule_name, database_name, table_name, source_connection, sql_dialect, rule_sql,
-            rule_group, rule_variant, seq_no, sequencing_mode, on_failure, natural_key_columns,
-            active_flag
-        ) VALUES (?, ?, 'main', 'claims', 'duckdb_test', 'ansi', ?, ?, ?, ?, ?, ?, 'claim_id', 1)
-    """, [rule_id, f"rule {rule_id}", rule_sql, rule_group, rule_variant, seq_no, sequencing_mode, on_failure])
+            project_name, process_name, rule_group, rule_variant, seq_no, sequencing_mode, on_failure,
+            natural_key_columns, active_flag
+        ) VALUES (?, ?, 'main', 'claims', 'duckdb_test', 'ansi', ?, ?, ?, ?, ?, ?, ?, ?, 'claim_id', 1)
+    """, [rule_id, f"rule {rule_id}", rule_sql, project_name, process_name, rule_group, rule_variant,
+          seq_no, sequencing_mode, on_failure])
 
 
 _MISSING_REASON_SQL = "SELECT claim_id FROM claims WHERE denial_reason IS NULL AND batch_id = '{batch_id}'"
@@ -512,3 +519,83 @@ def test_parallel_shared_total_cache_still_avoids_redundant_count_queries(monkey
     # the correct total -- that's the actual correctness guarantee; the
     # redundant-query count itself isn't asserted since it's timing-dependent.
     assert {r["rule_id"]: r["total_records"] for r in results} == {1: 4, 2: 4}
+
+
+# ── project_name/process_name propagation ─────────────────────────────────
+
+def test_gre_audit_carries_project_and_process_name_from_rules():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10,
+                 project_name="HEALTHSPRING_UM", process_name="UNIVERSE_VALIDATION")
+
+    summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    assert summary["status"] == "COMPLETED"
+
+    audit = execute_query(conn, "SELECT * FROM gre_audit WHERE run_id = ?", [summary["run_id"]])
+    assert len(audit) == 1
+    assert audit[0]["project_name"] == "HEALTHSPRING_UM"
+    assert audit[0]["process_name"] == "UNIVERSE_VALIDATION"
+
+
+def test_gre_audit_warns_and_picks_lowest_seq_no_on_mixed_project_name(caplog):
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10,
+                 project_name="HEALTHSPRING_UM", process_name="UNIVERSE_VALIDATION")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20,
+                 project_name="OTHER_PROJECT", process_name="OTHER_PROCESS")
+
+    with caplog.at_level("WARNING"):
+        summary = run_rule_group("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+
+    assert summary["status"] == "COMPLETED"
+    audit = execute_query(conn, "SELECT * FROM gre_audit WHERE run_id = ?", [summary["run_id"]])
+    assert audit[0]["project_name"] == "HEALTHSPRING_UM"      # rule 1, lowest seq_no
+    assert audit[0]["process_name"] == "UNIVERSE_VALIDATION"
+    assert any("mixed project_name/process_name" in r.message for r in caplog.records)
+
+
+# ── multi-group orchestration (project_name/process_name fan-out) ─────────
+
+def test_discover_rule_groups_filters_by_project_and_process():
+    conn = _conn()
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="PROC_A")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=10, rule_group="group_b",
+                 project_name="PROJECT_B", process_name="PROC_B")
+
+    assert discover_rule_groups(conn, META_DB) == ["group_a", "group_b"]
+    assert discover_rule_groups(conn, META_DB, project_name="PROJECT_A") == ["group_a"]
+    assert discover_rule_groups(conn, META_DB, process_name="PROC_B") == ["group_b"]
+    assert discover_rule_groups(conn, META_DB, project_name="PROJECT_A", process_name="PROC_B") == []
+
+
+def test_run_all_active_groups_runs_one_group_per_rule_group():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="PROC_A")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=10, rule_group="group_b",
+                 project_name="PROJECT_B", process_name="PROC_B")
+
+    outcome = run_all_active_groups(conn, META_DB, "B1", cf)
+
+    assert set(outcome["rule_groups"].keys()) == {"group_a", "group_b"}
+    assert outcome["rule_groups"]["group_a"]["status"] == "COMPLETED"
+    assert outcome["rule_groups"]["group_b"]["status"] == "COMPLETED"
+    # Each group gets its OWN gre_audit row / run_id -- not a merged run.
+    assert outcome["rule_groups"]["group_a"]["run_id"] != outcome["rule_groups"]["group_b"]["run_id"]
+
+
+def test_run_all_active_groups_scoped_to_one_project():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="PROC_A")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=10, rule_group="group_b",
+                 project_name="PROJECT_B", process_name="PROC_B")
+
+    outcome = run_all_active_groups(conn, META_DB, "B1", cf, project_name="PROJECT_A")
+
+    assert set(outcome["rule_groups"].keys()) == {"group_a"}

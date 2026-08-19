@@ -84,6 +84,7 @@ def _conn():
     conn.execute("""
         CREATE TABLE gre_exceptions (
             record_id BIGINT, run_id VARCHAR, rule_id INTEGER, database_name VARCHAR, table_name VARCHAR,
+            project_name VARCHAR, process_name VARCHAR,
             element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
             batch_id VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
@@ -96,6 +97,7 @@ def _conn():
     conn.execute("""
         CREATE TABLE gre_log (
             log_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
+            project_name VARCHAR, process_name VARCHAR,
             batch_id VARCHAR, seq_no INTEGER, start_time TIMESTAMP, end_time TIMESTAMP,
             status VARCHAR, rowcount BIGINT, error_message VARCHAR,
             created_at TIMESTAMP DEFAULT current_timestamp
@@ -113,6 +115,7 @@ def _conn():
     conn.execute("""
         CREATE TABLE gre_results (
             result_id BIGINT, rule_id INTEGER, batch_id VARCHAR, run_id VARCHAR,
+            project_name VARCHAR, process_name VARCHAR,
             total_records BIGINT, failed_records BIGINT, failure_pct DOUBLE,
             threshold_pct_used DOUBLE, threshold_count_used INTEGER,
             threshold_operator_used VARCHAR, severity VARCHAR, status VARCHAR,
@@ -139,6 +142,8 @@ def _rule(**overrides):
         # every key in run_params (batch_id included), so passing
         # run_params={"batch_id": "B1"} alone is enough to batch-scope the
         # total the same way the old explicit scope_sql override used to.
+        "project_name": "HEALTHSPRING_UM",
+        "process_name": "UNIVERSE_VALIDATION",
         "rule_group": "claims_dq",
         "rule_variant": None,
         "seq_no": 10,
@@ -233,6 +238,8 @@ def test_execute_rule_writes_exceptions_and_result():
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND batch_id = 'B1'")
     assert len(exceptions) == 2
     assert {r["natural_key_value"] for r in exceptions} == {"claim_id=C1", "claim_id=C3"}
+    assert all(r["project_name"] == "HEALTHSPRING_UM" and r["process_name"] == "UNIVERSE_VALIDATION"
+               for r in exceptions)
 
     results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND batch_id = 'B1'")
     assert len(results) == 1
@@ -240,11 +247,15 @@ def test_execute_rule_writes_exceptions_and_result():
     assert results[0]["total_records"] == 4
     assert results[0]["failed_records"] == 2
     assert results[0]["threshold_pct_used"] == 25
+    assert results[0]["project_name"] == "HEALTHSPRING_UM"
+    assert results[0]["process_name"] == "UNIVERSE_VALIDATION"
 
     logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND batch_id = 'B1'")
     assert len(logs) == 1
     assert logs[0]["status"] == "SUCCESS"
     assert logs[0]["rowcount"] == 2
+    assert logs[0]["project_name"] == "HEALTHSPRING_UM"
+    assert logs[0]["process_name"] == "UNIVERSE_VALIDATION"
 
 
 def test_execute_rule_is_idempotent_on_rerun():

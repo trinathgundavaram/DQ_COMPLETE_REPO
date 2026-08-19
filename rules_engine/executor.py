@@ -347,9 +347,9 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, batch_id
 
     sql = f"""
         INSERT INTO {meta_db}.gre_exceptions (
-            run_id, rule_id, database_name, table_name, element_name, source_name,
-            issue_desc, batch_id, natural_key_value
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            run_id, rule_id, database_name, table_name, project_name, process_name,
+            element_name, source_name, issue_desc, batch_id, natural_key_value
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     seen = set()
     params = []
@@ -364,6 +364,8 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, batch_id
             rule.get("rule_id"),
             rule.get("database_name"),
             rule.get("table_name"),
+            rule.get("project_name"),
+            rule.get("process_name"),
             rule.get("element_name"),
             rule.get("source_connection"),
             issue_desc,
@@ -383,14 +385,14 @@ def _upsert_result(meta_conn, meta_db: str, row: dict) -> None:
     """
     insert_sql = f"""
         INSERT INTO {meta_db}.gre_results (
-            rule_id, batch_id, run_id, total_records, failed_records,
+            rule_id, batch_id, run_id, project_name, process_name, total_records, failed_records,
             failure_pct, threshold_pct_used, threshold_count_used,
             threshold_operator_used, severity, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = [
-        row["rule_id"], row["batch_id"], row["run_id"], row["total_records"],
-        row["failed_records"], row["failure_pct"], row["threshold_pct_used"],
+        row["rule_id"], row["batch_id"], row["run_id"], row.get("project_name"), row.get("process_name"),
+        row["total_records"], row["failed_records"], row["failure_pct"], row["threshold_pct_used"],
         row["threshold_count_used"], row["threshold_operator_used"],
         row["severity"], row["status"],
     ]
@@ -403,14 +405,15 @@ def _upsert_result(meta_conn, meta_db: str, row: dict) -> None:
 
     update_sql = f"""
         UPDATE {meta_db}.gre_results
-        SET run_id = ?, total_records = ?, failed_records = ?, failure_pct = ?,
-            threshold_pct_used = ?, threshold_count_used = ?,
+        SET run_id = ?, project_name = ?, process_name = ?, total_records = ?, failed_records = ?,
+            failure_pct = ?, threshold_pct_used = ?, threshold_count_used = ?,
             threshold_operator_used = ?, severity = ?, status = ?,
             evaluated_at = CURRENT_TIMESTAMP
         WHERE rule_id = ? AND batch_id = ?
     """
     execute_dml(meta_conn, update_sql, [
-        row["run_id"], row["total_records"], row["failed_records"], row["failure_pct"],
+        row["run_id"], row.get("project_name"), row.get("process_name"), row["total_records"],
+        row["failed_records"], row["failure_pct"],
         row["threshold_pct_used"], row["threshold_count_used"], row["threshold_operator_used"],
         row["severity"], row["status"], row["rule_id"], row["batch_id"],
     ])
@@ -421,13 +424,14 @@ def _log_attempt(meta_conn, meta_db: str, run_id: str, rule: dict, batch_id: str
     """Insert one gre_log row for this execution attempt. Never raises."""
     sql = f"""
         INSERT INTO {meta_db}.gre_log (
-            run_id, rule_id, rule_group, batch_id, seq_no,
+            run_id, rule_id, rule_group, project_name, process_name, batch_id, seq_no,
             start_time, end_time, status, rowcount, error_message
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     try:
         execute_dml(meta_conn, sql, [
-            run_id, rule.get("rule_id"), rule.get("rule_group"), batch_id, rule.get("seq_no"),
+            run_id, rule.get("rule_id"), rule.get("rule_group"), rule.get("project_name"),
+            rule.get("process_name"), batch_id, rule.get("seq_no"),
             datetime.fromtimestamp(start_time), datetime.now(), status, rowcount, error_message,
         ])
     except Exception as exc:
@@ -642,6 +646,8 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_params: dict, 
                 "rule_id": rule.get("rule_id"),
                 "batch_id": batch_id,
                 "run_id": run_id,
+                "project_name": rule.get("project_name"),
+                "process_name": rule.get("process_name"),
                 "total_records": total,
                 "failed_records": failed,
                 "failure_pct": failure_pct,

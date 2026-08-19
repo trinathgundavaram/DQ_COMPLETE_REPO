@@ -65,6 +65,17 @@
 --     dimension composes a single string (e.g. "2026|MONTHLY"), the same
 --     "SQL/config authors are self-contained" philosophy as rule_sql
 --     above.
+--   * project_name / process_name are descriptive/reporting dimensions,
+--     NOT a second filter key -- rule_group stays the one literal column
+--     load_rules() filters on (gre_rules_group_variant_ix is unchanged).
+--     They exist so a rule_group's rows can be sliced/joined by project
+--     without a round trip back to gre_rules, and so this table finally
+--     speaks the same scoping vocabulary sampling/schema.sql's
+--     gre_sampling_config already uses (project_name/process_name there
+--     too). A rule_group is expected to belong to exactly one
+--     (project_name, process_name) pair -- rules_engine/runner.py warns
+--     if a group's rows disagree with themselves, the same pattern it
+--     already uses for sequencing_mode consistency.
 -- ============================================================
 
 
@@ -78,6 +89,10 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_rules (
     source_connection    VARCHAR(100) NOT NULL,   -- named connection, see db/connection_factory.py
     sql_dialect          VARCHAR(20)  NOT NULL,   -- 'teradata' | 'postgres' | 'ansi'
     rule_sql             CLOB NOT NULL,            -- the negative SELECT; never mutates data
+    project_name         VARCHAR(100) NOT NULL,    -- e.g. HEALTHSPRING_UM -- reporting/scoping dimension,
+                                                    -- NOT the filter key load_rules() uses (see design
+                                                    -- notes above); mirrors gre_sampling_config
+    process_name         VARCHAR(100) NOT NULL,    -- e.g. UNIVERSE_VALIDATION -- same as project_name
     rule_group           VARCHAR(100) NOT NULL,    -- groups rules for one use case / table pipeline
     rule_variant         VARCHAR(100),             -- optional extra selection level within rule_group;
                                                     -- NULL = always applies, see design notes above
@@ -102,6 +117,13 @@ PRIMARY INDEX (rule_id);
 CREATE INDEX gre_rules_group_variant_ix (rule_group, active_flag, rule_variant)
 ON CMSUNIV_FILELAND_DEV_T.gre_rules;
 
+-- Reporting/orchestration lookup by project/process (e.g. "which
+-- rule_groups exist for project X" -- see
+-- rules_engine/runner.py::discover_rule_groups()), never load_rules()'s
+-- own lookup -- that one stays on gre_rules_group_variant_ix above.
+CREATE INDEX gre_rules_project_process_ix (project_name, process_name, active_flag)
+ON CMSUNIV_FILELAND_DEV_T.gre_rules;
+
 
 -- ── 2. gre_log -- one row per rule execution attempt ──────────────────────
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_log (
@@ -109,6 +131,8 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_log (
     run_id           VARCHAR(200) NOT NULL,
     rule_id          INTEGER NOT NULL,
     rule_group       VARCHAR(100),
+    project_name     VARCHAR(100),         -- copied from gre_rules.project_name (reporting dimension)
+    process_name     VARCHAR(100),         -- copied from gre_rules.process_name
     batch_id         VARCHAR(100) NOT NULL,
     seq_no           INTEGER,
     start_time       TIMESTAMP,
@@ -150,6 +174,8 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_exceptions (
     rule_id               INTEGER NOT NULL,
     database_name         VARCHAR(200),                 -- copied from gre_rules.database_name
     table_name            VARCHAR(200),
+    project_name          VARCHAR(200),                 -- copied from gre_rules.project_name
+    process_name          VARCHAR(200),                 -- copied from gre_rules.process_name
     element_name          VARCHAR(200),
     source_name           VARCHAR(100),
     issue_desc            VARCHAR(2000),
@@ -198,6 +224,8 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_results (
     rule_id                    INTEGER NOT NULL,
     batch_id                   VARCHAR(100) NOT NULL,
     run_id                     VARCHAR(200) NOT NULL,
+    project_name                VARCHAR(100),         -- copied from gre_rules.project_name
+    process_name                VARCHAR(100),         -- copied from gre_rules.process_name
     total_records               BIGINT,
     failed_records              BIGINT,
     failure_pct                 FLOAT,

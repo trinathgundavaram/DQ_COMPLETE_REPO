@@ -13,7 +13,8 @@
 -- Why these two tables are here and not under rules_engine/ or sampling/:
 --   * gre_audit is one row per RUN, whichever package produced the run.
 --     run_type ('RULE_GROUP' | 'SAMPLING') discriminates the two; the
---     rule-run columns (rule_group, batch_id, total_rules, ...) are only
+--     rule-run columns (rule_group, project_name, process_name, batch_id,
+--     total_rules, ...) are only
 --     meaningful when run_type='RULE_GROUP' and are NULL for a sampling
 --     row, and vice versa for the sampling-only columns. This was a
 --     deliberate design choice ("reuse gre_audit rather than inventing a
@@ -38,6 +39,8 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_audit (
     run_id                 VARCHAR(200) NOT NULL,
     run_type               VARCHAR(20) DEFAULT 'RULE_GROUP',  -- 'RULE_GROUP' | 'SAMPLING'
     rule_group              VARCHAR(100),        -- RULE_GROUP runs only
+    project_name              VARCHAR(100),      -- RULE_GROUP runs only; copied from gre_rules.project_name
+    process_name              VARCHAR(100),      -- RULE_GROUP runs only; copied from gre_rules.process_name
     batch_id                 VARCHAR(100),        -- RULE_GROUP runs only
     rule_variant               VARCHAR(100),      -- RULE_GROUP runs only; NULL = no variant requested
     started_at                TIMESTAMP,
