@@ -54,7 +54,7 @@ import time
 from datetime import datetime
 
 from shared.db_ops import (
-    execute_dml, bulk_insert_or_skip, _is_duplicate_key_error,
+    execute_dml, execute_query, bulk_insert_or_skip, bulk_execute, _is_duplicate_key_error,
     _substitute_params, _run_source_query,
     log_error, EXCEPTION_CHUNK,
 )
@@ -348,18 +348,40 @@ def evaluate_threshold(
 # ---------------------------------------------------------------------------
 
 def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key: str, rows: list,
-                       run_params: dict = None) -> int:
+                       run_params: dict = None, capped: bool = False) -> dict:
     """
-    Write every violating row to gre_exceptions via one shared, batched
-    path. Rows are de-duplicated by src key WITHIN this call first (a
+    Reconcile gre_exceptions for (rule_id, run_key) against THIS attempt's
+    true violation set, instead of a blind append-only insert. A rerun of
+    a rule that already has exception rows on file for this run_key (see
+    rules_engine/runner.py's run_rule_group() -- every run now
+    re-executes every rule for its run_key rather than skipping
+    already-succeeded ones) must make etl_is_curr_ind='Y' reflect the
+    LATEST execution's state, not the union of every execution that ever
+    ran:
+
+      - a src_key_value violating NOW with no existing row      -> INSERT, etl_is_curr_ind='Y'
+      - a src_key_value violating NOW whose existing row is 'N' -> reactivate to 'Y'
+      - a src_key_value violating NOW whose existing row is 'Y' -> already current, left alone
+      - an existing 'Y' row whose src_key_value is NOT in this attempt's violation set
+        (fixed since the row was last written)                 -> deactivate to 'N'
+
+    Soft-deactivation (never delete) preserves full history of what was
+    ever flagged and when it got fixed -- rules_engine/reporting.py
+    already filters on etl_is_curr_ind='Y', so nothing on the read side
+    needs to change for deactivated rows to stop showing as open.
+
+    `capped`: True when _scan_violations()'s MAX_EXCEPTIONS cap means
+    `rows` is only a PARTIAL view of this attempt's true violations
+    (failed_records > MAX_EXCEPTIONS -- see execute_rule()'s STEP 1/STEP 3).
+    Deactivation is skipped entirely in that case: a src_key_value absent
+    from a partial `rows` list could still genuinely be violating, just
+    not captured in this attempt's capped detail set, and deactivating it
+    would incorrectly mark a still-open exception as fixed. Insert/
+    reactivate for whatever WAS captured still happens normally.
+
+    Rows are de-duplicated by src key WITHIN this call first (a
     rule_syntax that legitimately returns the same src key twice in one
-    pull would otherwise cost a wasted duplicate-key round trip per
-    repeat), then written with bulk_insert_or_skip() -- one executemany()
-    per GRE_EXCEPTION_CHUNK-sized chunk instead of one INSERT+commit per
-    row, falling back to row-by-row only for a chunk that collides with a
-    src key already committed by an earlier attempt on this run_key.
-    Returns how many NEW rows were inserted this call (not the total on
-    file).
+    pull would otherwise be treated as two separate changes).
 
     rule_nm/dgr_nbr/universe_version are copied straight from `rule`
     (gre_rules), same as element_name/project_name/process_name above --
@@ -368,47 +390,98 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
     caller happened to supply those exact keys for this run -- also purely
     descriptive, and never required (run_params has no reserved keys, see
     execute_rule()'s docstring).
+
+    Returns {"inserted": N, "reactivated": N, "deactivated": N}.
     """
-    if not rows:
-        return 0
-
     run_params = run_params or {}
+    rule_id = rule.get("rule_id")
 
-    sql = f"""
+    # de-dup this attempt's violating rows by src key
+    new_rows_by_key = {}
+    for row in rows:
+        nk = build_src_key(rule, row)
+        new_rows_by_key.setdefault(nk, row)
+
+    # every gre_exceptions row currently on file for (rule_id, run_key),
+    # regardless of its current etl_is_curr_ind -- needed to tell "new"
+    # from "reactivate" from "already current" from "now fixed"
+    existing = execute_query(
+        meta_conn,
+        f"""
+        SELECT record_id, src_key_value, etl_is_curr_ind
+        FROM {meta_db}.gre_exceptions
+        WHERE rule_id = ? AND run_key = ?
+        """,
+        [rule_id, run_key],
+    )
+    existing_by_key = {r["src_key_value"]: r for r in existing}
+
+    to_insert = []
+    to_reactivate = []
+    for nk, row in new_rows_by_key.items():
+        existing_row = existing_by_key.get(nk)
+        if existing_row is None:
+            issue_desc = f"Rule '{rule.get('rule_nm')}' violated (src_key={nk})"
+            to_insert.append([
+                run_id,
+                rule_id,
+                rule.get("database_name"),
+                rule.get("src_tbl_nm"),
+                rule.get("project_name"),
+                rule.get("process_name"),
+                rule.get("element_name"),
+                rule.get("sql_dialect"),
+                issue_desc,
+                run_key,
+                nk,
+                rule.get("rule_nm"),
+                rule.get("dgr_nbr"),
+                rule.get("universe_version"),
+                run_params.get("run_type"),
+                run_params.get("batch_schedule"),
+            ])
+        elif existing_row["etl_is_curr_ind"] != "Y":
+            to_reactivate.append([run_id, run_key, existing_row["record_id"]])
+
+    insert_sql = f"""
         INSERT INTO {meta_db}.gre_exceptions (
             run_id, rule_id, database_name, src_tbl_nm, project_name, process_name,
             element_name, source_name, issue_desc, run_key, src_key_value,
             rule_nm, dgr_nbr, universe_version, run_type, batch_schedule
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
-    seen = set()
-    params = []
-    for row in rows:
-        nk = build_src_key(rule, row)
-        if nk in seen:
-            continue
-        seen.add(nk)
-        issue_desc = f"Rule '{rule.get('rule_nm')}' violated (src_key={nk})"
-        params.append([
-            run_id,
-            rule.get("rule_id"),
-            rule.get("database_name"),
-            rule.get("src_tbl_nm"),
-            rule.get("project_name"),
-            rule.get("process_name"),
-            rule.get("element_name"),
-            rule.get("sql_dialect"),
-            issue_desc,
-            run_key,
-            nk,
-            rule.get("rule_nm"),
-            rule.get("dgr_nbr"),
-            rule.get("universe_version"),
-            run_params.get("run_type"),
-            run_params.get("batch_schedule"),
-        ])
+    inserted = bulk_insert_or_skip(meta_conn, insert_sql, to_insert) if to_insert else 0
 
-    return bulk_insert_or_skip(meta_conn, sql, params)
+    reactivate_sql = f"""
+        UPDATE {meta_db}.gre_exceptions
+        SET etl_is_curr_ind = 'Y', run_id = ?, last_updated_by = 'SYSTEM', last_updated_datetime = CURRENT_TIMESTAMP
+        WHERE run_key = ? AND record_id = ?
+    """
+    reactivated = bulk_execute(meta_conn, reactivate_sql, to_reactivate) if to_reactivate else 0
+
+    deactivated = 0
+    if capped:
+        logger.warning(
+            "rule_id=%s run_key=%s: detail-row capture capped (MAX_EXCEPTIONS) -- skipping "
+            "deactivation of stale gre_exceptions rows this attempt (can't confirm a row "
+            "outside the captured set no longer violates from a partial view).",
+            rule_id, run_key,
+        )
+    else:
+        to_deactivate = [
+            [r["record_id"]]
+            for nk, r in existing_by_key.items()
+            if r["etl_is_curr_ind"] == "Y" and nk not in new_rows_by_key
+        ]
+        if to_deactivate:
+            deactivate_sql = f"""
+                UPDATE {meta_db}.gre_exceptions
+                SET etl_is_curr_ind = 'N', last_updated_by = 'SYSTEM', last_updated_datetime = CURRENT_TIMESTAMP
+                WHERE record_id = ?
+            """
+            deactivated = bulk_execute(meta_conn, deactivate_sql, to_deactivate)
+
+    return {"inserted": inserted, "reactivated": reactivated, "deactivated": deactivated}
 
 
 def _upsert_result(meta_conn, meta_db: str, row: dict) -> None:
@@ -664,21 +737,30 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
         _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, start, str(exc))
         return "ERROR"
 
-    # ── STEP 3: write the already-fetched violating rows -- best effort ──────
+    # ── STEP 3: reconcile gre_exceptions against this attempt -- best effort ─
     # A failure here is logged but never fails the rule: `failed`/`total`
     # above are already correct (from the STEP 1 scan) and independent of
-    # whether the write itself succeeds.
-    written = 0
-    if violating_rows:
-        try:
-            written = _write_exceptions(meta_conn, meta_db, rule, run_id, run_key, violating_rows,
-                                        run_params=run_params)
-        except Exception as exc:
-            logger.warning(
-                "Rule %s: exception-row write failed (failed_records is still accurate): %s",
-                rule.get("rule_id"), exc, exc_info=True,
-            )
-            _log_error(meta_conn, meta_db, run_id, rule, run_key, "WRITE_FAILURE", str(exc))
+    # whether the write itself succeeds. Always runs -- even with ZERO
+    # violating_rows -- because a rule that's now fully clean (used to
+    # violate, doesn't anymore) still needs its previously-active
+    # gre_exceptions rows deactivated; skipping this call when
+    # violating_rows is empty (the old behavior) meant a clean rerun could
+    # never close out stale exceptions from an earlier attempt. See
+    # rules_engine/runner.py -- every run_rule_group() call now
+    # re-executes every rule for its run_key (no more silent
+    # already-succeeded skip), so this reconciliation runs on every rerun.
+    capped = MAX_EXCEPTIONS > 0 and failed > MAX_EXCEPTIONS
+    reconcile = {"inserted": 0, "reactivated": 0, "deactivated": 0}
+    try:
+        reconcile = _write_exceptions(meta_conn, meta_db, rule, run_id, run_key, violating_rows,
+                                      run_params=run_params, capped=capped)
+    except Exception as exc:
+        logger.warning(
+            "Rule %s: exception-row reconciliation failed (failed_records is still accurate): %s",
+            rule.get("rule_id"), exc, exc_info=True,
+        )
+        _log_error(meta_conn, meta_db, run_id, rule, run_key, "WRITE_FAILURE", str(exc))
+    written = reconcile["inserted"] + reconcile["reactivated"]
 
     verdict = evaluate_threshold(
         total, failed,
@@ -713,13 +795,17 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
             return "ERROR"
 
     logger.info(
-        "rule_id=%s | total=%d failed=%d written=%d | verdict=%s (write_result=%s) | %.3fs",
-        rule.get("rule_id"), total, failed, written, verdict["status"], verdict["write_result"], time.time() - start,
+        "rule_id=%s | total=%d failed=%d inserted=%d reactivated=%d deactivated=%d | "
+        "verdict=%s (write_result=%s) | %.3fs",
+        rule.get("rule_id"), total, failed, reconcile["inserted"], reconcile["reactivated"],
+        reconcile["deactivated"], verdict["status"], verdict["write_result"], time.time() - start,
     )
-    # gre_log.rowcount is "violating rows written to gre_exceptions THIS
-    # attempt" per the schema comment -- `written` (bulk_insert_or_skip's
-    # actual insert count, excluding skipped duplicates), not `failed`
-    # (the true total, which double-counts rows already on file from a
-    # prior attempt on a rerun).
+    # gre_log.rowcount is "violating rows now ACTIVE in gre_exceptions as of
+    # THIS attempt" per the schema comment -- inserted + reactivated
+    # (rows _write_exceptions() actually flipped/created to
+    # etl_is_curr_ind='Y' this attempt), not `failed` (the true total,
+    # which would double-count rows already on file and still current from
+    # a prior attempt), and not `deactivated` (the opposite direction --
+    # records closed out this attempt, not newly/still-open ones).
     _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "SUCCESS", written, start)
     return "SUCCESS"

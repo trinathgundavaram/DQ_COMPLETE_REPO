@@ -4,12 +4,20 @@ rules_engine/runner.py
 Orchestration entry point: run_rule_group(rule_group, run_key, ...).
 
 Single-threaded, sequential rule execution is still the DEFAULT and
-requires zero config: a run-readiness gate, checkpoint/resume, then a
-sequencing_mode-aware pass over the rules, calling
-rules_engine/executor.py::execute_rule() once per rule. Every rule commits
-its own findings independently -- this file only ever decides run ORDER,
-never commit/rollback. A dependency graph between rules is still out of
-scope.
+requires zero config: a run-readiness gate, then a sequencing_mode-aware
+pass over EVERY active rule in the group, calling rules_engine/executor.py
+::execute_rule() once per rule. Every rule commits its own findings
+independently -- this file only ever decides run ORDER, never
+commit/rollback. A dependency graph between rules is still out of scope.
+
+Every call always re-executes every rule for its run_key -- there is no
+checkpoint/resume skip of already-succeeded rules. A rerun of the same
+run_key (deliberate, or a resumed run after a crash) re-runs the whole
+group; rules_engine/executor.py::_write_exceptions() reconciles
+gre_exceptions.etl_is_curr_ind against each attempt's true violation set
+so a record that no longer violates gets deactivated instead of staying
+marked current forever from an earlier attempt. See that function's
+docstring for the reconciliation rules.
 
 Parallel execution (opt-in)
 -------------------------------
@@ -22,7 +30,7 @@ concurrent load (e.g. an OLTP Postgres source, vs. a Teradata warehouse)
 isn't hit harder just because the group-wide worker count went up. See
 rules_engine/parallel.py's module docstring for the connection-pooling
 mechanics, and _run_pending_parallel() below for how it plugs into this
-file's existing checkpoint/resume and gre_audit bookkeeping.
+file's existing per-rule execution and gre_audit bookkeeping.
 
 sequencing_mode='sequential' groups NEVER take this path, regardless of
 GRE_MAX_PARALLEL_RULES -- their whole point is a guaranteed run ORDER plus
@@ -47,31 +55,6 @@ logger = logging.getLogger(__name__)
 def generate_run_id(rule_group: str, run_key: str) -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"{rule_group}_{run_key}_{ts}"
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint / resume
-# ---------------------------------------------------------------------------
-
-def _already_succeeded_rule_ids(meta_conn, meta_db: str, rule_group: str, run_key: str) -> set:
-    """
-    rule_ids that already have a SUCCESS attempt logged in gre_log for this
-    (rule_group, run_key). These are skipped on resume -- carrying over
-    the legacy framework's get_failed_start_seq idea: a killed-and-rerun
-    run picks up after the last rule that actually completed, instead of
-    re-running (and re-committing duplicate work against) rules that
-    already succeeded.
-    """
-    rows = execute_query(
-        meta_conn,
-        f"""
-        SELECT DISTINCT rule_id
-        FROM {meta_db}.gre_log
-        WHERE rule_group = ? AND run_key = ? AND status = 'SUCCESS'
-        """,
-        [rule_group, run_key],
-    )
-    return {r["rule_id"] for r in rows}
 
 
 # ---------------------------------------------------------------------------
@@ -351,14 +334,20 @@ def run_rule_group(
                  rule_variant=rule_variant, project_name=project_name, process_name=process_name)
     logger.info("Starting GRE run: %s (%d rule(s))", run_id, len(rules))
 
-    # Checkpoint/resume: skip rules that already succeeded for this run_key.
-    done_ids = _already_succeeded_rule_ids(meta_conn, meta_db, rule_group, run_key)
-    pending = [r for r in rules if r["rule_id"] not in done_ids]
-    if done_ids:
-        logger.info(
-            "Resuming run for run_key=%s: %d rule(s) already succeeded, %d pending.",
-            run_key, len(done_ids), len(pending),
-        )
+    # Every rule always re-executes for its run_key -- no more skipping
+    # rules that already have a SUCCESS attempt on file. This used to be
+    # a checkpoint/resume optimization (skip work already committed after
+    # a crash), but it also meant a genuine, deliberate rerun of the same
+    # run_key (e.g. after fixing upstream data or a rule definition)
+    # silently did nothing: gre_exceptions rows from the earlier attempt
+    # stayed marked etl_is_curr_ind='Y' forever, even for records that no
+    # longer violate. Re-executing every rule every time lets
+    # rules_engine/executor.py::_write_exceptions() reconcile
+    # etl_is_curr_ind against each attempt's TRUE current violation set
+    # (see that function's docstring) -- the trade-off is that resuming
+    # after a mid-run crash now re-runs already-succeeded rules too,
+    # instead of picking up only from the failure point.
+    pending = rules
 
     # sequencing_mode is expected to be consistent across a rule_group; take
     # it from the first rule (in seq_no order) and warn if the group
@@ -454,8 +443,8 @@ def run_rule_group(
 # ---------------------------------------------------------------------------
 #
 # run_rule_group() above is deliberately single-group: "one call = one
-# rule_group" keeps its checkpoint/resume and gre_audit bookkeeping simple
-# and easy to reason about. Driving multiple projects/processes through the
+# rule_group" keeps its run bookkeeping simple and easy to reason about.
+# Driving multiple projects/processes through the
 # engine in one operation (e.g. a nightly job covering several use cases) is
 # an orchestration concern layered on TOP of that contract, not a change to
 # it -- discover_rule_groups()/run_all_active_groups() below just find which
@@ -505,8 +494,8 @@ def run_all_active_groups(
     Discover every active rule_group in scope (optionally filtered by
     project_name/process_name) and call run_rule_group() once per group,
     against the SAME run_key/run_params/rule_variant. Each group still gets
-    its own run_id, its own gre_audit row, and its own checkpoint/resume --
-    this is a thin fan-out, not a merged run.
+    its own run_id and its own gre_audit row -- this is a thin fan-out,
+    not a merged run.
 
     Returns {"rule_groups": {rule_group: run_rule_group()'s own summary dict, ...}}
     so a caller can inspect or aggregate per-group outcomes; a group that

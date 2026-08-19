@@ -227,6 +227,38 @@ def bulk_insert_or_skip(conn, sql: str, rows: list, chunk_size: int = None) -> i
     return inserted
 
 
+def bulk_execute(conn, sql: str, rows: list, chunk_size: int = None) -> int:
+    """
+    Chunked executemany() for UPDATE/DELETE-shaped DML -- the mutate-
+    existing-rows analog of bulk_insert() (which is insert-only). Used by
+    the etl_is_curr_ind reconciliation in rules_engine/executor.py::
+    _write_exceptions() and sampling/sampling.py's equivalent for
+    gre_sample_selections/gre_sample_selection_attrs: flipping a batch of
+    rows' current-indicator on a rerun, rather than one UPDATE+commit per
+    row.
+
+    No duplicate-key handling (unlike bulk_insert_or_skip()) -- an UPDATE
+    by primary/unique key has nothing to collide on. `rows` is a list of
+    positional param sequences, DB-API executemany() convention, same as
+    bulk_insert()/bulk_insert_or_skip().
+
+    Returns len(rows) (the number of UPDATE statements issued) -- not
+    every DB-API driver exposes a uniform "rows actually matched" count,
+    and the caller already knows which record_ids/keys it targeted.
+    """
+    if not rows:
+        return 0
+    size = chunk_size or EXCEPTION_CHUNK
+    cursor = conn.cursor()
+    try:
+        for i in range(0, len(rows), size):
+            cursor.executemany(sql, rows[i:i + size])
+            conn.commit()
+    finally:
+        cursor.close()
+    return len(rows)
+
+
 # ---------------------------------------------------------------------------
 # Run-parameter token substitution (v2 scoping mechanism -- see
 # rules_engine/schema.sql / sampling/schema.sql headers for why there's no

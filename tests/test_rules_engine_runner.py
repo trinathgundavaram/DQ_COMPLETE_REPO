@@ -214,13 +214,22 @@ def _run_all(meta_conn, meta_db, run_key, cf, **kwargs):
     return run_all_active_groups(meta_conn, meta_db, run_key, cf, run_params=run_params, **kwargs)
 
 
-def test_checkpoint_resume_skips_already_succeeded_rules():
+def test_rerun_always_re_executes_already_succeeded_rules():
+    """
+    run_rule_group() no longer skips a rule just because it already has a
+    SUCCESS attempt on file for this run_key -- every rule always
+    re-executes, every call (see runner.py's module docstring: this is
+    what lets executor.py::_write_exceptions() reconcile
+    etl_is_curr_ind against each attempt's TRUE current violation set,
+    instead of an already-succeeded rule being silently frozen in place
+    forever from its first run).
+    """
     conn = _conn()
     cf = _FakeConnectionFactory(conn)
     _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10)
     _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20)
 
-    # Pre-seed gre_log as if rule 1 already succeeded in a prior (interrupted) run.
+    # Pre-seed gre_log as if rule 1 already succeeded in a prior run.
     conn.execute("""
         INSERT INTO gre_log (run_id, rule_id, rule_group, run_key, status, rowcount)
         VALUES ('PRIOR_RUN', 1, 'claims_dq', 'B1', 'SUCCESS', 2)
@@ -229,12 +238,12 @@ def test_checkpoint_resume_skips_already_succeeded_rules():
     summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "COMPLETED"
-    assert 1 not in summary["results"]          # rule 1 was skipped, not re-run
+    assert summary["results"][1] == "SUCCESS"   # rule 1 re-ran, not skipped
     assert summary["results"][2] == "SUCCESS"
 
-    # Rule 1 should have exactly the ONE log row from before (not re-attempted).
+    # Rule 1 now has the pre-seeded row PLUS this attempt's new one.
     logs_r1 = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1")
-    assert len(logs_r1) == 1
+    assert len(logs_r1) == 2
     logs_r2 = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 2")
     assert len(logs_r2) == 1
 

@@ -85,9 +85,17 @@ def _conn():
             ('C5', NULL, 'B2')
     """)
 
+    # record_id needs a real, stable, auto-generated value (matching
+    # production's GENERATED ALWAYS AS IDENTITY) -- _write_exceptions()'s
+    # reactivate/deactivate UPDATEs target rows by record_id, which is
+    # NULL for every row without this (a plain BIGINT column with no
+    # default silently inserts NULL, and "WHERE record_id = NULL" matches
+    # nothing under normal SQL NULL semantics).
+    conn.execute("CREATE SEQUENCE gre_exceptions_seq START 1")
     conn.execute("""
         CREATE TABLE gre_exceptions (
-            record_id BIGINT, run_id VARCHAR, rule_id INTEGER, database_name VARCHAR, src_tbl_nm VARCHAR,
+            record_id BIGINT DEFAULT nextval('gre_exceptions_seq'),
+            run_id VARCHAR, rule_id INTEGER, database_name VARCHAR, src_tbl_nm VARCHAR,
             project_name VARCHAR, process_name VARCHAR,
             element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
@@ -96,8 +104,8 @@ def _conn():
             src_key_value VARCHAR,
             rule_nm VARCHAR, dgr_nbr VARCHAR, universe_version VARCHAR,
             run_type VARCHAR, batch_schedule VARCHAR,
-            created_at TIMESTAMP DEFAULT current_timestamp,
-            last_updated_by VARCHAR, updated_at TIMESTAMP
+            load_datetime TIMESTAMP DEFAULT current_timestamp,
+            last_updated_by VARCHAR, last_updated_datetime TIMESTAMP
         )
     """)
     conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, run_key, src_key_value)")
@@ -281,6 +289,152 @@ def test_execute_rule_is_idempotent_on_rerun():
 
     logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(logs) == 2         # both attempts are logged (attempt history, unlike results)
+
+
+def test_execute_rule_deactivates_exceptions_that_no_longer_violate():
+    """
+    Reconciliation regression: a rerun (runner.py no longer skips
+    already-succeeded rules -- see runner.py's module docstring) must
+    deactivate (etl_is_curr_ind='N') an exception whose underlying record
+    has since been fixed, not leave it marked current forever from the
+    first attempt.
+    """
+    conn = _conn()
+    rule = _rule(threshold_pct=25)
+
+    execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    before = {r["src_key_value"]: r for r in
+              execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")}
+    assert set(before) == {"claim_id=C1", "claim_id=C3"}
+    assert all(r["etl_is_curr_ind"] == "Y" for r in before.values())
+    c1_record_id = before["claim_id=C1"]["record_id"]
+
+    # C1 gets fixed upstream (no longer NULL) -- rerun the SAME run_key.
+    conn.execute("UPDATE claims SET denial_reason = 'Fixed' WHERE claim_id = 'C1'")
+    execute_rule(rule, _Adapter(conn), conn, "RUN2", "B1", {"batch_id": "B1"}, META_DB)
+
+    after = {r["src_key_value"]: r for r in
+             execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")}
+    assert set(after) == {"claim_id=C1", "claim_id=C3"}   # soft-deactivated, not deleted
+    assert after["claim_id=C1"]["etl_is_curr_ind"] == "N"
+    assert after["claim_id=C1"]["record_id"] == c1_record_id   # same row, updated in place
+    assert after["claim_id=C3"]["etl_is_curr_ind"] == "Y"      # still genuinely violating
+
+    # reporting.py's etl_is_curr_ind='Y' filter now correctly excludes C1
+    active = execute_query(
+        conn, "SELECT src_key_value FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1' "
+              "AND etl_is_curr_ind = 'Y'",
+    )
+    assert {r["src_key_value"] for r in active} == {"claim_id=C3"}
+
+
+def test_execute_rule_reactivates_exception_that_violates_again():
+    """
+    The inverse of the deactivate case: a record that was fixed (soft-
+    deactivated) and later breaks again must be reactivated in place
+    (same record_id, etl_is_curr_ind flipped back to 'Y'), not inserted
+    as a brand new row (gre_exceptions_uix would reject that anyway).
+    """
+    conn = _conn()
+    rule = _rule(threshold_pct=25)
+
+    execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    conn.execute("UPDATE claims SET denial_reason = 'Fixed' WHERE claim_id = 'C1'")
+    execute_rule(rule, _Adapter(conn), conn, "RUN2", "B1", {"batch_id": "B1"}, META_DB)
+
+    deactivated_id = execute_query(
+        conn, "SELECT record_id FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1' "
+              "AND src_key_value = 'claim_id=C1'",
+    )[0]["record_id"]
+
+    # C1 breaks again
+    conn.execute("UPDATE claims SET denial_reason = NULL WHERE claim_id = 'C1'")
+    execute_rule(rule, _Adapter(conn), conn, "RUN3", "B1", {"batch_id": "B1"}, META_DB)
+
+    rows = execute_query(
+        conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1' "
+              "AND src_key_value = 'claim_id=C1'",
+    )
+    assert len(rows) == 1                              # reactivated, not duplicated
+    assert rows[0]["record_id"] == deactivated_id       # same row throughout
+    assert rows[0]["etl_is_curr_ind"] == "Y"
+    assert rows[0]["run_id"] == "RUN3"                  # stamped with the reactivating run
+
+
+def test_execute_rule_clean_rerun_deactivates_all_prior_exceptions():
+    """
+    A rule that used to fail and is now fully clean (zero violations) must
+    still deactivate its previously-active exceptions -- this only works
+    because _write_exceptions() is called unconditionally, even when
+    violating_rows is empty (see execute_rule()'s STEP 3 comment); the old
+    `if violating_rows:` guard would have skipped this entirely.
+    """
+    conn = _conn()
+    rule = _rule(threshold_pct=25)
+
+    execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    conn.execute("UPDATE claims SET denial_reason = 'Fixed' WHERE claim_id IN ('C1', 'C3')")
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN2", "B1", {"batch_id": "B1"}, META_DB)
+    assert status == "SUCCESS"
+
+    active = execute_query(
+        conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1' AND etl_is_curr_ind = 'Y'",
+    )
+    assert active == []
+    all_rows = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
+    assert len(all_rows) == 2   # both rows kept, both deactivated
+    assert all(r["etl_is_curr_ind"] == "N" for r in all_rows)
+
+
+def test_write_exceptions_capped_skips_deactivation(monkeypatch):
+    """
+    When _scan_violations()'s MAX_EXCEPTIONS cap means this attempt only
+    captured a PARTIAL view of the true violation set, deactivation must
+    be skipped entirely -- a src_key_value missing from a capped `rows`
+    list could still genuinely be violating, just not captured this
+    attempt, and deactivating it would incorrectly mark a still-open
+    exception as fixed.
+    """
+    from rules_engine.executor import _write_exceptions
+
+    conn = _conn()
+    rule = _rule(threshold_pct=25)
+
+    # seed one PRE-EXISTING active exception for a key that will NOT
+    # appear in this attempt's (capped) rows
+    conn.execute("""
+        INSERT INTO gre_exceptions (record_id, rule_id, run_key, src_key_value, etl_is_curr_ind)
+        VALUES (999, 1, 'B1', 'claim_id=PRIOR', 'Y')
+    """)
+
+    summary = _write_exceptions(
+        conn, META_DB, rule, "RUN1", "B1",
+        rows=[{"claim_id": "C1"}],   # does NOT include claim_id=PRIOR
+        capped=True,
+    )
+    assert summary["deactivated"] == 0   # skipped -- capped view can't confirm PRIOR is fixed
+
+    prior = execute_query(
+        conn, "SELECT etl_is_curr_ind FROM gre_exceptions WHERE record_id = 999",
+    )[0]
+    assert prior["etl_is_curr_ind"] == "Y"   # untouched, still active
+
+    # sanity: the SAME call with capped=False WOULD have deactivated it
+    conn2 = _conn()
+    conn2.execute("""
+        INSERT INTO gre_exceptions (record_id, rule_id, run_key, src_key_value, etl_is_curr_ind)
+        VALUES (999, 1, 'B1', 'claim_id=PRIOR', 'Y')
+    """)
+    summary2 = _write_exceptions(
+        conn2, META_DB, rule, "RUN1", "B1",
+        rows=[{"claim_id": "C1"}],
+        capped=False,
+    )
+    assert summary2["deactivated"] == 1
+    prior2 = execute_query(
+        conn2, "SELECT etl_is_curr_ind FROM gre_exceptions WHERE record_id = 999",
+    )[0]
+    assert prior2["etl_is_curr_ind"] == "N"
 
 
 def test_execute_rule_batches_are_isolated():
