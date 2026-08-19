@@ -46,7 +46,7 @@ your own string.
 `scope_sql` and `exclusion_sql` may both embed any number of `"{key}"`
 tokens -- each run passes a `run_params` dict, and every matching token is
 substituted (quoted, escaped) before the pull query runs, the SAME
-mechanism and dict shape `rules_engine/` uses for `rule_sql`/`scope_sql`.
+mechanism and dict shape `rules_engine/` uses for `rule_syntax`/`scope_sql`.
 `run_params` is completely free-form -- there is no reserved/required
 key, and `run_key` is deliberately NOT auto-merged into it, since it's
 often not a real column on the universe table (e.g. a composite like

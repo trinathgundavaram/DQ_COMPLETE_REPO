@@ -13,16 +13,16 @@ Adapter interface (SourceAdapter ABC)
     commit()               -> commit the current transaction (no-op for read-only sources)
     close()                 -> release the underlying connection
     ping() -> bool           -> lightweight liveness check (default: SELECT 1)
-    prepare(rule)              -> per-rule setup before rule_sql runs (no-op by
+    prepare(rule)              -> per-rule setup before rule_syntax runs (no-op by
                                   default; FileAdapter/S3Adapter register a
                                   DuckDB view from rule['database_name']/
-                                  rule['table_name'] -- the metadata table
+                                  rule['src_tbl_nm'] -- the metadata table
                                   IS the source of the file/S3 path, nothing
                                   else to configure per rule)
     qualified_name(rule) -> str -> the FROM-clause identifier for the
                                   auto-generated total-record count
                                   (rules_engine/executor.py::_build_total_query);
-                                  "database_name.table_name" for a real DB,
+                                  "database_name.src_tbl_nm" for a real DB,
                                   the prepared view name for file/S3
     source_type: str            -> 'teradata' | 'postgres' | 's3' | 'file'
 
@@ -69,15 +69,15 @@ def _escape(value: str) -> str:
     return value.replace("'", "''")
 
 
-def _view_name(table_name: str) -> str:
+def _view_name(src_tbl_nm: str) -> str:
     """
     A safe SQL identifier for a file/S3 rule's DuckDB view, derived from
-    table_name (e.g. "claims.csv" -> "claims", "pull_date=*/*.parquet" ->
-    "pull_date___"). rule_sql for a file/S3 rule references this same name,
-    so keep table_name simple (no need to match it exactly -- just be aware
+    src_tbl_nm (e.g. "claims.csv" -> "claims", "pull_date=*/*.parquet" ->
+    "pull_date___"). rule_syntax for a file/S3 rule references this same name,
+    so keep src_tbl_nm simple (no need to match it exactly -- just be aware
     non-alnum characters become underscores).
     """
-    stem = Path(table_name).stem or table_name
+    stem = Path(src_tbl_nm).stem or src_tbl_nm
     cleaned = re.sub(r"[^0-9a-zA-Z_]", "_", stem) or "t"
     return f"t_{cleaned}" if cleaned[0].isdigit() else cleaned
 
@@ -116,8 +116,8 @@ class SourceAdapter(ABC):
         """Per-rule setup hook. No-op for real databases; file/S3 override this."""
 
     def qualified_name(self, rule: dict) -> str:
-        """FROM-clause identifier for rule['database_name']/rule['table_name']."""
-        return f"{rule['database_name']}.{rule['table_name']}"
+        """FROM-clause identifier for rule['database_name']/rule['src_tbl_nm']."""
+        return f"{rule['database_name']}.{rule['src_tbl_nm']}"
 
 
 # =============================================================================
@@ -250,11 +250,11 @@ class FileAdapter(SourceAdapter):
     no per-rule setup outside gre_rules is needed:
         database_name -> the directory the file lives in (absolute, or
                           relative to FILE_BASE_PATH if that's set)
-        table_name    -> the filename (e.g. "claims.csv")
+        src_tbl_nm    -> the filename (e.g. "claims.csv")
     prepare(rule) loads the file once (guarded by a lock) into a shared
     DataFrame registry, then registers it as a DuckDB view -- named via
-    _view_name(table_name) -- in each thread's own connection (DuckDB
-    connections aren't safe to share across threads). rule_sql references
+    _view_name(src_tbl_nm) -- in each thread's own connection (DuckDB
+    connections aren't safe to share across threads). rule_syntax references
     that same view name.
     """
 
@@ -290,15 +290,15 @@ class FileAdapter(SourceAdapter):
             return False
 
     def prepare(self, rule: dict) -> None:
-        table_name = (rule.get("table_name") or "").strip()
-        if not table_name:
-            raise ValueError("table_name is empty -- cannot prepare file source.")
-        view_name = _view_name(table_name)
+        src_tbl_nm = (rule.get("src_tbl_nm") or "").strip()
+        if not src_tbl_nm:
+            raise ValueError("src_tbl_nm is empty -- cannot prepare file source.")
+        view_name = _view_name(src_tbl_nm)
 
         if view_name not in self._df_registry:
             with self._registry_lock:
                 if view_name not in self._df_registry:
-                    full_path = self._resolve_path(table_name, (rule.get("database_name") or "").strip())
+                    full_path = self._resolve_path(src_tbl_nm, (rule.get("database_name") or "").strip())
                     df = _read_file(full_path)
                     df.columns = [c.lower() for c in df.columns]
                     self._df_registry[view_name] = df
@@ -312,7 +312,7 @@ class FileAdapter(SourceAdapter):
             self._local.registered = registered
 
     def qualified_name(self, rule: dict) -> str:
-        return _view_name(rule["table_name"])
+        return _view_name(rule["src_tbl_nm"])
 
     @classmethod
     def build(cls) -> "FileAdapter":
@@ -329,11 +329,11 @@ class FileAdapter(SourceAdapter):
             self._local.registered = registered
         return self._local.conn
 
-    def _resolve_path(self, table_name: str, database_name: str) -> str:
-        if os.path.isabs(table_name):
-            return table_name
+    def _resolve_path(self, src_tbl_nm: str, database_name: str) -> str:
+        if os.path.isabs(src_tbl_nm):
+            return src_tbl_nm
         base = database_name or self._base_path
-        return f"{base.rstrip('/')}/{table_name}" if base else table_name
+        return f"{base.rstrip('/')}/{src_tbl_nm}" if base else src_tbl_nm
 
 
 class S3Adapter(SourceAdapter):
@@ -342,9 +342,9 @@ class S3Adapter(SourceAdapter):
     (joins, aggregates, window functions). Same metadata-driven convention as
     FileAdapter -- no per-rule setup outside gre_rules:
         database_name -> the s3:// prefix/bucket (e.g. "s3://bucket/claims")
-        table_name    -> the object key or glob under that prefix (e.g.
+        src_tbl_nm    -> the object key or glob under that prefix (e.g.
                           "pull_date=*/*.parquet") -- also names the view
-                          rule_sql references, via _view_name(table_name)
+                          rule_syntax references, via _view_name(src_tbl_nm)
 
     One DuckDB connection per thread (thread-local, mirrors FileAdapter),
     each configured with the httpfs extension and S3 credentials read from
@@ -381,25 +381,25 @@ class S3Adapter(SourceAdapter):
             return False
 
     def prepare(self, rule: dict) -> None:
-        table_name = (rule.get("table_name") or "").strip()
+        src_tbl_nm = (rule.get("src_tbl_nm") or "").strip()
         prefix = (rule.get("database_name") or "").strip()
-        if not table_name or not prefix:
-            raise ValueError("S3 rules require database_name (s3:// prefix) and table_name (key/glob).")
+        if not src_tbl_nm or not prefix:
+            raise ValueError("S3 rules require database_name (s3:// prefix) and src_tbl_nm (key/glob).")
 
-        view_name = _view_name(table_name)
+        view_name = _view_name(src_tbl_nm)
         conn = self._get_thread_conn()
         registered = getattr(self._local, "registered", set())
         if view_name in registered:
             return
 
-        uri = f"{prefix.rstrip('/')}/{table_name}"
+        uri = f"{prefix.rstrip('/')}/{src_tbl_nm}"
         conn.execute(f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM {self._reader_fn(uri)}")
         registered.add(view_name)
         self._local.registered = registered
         logger.info("S3 view prepared: %s -> %s", view_name, uri)
 
     def qualified_name(self, rule: dict) -> str:
-        return _view_name(rule["table_name"])
+        return _view_name(rule["src_tbl_nm"])
 
     @classmethod
     def build(cls) -> "S3Adapter":

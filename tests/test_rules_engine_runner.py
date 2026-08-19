@@ -41,7 +41,7 @@ class _Adapter:
         pass
 
     def qualified_name(self, rule: dict) -> str:
-        return f"{rule['database_name']}.{rule['table_name']}"
+        return f"{rule['database_name']}.{rule['src_tbl_nm']}"
 
 
 class _FakeConnectionFactory:
@@ -97,38 +97,38 @@ def _conn():
 
     conn.execute("""
         CREATE TABLE gre_rules (
-            rule_id INTEGER, rule_name VARCHAR, database_name VARCHAR, table_name VARCHAR,
-            sql_dialect VARCHAR, rule_sql VARCHAR,
+            rule_id INTEGER, rule_nm VARCHAR, database_name VARCHAR, src_tbl_nm VARCHAR,
+            sql_dialect VARCHAR, rule_syntax VARCHAR,
             project_name VARCHAR, process_name VARCHAR,
             rule_group VARCHAR, rule_variant VARCHAR,
             seq_no INTEGER, sequencing_mode VARCHAR, on_failure VARCHAR,
             threshold_pct DOUBLE, threshold_count INTEGER, threshold_operator VARCHAR,
-            severity VARCHAR, natural_key_columns VARCHAR, element_name VARCHAR,
-            active_flag INTEGER,
+            severity VARCHAR, src_key_cols VARCHAR, element_name VARCHAR,
+            act_ind INTEGER,
             universe_version VARCHAR, universe_year INTEGER, dgr_nbr VARCHAR,
             issue_category_name VARCHAR, business_rule VARCHAR, rule_description VARCHAR,
             created_by VARCHAR, last_updated_by VARCHAR,
-            created_at TIMESTAMP DEFAULT current_timestamp,
-            updated_at TIMESTAMP
+            load_datetime TIMESTAMP DEFAULT current_timestamp,
+            last_updated_datetime TIMESTAMP
         )
     """)
 
     conn.execute("""
         CREATE TABLE gre_exceptions (
-            record_id BIGINT, run_id VARCHAR, rule_id INTEGER, database_name VARCHAR, table_name VARCHAR,
+            record_id BIGINT, run_id VARCHAR, rule_id INTEGER, database_name VARCHAR, src_tbl_nm VARCHAR,
             project_name VARCHAR, process_name VARCHAR,
             element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
             run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
             etl_load_dt DATE, etl_last_updt_dt TIMESTAMP,
-            natural_key_value VARCHAR,
-            rule_name VARCHAR, dgr_nbr VARCHAR, universe_version VARCHAR,
+            src_key_value VARCHAR,
+            rule_nm VARCHAR, dgr_nbr VARCHAR, universe_version VARCHAR,
             run_type VARCHAR, batch_schedule VARCHAR,
-            created_at TIMESTAMP DEFAULT current_timestamp,
-            last_updated_by VARCHAR, updated_at TIMESTAMP
+            load_datetime TIMESTAMP DEFAULT current_timestamp,
+            last_updated_by VARCHAR, last_updated_datetime TIMESTAMP
         )
     """)
-    conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, run_key, natural_key_value)")
+    conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, run_key, src_key_value)")
 
     conn.execute("""
         CREATE TABLE gre_log (
@@ -136,7 +136,7 @@ def _conn():
             project_name VARCHAR, process_name VARCHAR,
             run_key VARCHAR, seq_no INTEGER, start_time TIMESTAMP, end_time TIMESTAMP,
             status VARCHAR, rowcount BIGINT, error_message VARCHAR,
-            created_at TIMESTAMP DEFAULT current_timestamp
+            load_datetime TIMESTAMP DEFAULT current_timestamp
         )
     """)
 
@@ -166,24 +166,24 @@ def _conn():
             run_key VARCHAR, rule_variant VARCHAR,
             started_at TIMESTAMP, ended_at TIMESTAMP, status VARCHAR,
             total_rules INTEGER, rules_succeeded INTEGER, rules_errored INTEGER,
-            triggered_by VARCHAR, created_at TIMESTAMP DEFAULT current_timestamp
+            triggered_by VARCHAR, load_datetime TIMESTAMP DEFAULT current_timestamp
         )
     """)
 
     return conn
 
 
-def _insert_rule(conn, rule_id, rule_sql, seq_no, sequencing_mode="independent",
+def _insert_rule(conn, rule_id, rule_syntax, seq_no, sequencing_mode="independent",
                   on_failure="skip_and_continue", rule_group="claims_dq", rule_variant=None,
                   project_name="HEALTHSPRING_UM", process_name="UNIVERSE_VALIDATION",
                   sql_dialect="teradata"):
     conn.execute("""
         INSERT INTO gre_rules (
-            rule_id, rule_name, database_name, table_name, sql_dialect, rule_sql,
+            rule_id, rule_nm, database_name, src_tbl_nm, sql_dialect, rule_syntax,
             project_name, process_name, rule_group, rule_variant, seq_no, sequencing_mode, on_failure,
-            natural_key_columns, active_flag
+            src_key_cols, act_ind
         ) VALUES (?, ?, 'main', 'claims', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claim_id', 1)
-    """, [rule_id, f"rule {rule_id}", sql_dialect, rule_sql, project_name, process_name, rule_group,
+    """, [rule_id, f"rule {rule_id}", sql_dialect, rule_syntax, project_name, process_name, rule_group,
           rule_variant, seq_no, sequencing_mode, on_failure])
 
 
@@ -292,7 +292,7 @@ def test_no_rules_returns_no_rules_status():
 
 
 def test_shared_total_cache_avoids_redundant_count_queries_across_rules(monkeypatch):
-    # Two rules in the same group, same database_name/table_name, same
+    # Two rules in the same group, same database_name/src_tbl_nm, same
     # run_params -- _compute_total() auto-builds the identical
     # database.table + WHERE batch_id = '{run_key}' query for both, so within one
     # run_rule_group() call that COUNT(*) should only actually run once.
@@ -319,7 +319,7 @@ def test_shared_total_cache_avoids_redundant_count_queries_across_rules(monkeypa
     assert summary["results"][1] == "SUCCESS"
     assert summary["results"][2] == "SUCCESS"
     # _run_source_query is only used by _compute_total() in this flow (the
-    # rule_sql/failed-count path uses execute_query/_count_failed directly)
+    # rule_syntax/failed-count path uses execute_query/_count_failed directly)
     # -- one call total proves the second rule's total was served from cache.
     assert calls["n"] == 1
 
@@ -364,7 +364,7 @@ def test_rule_variant_requested_runs_universal_plus_matching_variant():
 
 # ── run_params threading (v2 scoping) ────────────────────────────────────
 
-def test_run_params_extra_key_is_available_to_every_rule_sql():
+def test_run_params_extra_key_is_available_to_every_rule_syntax():
     conn = _conn()
     # run_type must be a real column -- every run_params key also becomes
     # an equality filter for the auto-generated total-record count (see

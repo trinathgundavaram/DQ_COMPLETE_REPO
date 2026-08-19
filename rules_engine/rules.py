@@ -62,7 +62,7 @@ def load_rules(meta_conn, meta_db: str, rule_group: str, rule_variant: str = Non
             SELECT *
             FROM {meta_db}.gre_rules
             WHERE rule_group   = ?
-              AND active_flag  = 1
+              AND act_ind      = 1
               AND (rule_variant IS NULL OR rule_variant = ?)
             ORDER BY seq_no ASC, rule_id ASC
         """
@@ -72,7 +72,7 @@ def load_rules(meta_conn, meta_db: str, rule_group: str, rule_variant: str = Non
             SELECT *
             FROM {meta_db}.gre_rules
             WHERE rule_group   = ?
-              AND active_flag  = 1
+              AND act_ind      = 1
               AND rule_variant IS NULL
             ORDER BY seq_no ASC, rule_id ASC
         """

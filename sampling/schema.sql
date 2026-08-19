@@ -37,14 +37,14 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_config (
     scope_sql            CLOB,                    -- WHERE-fragment; may embed any number of
                                                     -- "{key}" tokens (e.g. {run_date}, {year}),
                                                     -- substituted from run_params the same way
-                                                    -- rules_engine's rule_sql is -- see
+                                                    -- rules_engine's rule_syntax is -- see
                                                     -- shared/db_ops.py::_substitute_params().
                                                     -- Defaults to '1=1' (whole table) if unset.
                                                     -- Kept as an explicit, hand-authored WHERE-
                                                     -- fragment (unlike rules_engine/schema.sql's
                                                     -- gre_rules, which has no scope_sql at all --
                                                     -- its total-record count is auto-derived from
-                                                    -- run_params + database_name.table_name)
+                                                    -- run_params + database_name.src_tbl_nm)
                                                     -- because "which rows are this cycle's
                                                     -- candidates" isn't always a plain equality
                                                     -- filter (exclusions, date ranges, ...).
@@ -58,8 +58,13 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_config (
                                                     -- expression, lowest = highest priority
     rounding_mode          VARCHAR(10) DEFAULT 'FLOOR',  -- 'FLOOR'|'ROUND'|'CEIL'
     schedule_cron            VARCHAR(50),
-    active_flag                BYTEINT DEFAULT 1,
-    created_at                   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    act_ind                    BYTEINT DEFAULT 1,
+    created_by                   VARCHAR(100),      -- purely descriptive/audit; mirrors
+                                                    -- gre_rules.created_by for the same
+                                                    -- reason -- see rules_engine/schema.sql
+    last_updated_by                VARCHAR(100),    -- purely descriptive/audit; mirrors
+                                                    -- gre_rules.last_updated_by
+    load_datetime                TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 PRIMARY INDEX (config_id);
 
@@ -118,7 +123,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selections (
     excluded_flag                 BYTEINT DEFAULT 0,
     exclusion_reason                 VARCHAR(500),
     selected_flag                       BYTEINT DEFAULT 0,
-    created_at                             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    load_datetime                          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 PRIMARY INDEX (sample_run_id);
 
@@ -141,6 +146,6 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selection_attrs (
     strata_id             INTEGER NOT NULL,
     level_order            INTEGER,          -- denormalized for ordered reads without a join
     bucket_value              VARCHAR(200),
-    created_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    load_datetime                TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 PRIMARY INDEX (sample_run_id, case_key);

@@ -20,15 +20,15 @@ def _conn():
     conn = duckdb.connect(":memory:")
     conn.execute("""
         CREATE TABLE gre_exceptions (
-            record_id BIGINT, run_id VARCHAR, rule_id INTEGER, table_name VARCHAR,
+            record_id BIGINT, run_id VARCHAR, rule_id INTEGER, src_tbl_nm VARCHAR,
             element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
             run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
             etl_load_dt DATE, etl_last_updt_dt TIMESTAMP,
-            natural_key_value VARCHAR, created_at TIMESTAMP DEFAULT current_timestamp
+            src_key_value VARCHAR, load_datetime TIMESTAMP DEFAULT current_timestamp
         )
     """)
-    conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, run_key, natural_key_value)")
+    conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, run_key, src_key_value)")
     return conn
 
 
@@ -101,8 +101,8 @@ def test_bulk_insert_batches_across_multiple_chunks():
     rows = [["RUN", i, "t", "e", "s", f"issue {i}", "B1", f"claim_id=C{i}"] for i in range(7)]
     sql = """
         INSERT INTO gre_exceptions (
-            run_id, rule_id, table_name, element_name, source_name,
-            issue_desc, run_key, natural_key_value
+            run_id, rule_id, src_tbl_nm, element_name, source_name,
+            issue_desc, run_key, src_key_value
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
     bulk_insert(conn, sql, rows, chunk_size=2)   # 7 rows, chunk_size=2 -> 4 chunks
@@ -114,8 +114,8 @@ def test_bulk_insert_or_skip_chunk_falls_back_on_duplicate():
     conn = _conn()
     sql = """
         INSERT INTO gre_exceptions (
-            run_id, rule_id, table_name, element_name, source_name,
-            issue_desc, run_key, natural_key_value
+            run_id, rule_id, src_tbl_nm, element_name, source_name,
+            issue_desc, run_key, src_key_value
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
     first = [["RUN1", 1, "t", "e", "s", "d", "B1", "claim_id=C1"],
@@ -136,5 +136,5 @@ def test_bulk_insert_or_skip_chunk_falls_back_on_duplicate():
 
     total = execute_query(conn, "SELECT COUNT(*) AS cnt FROM gre_exceptions")[0]["cnt"]
     assert total == 3   # C1, C2, C3 -- no duplicate row, no lost row
-    keys = {r["natural_key_value"] for r in execute_query(conn, "SELECT natural_key_value FROM gre_exceptions")}
+    keys = {r["src_key_value"] for r in execute_query(conn, "SELECT src_key_value FROM gre_exceptions")}
     assert keys == {"claim_id=C1", "claim_id=C2", "claim_id=C3"}

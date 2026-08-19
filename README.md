@@ -109,7 +109,7 @@ print(result["status"], result["selected"], "/", result["target_volume"])
 
 `run_key` is deliberately NOT merged into `run_params` -- `run_params` is
 a completely free-form dict used only for `{key}` substitution in
-`rule_sql`/`scope_sql`/`exclusion_sql`, and doubles as the equality
+`rule_syntax`/`scope_sql`/`exclusion_sql`, and doubles as the equality
 filters for the auto-generated total-record count. If a rule's SQL needs
 to reference the run's tracking value as a literal column filter, pass it
 explicitly via `run_params` under whatever key matches an actual column
@@ -221,7 +221,7 @@ Teradata/Postgres/etc. connection is needed.
 |---|---|
 | `test_shared_config.py` | `shared/config.py` -- `.env` loading, metadata connection/db resolution, batch-readiness checks. |
 | `test_shared_db_ops.py` | `shared/db_ops.py` -- bulk writes with duplicate-key tolerance, `{key}` run_params substitution (`_substitute_params`/`build_run_key`). |
-| `test_rules_engine_rules.py` | `rules_engine/rules.py` -- `load_rules()`'s group/active_flag filtering, ordering, and `rule_variant` selection (universal vs. exact-match). |
+| `test_rules_engine_rules.py` | `rules_engine/rules.py` -- `load_rules()`'s group/act_ind filtering, ordering, and `rule_variant` selection (universal vs. exact-match). |
 | `test_rules_engine_executor.py` | `rules_engine/executor.py` -- threshold evaluation, natural-key building, `execute_rule()` end-to-end, the single-scan/memoized-total big-dataset path, run_params substitution and its fail-fast `PARAM_SUBSTITUTION_ERROR`. |
 | `test_rules_engine_runner.py` | `rules_engine/runner.py` -- checkpoint/resume, `sequencing_mode` (`halt_group` vs. `skip_and_continue`), the shared `total_cache`, `rule_variant` end-to-end, `run_params` threading. |
 | `test_sampling.py` | `sampling/sampling.py` -- rounding modes, selection methods, recursive stratification, candidate pull (including the `exclusion_sql` run_params fix), `run_sampling()` end-to-end, and a frozen regression fixture proving output still matches the originally-validated UM sample. |

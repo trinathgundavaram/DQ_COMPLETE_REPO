@@ -19,7 +19,7 @@ import pytest
 
 import rules_engine.executor as rules_engine_executor
 from rules_engine.executor import (
-    evaluate_threshold, build_natural_key,
+    evaluate_threshold, build_src_key,
     execute_rule, _compute_total, _scan_violations,
 )
 from shared.db_ops import execute_query
@@ -49,7 +49,7 @@ class _Adapter:
         pass   # no-op, same default as SourceAdapter -- these tests use real tables
 
     def qualified_name(self, rule: dict) -> str:
-        return f"{rule['database_name']}.{rule['table_name']}"
+        return f"{rule['database_name']}.{rule['src_tbl_nm']}"
 
 
 class _CursorCountingWrapper(_Adapter):
@@ -87,20 +87,20 @@ def _conn():
 
     conn.execute("""
         CREATE TABLE gre_exceptions (
-            record_id BIGINT, run_id VARCHAR, rule_id INTEGER, database_name VARCHAR, table_name VARCHAR,
+            record_id BIGINT, run_id VARCHAR, rule_id INTEGER, database_name VARCHAR, src_tbl_nm VARCHAR,
             project_name VARCHAR, process_name VARCHAR,
             element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
             run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
             etl_load_dt DATE, etl_last_updt_dt TIMESTAMP,
-            natural_key_value VARCHAR,
-            rule_name VARCHAR, dgr_nbr VARCHAR, universe_version VARCHAR,
+            src_key_value VARCHAR,
+            rule_nm VARCHAR, dgr_nbr VARCHAR, universe_version VARCHAR,
             run_type VARCHAR, batch_schedule VARCHAR,
             created_at TIMESTAMP DEFAULT current_timestamp,
             last_updated_by VARCHAR, updated_at TIMESTAMP
         )
     """)
-    conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, run_key, natural_key_value)")
+    conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, run_key, src_key_value)")
 
     conn.execute("""
         CREATE TABLE gre_log (
@@ -138,14 +138,14 @@ def _conn():
 def _rule(**overrides):
     rule = {
         "rule_id": 1,
-        "rule_name": "Denied claim missing denial_reason",
+        "rule_nm": "Denied claim missing denial_reason",
         "database_name": "main",   # DuckDB's default schema -- see _conn()
-        "table_name": "claims",
+        "src_tbl_nm": "claims",
         "sql_dialect": "teradata",   # also picks the one connection this rule runs against
-        "rule_sql": "SELECT claim_id, denial_reason FROM claims "
+        "rule_syntax": "SELECT claim_id, denial_reason FROM claims "
                     "WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
         # No scope_sql column anymore -- _compute_total() auto-builds the
-        # total-record count from database_name.table_name filtered by
+        # total-record count from database_name.src_tbl_nm filtered by
         # every key in run_params (batch_id included), so passing
         # run_params={"batch_id": "B1"} alone is enough to batch-scope the
         # total the same way the old explicit scope_sql override used to.
@@ -160,7 +160,7 @@ def _rule(**overrides):
         "threshold_count": None,
         "threshold_operator": "OR",
         "severity": "Data Validation Error",
-        "natural_key_columns": "claim_id",
+        "src_key_cols": "claim_id",
         "element_name": "denial_reason",
     }
     rule.update(overrides)
@@ -219,18 +219,18 @@ def test_no_threshold_fallback_requires_every_record_to_fail():
     assert v2["threshold_pct_used"] is None and v2["threshold_count_used"] is None
 
 
-# ── natural key ────────────────────────────────────────────────────────
+# ── src key ────────────────────────────────────────────────────────
 
-def test_build_natural_key():
-    rule = _rule(natural_key_columns="claim_id, denial_reason")
-    key = build_natural_key(rule, {"claim_id": "C1", "denial_reason": None})
+def test_build_src_key():
+    rule = _rule(src_key_cols="claim_id, denial_reason")
+    key = build_src_key(rule, {"claim_id": "C1", "denial_reason": None})
     assert key == "claim_id=C1|denial_reason=NULL"
 
 
-def test_build_natural_key_requires_columns():
-    rule = _rule(natural_key_columns="")
+def test_build_src_key_requires_columns():
+    rule = _rule(src_key_cols="")
     with pytest.raises(ValueError):
-        build_natural_key(rule, {"claim_id": "C1"})
+        build_src_key(rule, {"claim_id": "C1"})
 
 
 # ── execute_rule end-to-end ──────────────────────────────────────────────
@@ -244,7 +244,7 @@ def test_execute_rule_writes_exceptions_and_result():
 
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(exceptions) == 2
-    assert {r["natural_key_value"] for r in exceptions} == {"claim_id=C1", "claim_id=C3"}
+    assert {r["src_key_value"] for r in exceptions} == {"claim_id=C1", "claim_id=C3"}
     assert all(r["project_name"] == "HEALTHSPRING_UM" and r["process_name"] == "UNIVERSE_VALIDATION"
                for r in exceptions)
 
@@ -314,7 +314,7 @@ def test_execute_rule_no_threshold_fallback_not_written_when_partial_failure():
 
 def test_execute_rule_sql_error_routes_to_errors_and_logs():
     conn = _conn()
-    rule = _rule(rule_sql="SELECT * FROM no_such_table WHERE batch_id = '{batch_id}'")
+    rule = _rule(rule_syntax="SELECT * FROM no_such_table WHERE batch_id = '{batch_id}'")
 
     status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     assert status == "ERROR"
@@ -332,15 +332,15 @@ def test_execute_rule_sql_error_routes_to_errors_and_logs():
 
 # ── big-dataset path: dedup + true-count/capped-fetch split ──────────────
 
-def test_write_exceptions_dedupes_natural_key_within_one_pull():
+def test_write_exceptions_dedupes_src_key_within_one_pull():
     conn = _conn()
-    # A rule_sql that returns the SAME claim_id twice in one pull (e.g. a
+    # A rule_syntax that returns the SAME claim_id twice in one pull (e.g. a
     # join fan-out) should still only write ONE gre_exceptions row per
-    # natural key. The true failed_records count (a COUNT(*) on rule_sql
-    # itself) legitimately counts every row rule_sql returns, duplicates
+    # src key. The true failed_records count (a COUNT(*) on rule_syntax
+    # itself) legitimately counts every row rule_syntax returns, duplicates
     # included -- it's the exception-DETAIL rows that get deduplicated.
     rule = _rule(
-        rule_sql="SELECT claim_id, denial_reason FROM claims "
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
                  "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' "
                  "UNION ALL "
                  "SELECT claim_id, denial_reason FROM claims "
@@ -351,11 +351,11 @@ def test_write_exceptions_dedupes_natural_key_within_one_pull():
 
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(exceptions) == 2   # C1, C3 -- deduped, not 4, even though the pull returned each twice
-    assert {r["natural_key_value"] for r in exceptions} == {"claim_id=C1", "claim_id=C3"}
+    assert {r["src_key_value"] for r in exceptions} == {"claim_id=C1", "claim_id=C3"}
 
     results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(results) == 1
-    assert results[0]["failed_records"] == 4   # true COUNT(*) on rule_sql counts every returned row
+    assert results[0]["failed_records"] == 4   # true COUNT(*) on rule_syntax counts every returned row
 
 
 def test_max_exceptions_cap_keeps_failed_records_true_but_caps_detail_rows(monkeypatch):
@@ -379,14 +379,14 @@ def test_max_exceptions_cap_keeps_failed_records_true_but_caps_detail_rows(monke
 # ── source prepare (STEP 0 of execute_rule) ──────────────────────────────
 
 def test_execute_rule_prepare_failure_routes_to_errors_before_any_query():
-    # A file/S3 rule whose prepare() fails (e.g. missing table_name) must
+    # A file/S3 rule whose prepare() fails (e.g. missing src_tbl_nm) must
     # fail BEFORE any query runs -- same fail-fast contract the old dialect
     # guard had, now covering source setup instead of a dialect mismatch.
     conn = _conn()
 
     class _FailingAdapter(_Adapter):
         def prepare(self, rule):
-            raise ValueError("table_name is empty -- cannot prepare file source.")
+            raise ValueError("src_tbl_nm is empty -- cannot prepare file source.")
 
     rule = _rule(threshold_pct=25)
     status = execute_rule(rule, _FailingAdapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
@@ -422,12 +422,12 @@ def test_execute_rule_calls_prepare_before_scanning():
     assert calls == [1]
 
 
-# ── _compute_total: auto-derived from database_name.table_name + run_params ──
+# ── _compute_total: auto-derived from database_name.src_tbl_nm + run_params ──
 
 def test_compute_total_auto_filters_by_every_run_params_key():
     # No scope_sql anywhere -- _compute_total() builds
     # "SELECT COUNT(*) FROM main.claims WHERE batch_id = '...'" straight
-    # from database_name/table_name + run_params, same as the old explicit
+    # from database_name/src_tbl_nm + run_params, same as the old explicit
     # scope_sql override used to, with nothing hand-written.
     conn = _conn()
     rule = _rule()
@@ -446,15 +446,15 @@ def test_compute_total_multiple_run_params_keys_are_anded_together():
     assert _compute_total(_Adapter(conn), rule, {"batch_id": "B1", "claim_id": "NO_SUCH_ID"}, total_cache=None) == 0
 
 
-def test_compute_total_uses_database_name_and_table_name():
+def test_compute_total_uses_database_name_and_src_tbl_nm():
     conn = _conn()
-    rule = _rule(database_name="main", table_name="claims")
+    rule = _rule(database_name="main", src_tbl_nm="claims")
     assert _compute_total(_Adapter(conn), rule, {"batch_id": "B1"}, total_cache=None) == 4
 
-    # A wrong database_name/table_name should surface as a real query
+    # A wrong database_name/src_tbl_nm should surface as a real query
     # failure, not silently return something -- proves the auto-built
     # query actually uses the fields, not a hardcoded table reference.
-    bad_rule = _rule(database_name="main", table_name="no_such_table")
+    bad_rule = _rule(database_name="main", src_tbl_nm="no_such_table")
     with pytest.raises(Exception):
         _compute_total(_Adapter(conn), bad_rule, {"batch_id": "B1"}, total_cache=None)
 
@@ -535,7 +535,7 @@ def test_scan_violations_issues_exactly_one_query():
 
 def test_execute_rule_issues_two_source_queries_not_three():
     # Old design per rule: a COUNT(*)-wrapped query + a detail-row fetch
-    # query (both running rule_sql) + the total-record query = 3 source-side
+    # query (both running rule_syntax) + the total-record query = 3 source-side
     # queries. New design: one merged scan (_scan_violations) + the total
     # query = 2. (A rule_group with several rules sharing the same table
     # drops this further via total_cache -- see test_rules_engine_runner.py's
@@ -556,11 +556,11 @@ def test_execute_rule_uses_extra_run_params_key_beyond_batch_id():
     # run_type must be a REAL column: every key in run_params also becomes
     # an equality filter for the auto-generated total-record count (see
     # _build_total_query()), so an extra run_params key has to name an
-    # actual column on the rule's table, not just something rule_sql
+    # actual column on the rule's table, not just something rule_syntax
     # happens to reference inline.
     conn.execute("ALTER TABLE claims ADD COLUMN run_type VARCHAR DEFAULT 'MONTHLY'")
     rule = _rule(
-        rule_sql="SELECT claim_id, denial_reason FROM claims "
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
                  "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' AND '{run_type}' = 'MONTHLY'",
     )
     status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1", "run_type": "MONTHLY"}, META_DB)
@@ -571,14 +571,14 @@ def test_execute_rule_uses_extra_run_params_key_beyond_batch_id():
 
 
 def test_execute_rule_unresolved_token_fails_fast_before_any_query():
-    # rule_sql references {run_type}, but the caller's run_params doesn't
+    # rule_syntax references {run_type}, but the caller's run_params doesn't
     # supply it -- must fail BEFORE the scan/count queries run, logged as
     # PARAM_SUBSTITUTION_ERROR, never as a confusing SQL syntax error from
     # the source database.
     conn = _conn()
     wrapped_db = _CursorCountingWrapper(conn)
     rule = _rule(
-        rule_sql="SELECT claim_id, denial_reason FROM claims "
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
                  "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' AND run_type = '{run_type}'",
     )
 
@@ -603,7 +603,7 @@ def test_execute_rule_unresolved_token_fails_fast_before_any_query():
 def test_execute_rule_with_year_month_run_key_not_batch_id():
     # run_key doesn't have to be a "batch" at all -- a year+month composite
     # (built via shared/db_ops.py::build_run_key()) works identically, and
-    # run_params contains NO "batch_id" key anywhere -- rule_sql here
+    # run_params contains NO "batch_id" key anywhere -- rule_syntax here
     # doesn't reference {batch_id}, proving run_key is fully decoupled
     # from run_params.
     from shared.db_ops import build_run_key
@@ -612,14 +612,14 @@ def test_execute_rule_with_year_month_run_key_not_batch_id():
     assert run_key == "2026_8"
 
     rule = _rule(
-        rule_sql="SELECT claim_id, denial_reason FROM claims WHERE denial_reason IS NULL",
+        rule_syntax="SELECT claim_id, denial_reason FROM claims WHERE denial_reason IS NULL",
         threshold_pct=25,
     )
     status = execute_rule(rule, _Adapter(conn), conn, "RUN1", run_key, {}, META_DB)
     assert status == "SUCCESS"
 
     exceptions = execute_query(conn, f"SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = '{run_key}'")
-    assert len(exceptions) == 3   # C1, C3, C5 -- no batch_id filter in rule_sql this time
+    assert len(exceptions) == 3   # C1, C3, C5 -- no batch_id filter in rule_syntax this time
 
     results = execute_query(conn, f"SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = '{run_key}'")
     assert len(results) == 1
@@ -628,11 +628,11 @@ def test_execute_rule_with_year_month_run_key_not_batch_id():
     assert len(logs) == 1 and logs[0]["status"] == "SUCCESS"
 
 
-# ── descriptive/reporting columns: rule_name/dgr_nbr/universe_version, ───
+# ── descriptive/reporting columns: rule_nm/dgr_nbr/universe_version, ───
 # ── run_type/batch_schedule ───────────────────────────────────────────────
 
 def test_execute_rule_copies_rule_name_dgr_nbr_universe_version_onto_exceptions():
-    # rule_name/dgr_nbr/universe_version are copied straight from the rule
+    # rule_nm/dgr_nbr/universe_version are copied straight from the rule
     # row onto every gre_exceptions row it writes -- purely descriptive,
     # never read by engine logic (execute_rule() doesn't branch on them).
     conn = _conn()
@@ -643,7 +643,7 @@ def test_execute_rule_copies_rule_name_dgr_nbr_universe_version_onto_exceptions(
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1")
     assert len(exceptions) == 2
     for exc in exceptions:
-        assert exc["rule_name"] == rule["rule_name"]
+        assert exc["rule_nm"] == rule["rule_nm"]
         assert exc["dgr_nbr"] == "CDAG1V22R4"
         assert exc["universe_version"] == "V22"
 

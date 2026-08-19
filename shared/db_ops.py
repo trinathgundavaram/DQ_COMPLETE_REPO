@@ -173,12 +173,12 @@ def bulk_insert_or_skip(conn, sql: str, rows: list, chunk_size: int = None) -> i
     """
     Chunked executemany() with duplicate-key tolerance -- the bulk analog of
     _insert_or_skip(), used by rules_engine/executor.py for gre_exceptions
-    where gre_exceptions_uix (rule_id, run_key, natural_key_value) is what
+    where gre_exceptions_uix (rule_id, run_key, src_key_value) is what
     makes a rerun idempotent.
 
     Tries each chunk as one executemany() batch first (cheap: one round
     trip for up to `chunk_size` rows). If a chunk raises -- in practice
-    almost always because one row in it collides with a natural key
+    almost always because one row in it collides with a src key
     committed by an EARLIER attempt on this run_key -- it falls back to
     row-by-row _insert_or_skip() for JUST that chunk, so one stale
     duplicate never costs the other rows in the same run. Any non
@@ -253,8 +253,8 @@ def _escape_sql_literal(value) -> str:
     """
     Escape a value for embedding inside a single-quoted SQL string literal
     -- doubles embedded single quotes, and treats None as an empty string.
-    Shared by _substitute_params() below (rule_sql/scope_sql/exclusion_sql
-    token substitution) and rules_engine/reporting.py's natural-key
+    Shared by _substitute_params() below (rule_syntax/scope_sql/exclusion_sql
+    token substitution) and rules_engine/reporting.py's src-key
     tie-back query builder, so there is exactly one escaping
     implementation, not two that could quietly drift apart.
     """

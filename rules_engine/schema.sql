@@ -19,10 +19,22 @@
 -- shared/schema.sql) or any gre_sampling_*/gre_sample_* table (see
 -- sampling/schema.sql).
 --
+-- Column naming: this file's column names follow the vocabulary of an
+-- existing rule-catalog/exception-tracking table pair
+-- (HSABC_DEV_V.CMS_UNIVERSE_RULESENGINE / REPORTING_DEV_V.CMS_RULESENGINE)
+-- rather than a from-scratch convention -- rule_syntax/src_tbl_nm/rule_nm/
+-- act_ind/load_datetime/last_updated_datetime/src_key_cols/src_key_value
+-- below are this engine's own required columns wearing that vocabulary's
+-- names; universe_version/universe_year/dgr_nbr/issue_category_name/
+-- business_rule/rule_description/created_by/last_updated_by are additional
+-- descriptive columns added on top of it (see the gre_rules/gre_exceptions
+-- comments below for the full list). run_key stays run_key, NOT batch_id --
+-- see the run_key design note below for why.
+--
 -- Design notes (see rules_engine/config usage via shared/config.py,
 -- rules_engine/executor.py docstrings for the code that relies on these
 -- shapes):
---   * rule_sql may embed any number of "{key}" tokens (e.g. "{run_date}",
+--   * rule_syntax may embed any number of "{key}" tokens (e.g. "{run_date}",
 --     "{year}", "{run_type}"). The engine string-substitutes each one
 --     (quoted, escaped) from the run_params dict passed to this run --
 --     see shared/db_ops.py::_substitute_params(). run_params has NO
@@ -38,14 +50,14 @@
 --     self-contained -- an unresolved "{token}" fails the rule attempt
 --     immediately (PARAM_SUBSTITUTION_ERROR) rather than reaching the
 --     source database as a syntax error.
---   * database_name + table_name give the auto-generated total-record
+--   * database_name + src_tbl_nm give the auto-generated total-record
 --     count query (see below) a fully-qualified FROM. There is no
---     separate scope_sql column: the run_params dict that scopes rule_sql
---     already IS the definition of what's in scope for this run, so a
---     second, independently hand-written WHERE clause was pure
+--     separate scope_sql column: the run_params dict that scopes
+--     rule_syntax already IS the definition of what's in scope for this
+--     run, so a second, independently hand-written WHERE clause was pure
 --     duplication (and a real drift risk -- the two could silently
 --     disagree). Every key present in run_params is applied as an equality
---     filter against database_name.table_name, AND'd together -- see
+--     filter against database_name.src_tbl_nm, AND'd together -- see
 --     rules_engine/executor.py::_build_total_query(). A project whose
 --     table doesn't carry a column for one of its run_params keys should
 --     not pass that key for rules on this table.
@@ -54,13 +66,13 @@
 --     runs against -- db/connection_factory.py builds exactly one
 --     connection per source_type, so a rule needs nothing more than its
 --     dialect to pick its source.
---   * natural_key_columns is this engine's analog of dq_rules'
---     primary_key_columns: a comma-separated list of column names present
---     in the rule's own SELECT output, used to build a deterministic
---     natural_key_value for each violating row so reruns are idempotent
---     (UNIQUE INDEX below), mirroring the dq_metrics_summary_uix pattern:
---     catch the duplicate-key error and skip/update rather than
---     delete-then-insert, which leaves a crash-mid-delete window.
+--   * src_key_cols is this engine's analog of dq_rules' primary_key_columns:
+--     a comma-separated list of column names present in the rule's own
+--     SELECT output, used to build a deterministic src_key_value for each
+--     violating row so reruns are idempotent (UNIQUE INDEX below),
+--     mirroring the dq_metrics_summary_uix pattern: catch the
+--     duplicate-key error and skip/update rather than delete-then-insert,
+--     which leaves a crash-mid-delete window.
 --   * rule_variant adds ONE additional generic level on top of
 --     project/table (rule_group) for selecting which rules run: NULL
 --     means the rule always applies within its rule_group; a non-NULL
@@ -69,7 +81,7 @@
 --     This is deliberately a single freeform column, not separate
 --     hardcoded year/run_type columns -- a project needing more than one
 --     dimension composes a single string (e.g. "2026|MONTHLY"), the same
---     "SQL/config authors are self-contained" philosophy as rule_sql
+--     "SQL/config authors are self-contained" philosophy as rule_syntax
 --     above.
 --   * project_name / process_name are descriptive/reporting dimensions,
 --     NOT a second filter key -- rule_group stays the one literal column
@@ -88,13 +100,13 @@
 -- ── 1. gre_rules -- one row per rule ──────────────────────────────────────
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_rules (
     rule_id              INTEGER NOT NULL,
-    rule_name            VARCHAR(500) NOT NULL,
+    rule_nm              VARCHAR(500) NOT NULL,
     database_name        VARCHAR(200) NOT NULL,    -- teradata/postgres: schema the table lives in.
                                                     -- file: the directory. s3: the s3:// prefix/bucket.
-                                                    -- Combined with table_name for the auto total-record
+                                                    -- Combined with src_tbl_nm for the auto total-record
                                                     -- count query (db/connection_factory.py's
                                                     -- SourceAdapter.qualified_name()).
-    table_name           VARCHAR(200) NOT NULL,    -- teradata/postgres: table name. file: filename.
+    src_tbl_nm           VARCHAR(200) NOT NULL,    -- teradata/postgres: table name. file: filename.
                                                     -- s3: object key/glob. The metadata table IS the
                                                     -- source path for file/s3 rules -- no separate setup.
     sql_dialect          VARCHAR(20)  NOT NULL,   -- 'teradata' | 'postgres' | 's3' | 'file' -- ALSO
@@ -102,10 +114,10 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_rules (
                                                     -- against (see db/connection_factory.py -- exactly
                                                     -- one connection per value, no separate named-
                                                     -- connection column).
-    rule_sql             CLOB NOT NULL,            -- the negative SELECT; never mutates data. For a
+    rule_syntax          CLOB NOT NULL,            -- the negative SELECT; never mutates data. For a
                                                     -- file/s3 rule, FROM the view name
-                                                    -- db/connection_factory.py::_view_name(table_name)
-                                                    -- derives from table_name.
+                                                    -- db/connection_factory.py::_view_name(src_tbl_nm)
+                                                    -- derives from src_tbl_nm.
     project_name         VARCHAR(100) NOT NULL,    -- e.g. HEALTHSPRING_UM -- reporting/scoping dimension,
                                                     -- NOT the filter key load_rules() uses (see design
                                                     -- notes above); mirrors gre_sampling_config
@@ -121,9 +133,9 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_rules (
     threshold_count      INTEGER,                  -- raw count of failed records that must be exceeded
     threshold_operator   CHAR(3) DEFAULT 'OR',      -- 'OR' | 'AND' -- only relevant if both are set
     severity             VARCHAR(50) DEFAULT 'Data Validation Error',  -- free string, project-defined
-    natural_key_columns  VARCHAR(500) NOT NULL,    -- comma-separated cols from the rule's own SELECT
+    src_key_cols         VARCHAR(500) NOT NULL,    -- comma-separated cols from the rule's own SELECT
     element_name         VARCHAR(200),             -- optional; copied straight into gre_exceptions
-    active_flag          BYTEINT DEFAULT 1,
+    act_ind              BYTEINT DEFAULT 1,
     -- ── Descriptive/reporting columns below -- purely informational, never
     -- read by engine logic (load_rules()/execute_rule() ignore them
     -- entirely). Added to carry a project's own rule-catalog vocabulary
@@ -139,25 +151,25 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_rules (
                                                     -- at write time, see below
     issue_category_name  VARCHAR(200),             -- descriptive issue category (e.g. "Missing Data")
     business_rule        VARCHAR(2000),            -- business-friendly statement of what this rule
-                                                    -- checks -- distinct from rule_sql (the actual SQL)
+                                                    -- checks -- distinct from rule_syntax (the actual SQL)
     rule_description     VARCHAR(2000),            -- longer-form description
     created_by           VARCHAR(100),             -- audit: who/what created this row
     last_updated_by      VARCHAR(100),             -- audit: who/what last modified this row
-    created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at           TIMESTAMP
+    load_datetime            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_updated_datetime    TIMESTAMP
 )
 PRIMARY INDEX (rule_id);
 
 -- rules_engine/rules.py::load_rules() always filters on exactly these
 -- three columns -- covers that lookup without a full-table scan.
-CREATE INDEX gre_rules_group_variant_ix (rule_group, active_flag, rule_variant)
+CREATE INDEX gre_rules_group_variant_ix (rule_group, act_ind, rule_variant)
 ON CMSUNIV_FILELAND_DEV_T.gre_rules;
 
 -- Reporting/orchestration lookup by project/process (e.g. "which
 -- rule_groups exist for project X" -- see
 -- rules_engine/runner.py::discover_rule_groups()), never load_rules()'s
 -- own lookup -- that one stays on gre_rules_group_variant_ix above.
-CREATE INDEX gre_rules_project_process_ix (project_name, process_name, active_flag)
+CREATE INDEX gre_rules_project_process_ix (project_name, process_name, act_ind)
 ON CMSUNIV_FILELAND_DEV_T.gre_rules;
 
 
@@ -176,7 +188,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_log (
     status           VARCHAR(20),          -- 'SUCCESS' | 'ERROR' -- attempt-level, not the verdict
     rowcount         BIGINT,               -- violating rows written to gre_exceptions this attempt
     error_message    VARCHAR(2000),
-    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    load_datetime    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 PRIMARY INDEX (run_id, rule_id);
 
@@ -188,20 +200,20 @@ ON CMSUNIV_FILELAND_DEV_T.gre_log;
 
 -- ── 3. gre_exceptions -- data findings, engine-populated only ─────────────
 -- Column shape is the legacy INSERT list verbatim (record_id, rule_id,
--- table_name, element_name, source_name, issue_desc, exception_flag,
+-- src_tbl_nm, element_name, source_name, issue_desc, exception_flag,
 -- exception_approver, run_key, etl_is_curr_ind, etl_load_dt,
--- etl_last_updt_dt) plus run_id, database_name, and natural_key_value,
--- which the legacy shape didn't need but this engine's idempotency and
--- source tie-back do. rule_name/dgr_nbr/universe_version/run_type/
--- batch_schedule/last_updated_by/updated_at below extend this further to
+-- etl_last_updt_dt) plus run_id, database_name, and src_key_value, which
+-- the legacy shape didn't need but this engine's idempotency and source
+-- tie-back do. rule_nm/dgr_nbr/universe_version/run_type/batch_schedule/
+-- last_updated_by/last_updated_datetime below extend this further to
 -- match a project's own rule-catalog/audit vocabulary (see gre_rules'
 -- design notes) -- purely descriptive, never read by engine logic.
 --
 -- Deliberately does NOT store the violating row's own data -- only enough
--- to re-identify it (database_name/table_name/source_name +
--- natural_key_value). A row that fails every rule in a 10-rule group
--- would otherwise get its full column set duplicated 10 times, once per
--- rule, for no benefit; instead, rules_engine/reporting.py::
+-- to re-identify it (database_name/src_tbl_nm/source_name +
+-- src_key_value). A row that fails every rule in a 10-rule group would
+-- otherwise get its full column set duplicated 10 times, once per rule,
+-- for no benefit; instead, rules_engine/reporting.py::
 -- get_source_records_for_rule() re-joins back to the LIVE source table at
 -- report/analysis time using this natural key, which costs nothing at
 -- write time and reflects the record as it stands right now (see that
@@ -212,7 +224,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_exceptions (
     run_id                VARCHAR(200),
     rule_id               INTEGER NOT NULL,
     database_name         VARCHAR(200),                 -- copied from gre_rules.database_name
-    table_name            VARCHAR(200),
+    src_tbl_nm            VARCHAR(200),
     project_name          VARCHAR(200),                 -- copied from gre_rules.project_name
     process_name          VARCHAR(200),                 -- copied from gre_rules.process_name
     element_name          VARCHAR(200),
@@ -224,28 +236,28 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_exceptions (
     etl_is_curr_ind       CHAR(1) DEFAULT 'Y',
     etl_load_dt           DATE,
     etl_last_updt_dt      TIMESTAMP,
-    natural_key_value     VARCHAR(1000) NOT NULL,       -- built from rule.natural_key_columns
+    src_key_value         VARCHAR(1000) NOT NULL,       -- built from rule.src_key_cols
     -- ── Descriptive/reporting columns below -- purely informational, never
-    -- read by engine logic. rule_name/dgr_nbr/universe_version are copied
+    -- read by engine logic. rule_nm/dgr_nbr/universe_version are copied
     -- from gre_rules at write time (like element_name/project_name above);
     -- run_type/batch_schedule are copied from run_params IF the caller
     -- supplies those exact keys for this run, else NULL -- see
     -- rules_engine/executor.py::_write_exceptions().
-    rule_name             VARCHAR(500),                 -- copied from gre_rules.rule_name
+    rule_nm               VARCHAR(500),                 -- copied from gre_rules.rule_nm
     dgr_nbr               VARCHAR(50),                  -- copied from gre_rules.dgr_nbr
     universe_version      VARCHAR(50),                  -- copied from gre_rules.universe_version
     run_type              VARCHAR(50),                  -- from run_params["run_type"], if supplied
     batch_schedule        VARCHAR(100),                 -- from run_params["batch_schedule"], if supplied
-    created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    load_datetime             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_updated_by       VARCHAR(100),                 -- audit: who/what last modified this row
-    updated_at            TIMESTAMP
+    last_updated_datetime     TIMESTAMP
 )
 PRIMARY INDEX (record_id);
 
 -- v1: UNIQUE INDEX is the idempotency mechanism -- catch the duplicate-key
 -- error on rerun and skip that row rather than delete-then-insert (same
 -- pattern as dq_metrics_summary_uix).
-CREATE UNIQUE INDEX gre_exceptions_uix (rule_id, run_key, natural_key_value)
+CREATE UNIQUE INDEX gre_exceptions_uix (rule_id, run_key, src_key_value)
 ON CMSUNIV_FILELAND_DEV_T.gre_exceptions;
 
 -- v1: fast lookup by rule_id/run_key -- this is exactly how gre_results

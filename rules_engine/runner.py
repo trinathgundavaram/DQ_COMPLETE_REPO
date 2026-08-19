@@ -144,7 +144,7 @@ def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, run_key, reso
     concurrent execute_rule() call exactly as it is in the sequential
     path. Plain dict get/set/contains are atomic under the GIL, so this
     never corrupts -- the one accepted trade-off is that two rules racing
-    to compute the SAME cache key (identical database_name/table_name/
+    to compute the SAME cache key (identical database_name/src_tbl_nm/
     run_params) for the first time can, rarely, both run the identical
     COUNT(*) query before either has written the result. Both write the
     same correct value either way, so this is a harmless, self-resolving
@@ -275,7 +275,7 @@ def run_rule_group(
                    count (see run_params below), and run_key is often NOT
                    a real column on a rule's table (e.g. a composite like
                    "2026_8"), so auto-injecting it there would silently
-                   break that query for most tables. If a rule_sql needs
+                   break that query for most tables. If a rule_syntax needs
                    to reference the run's tracking value, pass it
                    explicitly via run_params under whatever key matches an
                    actual column.
@@ -286,7 +286,7 @@ def run_rule_group(
     meta_db      : schema the gre_ tables live in; defaults to
                    gre_config.get_meta_db()
     triggered_by : freeform string recorded on gre_audit
-    run_params   : optional dict of named values a rule's rule_sql can
+    run_params   : optional dict of named values a rule's rule_syntax can
                    reference via "{key}" tokens -- passed through exactly
                    as given, no reserved/required key. The SAME dict also
                    becomes the equality filters for the auto-generated
@@ -378,7 +378,7 @@ def run_rule_group(
 
     # Shared for the whole run: several rules in a group often ask the
     # identical "how many rows are in this run" question (same
-    # database_name/table_name and run_params) -- one dict here, threaded
+    # database_name/src_tbl_nm and run_params) -- one dict here, threaded
     # into every execute_rule() call, lets _compute_total() reuse that COUNT(*)
     # result instead of re-scanning the same rows once per rule. See
     # rules_engine/executor.py::_compute_total()'s docstring.
@@ -471,7 +471,7 @@ def discover_rule_groups(meta_conn, meta_db: str, project_name: str = None,
     deterministic run order; callers needing a specific order should sort
     rule_groups themselves before passing them to run_all_active_groups().
     """
-    where = ["active_flag = 1"]
+    where = ["act_ind = 1"]
     params = []
     if project_name is not None:
         where.append("project_name = ?")
@@ -565,7 +565,7 @@ def run_by_process_name(
                    shared.config.get_meta_db() if not supplied.
     project_name : optional further narrowing to one project within this
                    process_name; omit to run every project under it.
-    run_params   : free-form dict for rule_sql {key} substitution -- see
+    run_params   : free-form dict for rule_syntax {key} substitution -- see
                    run_rule_group()'s docstring. run_key is deliberately
                    NOT merged into this.
 

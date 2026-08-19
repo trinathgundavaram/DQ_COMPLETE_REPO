@@ -65,7 +65,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_audit (
     total_candidates                        INTEGER,-- SAMPLING runs only
     total_selected                           INTEGER,-- SAMPLING runs only
     triggered_by                              VARCHAR(100),
-    created_at                                 TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    load_datetime                              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 PRIMARY INDEX (run_id);
 

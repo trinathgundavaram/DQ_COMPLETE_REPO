@@ -32,14 +32,14 @@ proven fix #1 fixes the equivalent problem for the dq_* engine:
      deriving failed_records from a COUNT(*) against the *destination*
      table after the write, ties the accuracy of failed_records to
      whatever exception-detail capture happens to write. _scan_violations()
-     runs rule_sql ONCE, streamed via fetchmany(), producing both a true
+     runs rule_syntax ONCE, streamed via fetchmany(), producing both a true
      failed count (counts every row, uncapped) and a GRE_MAX_EXCEPTIONS-
      capped row list for detail capture from that same pass -- so a rule
      that matches 10 million rows still gets an exact failed_records/
      threshold verdict, with gre_exceptions detail capture bounded to a
      safe, configurable ceiling, instead of trying to hold every row in
      memory. See execute_rule()'s docstring for the trade-off this makes.
-  3. Running rule_sql AGAIN just to count it (a separate COUNT(*)-wrapped
+  3. Running rule_syntax AGAIN just to count it (a separate COUNT(*)-wrapped
      query) means every rule scanned its own base data twice per attempt.
      _scan_violations() replaces that two-query design (formerly
      _count_failed() + _fetch_violating_rows()) with the one combined scan
@@ -93,8 +93,8 @@ def _log_error(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str,
 # as a hard error for this attempt (see execute_rule()'s STEP 1).
 def _scan_violations(db_conn, query: str) -> tuple:
     """
-    Run rule_sql ONCE, streamed via fetchmany(), instead of the old
-    two-query design (a separate COUNT(*)-wrapped query, then rule_sql
+    Run rule_syntax ONCE, streamed via fetchmany(), instead of the old
+    two-query design (a separate COUNT(*)-wrapped query, then rule_syntax
     run again in full to fetch detail rows) -- roughly halving read load
     against the source table/connection for every rule, since both old
     queries evaluated the identical predicate against the identical rows.
@@ -103,7 +103,7 @@ def _scan_violations(db_conn, query: str) -> tuple:
       failed : TRUE count of every row the query returns. This keeps
                counting past MAX_EXCEPTIONS (it just stops appending to
                `rows` once the cap is hit) -- failed_records/threshold
-               math stays exact no matter how many rows rule_sql matches,
+               math stays exact no matter how many rows rule_syntax matches,
                same guarantee the old _count_failed() gave.
       rows   : up to MAX_EXCEPTIONS violating rows (0/negative = unlimited)
                for gre_exceptions detail capture -- same cap/shape the old
@@ -162,18 +162,18 @@ def _scan_violations(db_conn, query: str) -> tuple:
 # Natural key
 # ---------------------------------------------------------------------------
 
-def _format_natural_key(cols: list, row: dict) -> str:
+def _format_src_key(cols: list, row: dict) -> str:
     """
     "col1=val1|col2=val2" for `cols`, in order, from `row` -- the actual
-    encoding logic behind build_natural_key() below, factored out so
+    encoding logic behind build_src_key() below, factored out so
     rules_engine/reporting.py can recompute the identical string from a
     row it fetched straight from the source table (not through a `rule`
     dict), to match it back to the gre_exceptions row it came from.
 
     Explicit None -> 'NULL' (not just a missing-key default) so a
     genuinely NULL key column is stable and human-readable in
-    gre_exceptions.natural_key_value, not the string "None". See
-    parse_natural_key() for the (best-effort) inverse.
+    gre_exceptions.src_key_value, not the string "None". See
+    parse_src_key() for the (best-effort) inverse.
     """
     def _fmt(c):
         v = row.get(c, "NULL")
@@ -181,44 +181,44 @@ def _format_natural_key(cols: list, row: dict) -> str:
     return "|".join(f"{c}={_fmt(c)}" for c in cols)
 
 
-def build_natural_key(rule: dict, row: dict) -> str:
+def build_src_key(rule: dict, row: dict) -> str:
     """
-    "col1=val1|col2=val2" from rule['natural_key_columns'] -- this engine's
+    "col1=val1|col2=val2" from rule['src_key_cols'] -- this engine's
     analog of dq_rules.primary_key_columns / utils/ids.py::build_pk_string.
     Every violating row must produce one of these; it's what makes
-    gre_exceptions_uix (rule_id, run_key, natural_key_value) meaningful.
+    gre_exceptions_uix (rule_id, run_key, src_key_value) meaningful.
     """
-    cols = [c.strip() for c in (rule.get("natural_key_columns") or "").split(",") if c.strip()]
+    cols = [c.strip() for c in (rule.get("src_key_cols") or "").split(",") if c.strip()]
     if not cols:
         raise ValueError(
-            f"rule_id={rule.get('rule_id')} has no natural_key_columns -- "
+            f"rule_id={rule.get('rule_id')} has no src_key_cols -- "
             "every rule must declare one to write idempotent exception rows."
         )
-    return _format_natural_key(cols, row)
+    return _format_src_key(cols, row)
 
 
-def parse_natural_key(natural_key_value: str) -> dict:
+def parse_src_key(src_key_value: str) -> dict:
     """
-    Best-effort inverse of build_natural_key()/_format_natural_key():
+    Best-effort inverse of build_src_key()/_format_src_key():
     "col1=val1|col2=val2" -> {"col1": "val1", "col2": "val2"}, used by
     rules_engine/reporting.py to re-derive the WHERE filter that ties a
     gre_exceptions row back to its source record.
 
     The literal string 'NULL' round-trips back to Python None (matching
-    build_natural_key()'s own encoding of a genuinely NULL key column) --
+    build_src_key()'s own encoding of a genuinely NULL key column) --
     which means a key column whose REAL value is the literal text "NULL"
     is indistinguishable from a true NULL after parsing. This is a
     pre-existing constraint of the delimited-string encoding itself (not
-    introduced here); pick natural_key_columns that won't hold that value.
+    introduced here); pick src_key_cols that won't hold that value.
 
     Splits on the literal "|" and the FIRST "=" in each segment -- key
     column NAMES never contain either, but a key VALUE containing "|"
     will not round-trip correctly, for the same reason. Empty input (a
-    row with no columns, which build_natural_key() never actually
+    row with no columns, which build_src_key() never actually
     produces since it requires at least one column) returns {}.
     """
     parsed = {}
-    for segment in (natural_key_value or "").split("|"):
+    for segment in (src_key_value or "").split("|"):
         if not segment:
             continue
         col, _, val = segment.partition("=")
@@ -333,17 +333,17 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
                        run_params: dict = None) -> int:
     """
     Write every violating row to gre_exceptions via one shared, batched
-    path. Rows are de-duplicated by natural key WITHIN this call first (a
-    rule_sql that legitimately returns the same natural key twice in one
+    path. Rows are de-duplicated by src key WITHIN this call first (a
+    rule_syntax that legitimately returns the same src key twice in one
     pull would otherwise cost a wasted duplicate-key round trip per
     repeat), then written with bulk_insert_or_skip() -- one executemany()
     per GRE_EXCEPTION_CHUNK-sized chunk instead of one INSERT+commit per
     row, falling back to row-by-row only for a chunk that collides with a
-    natural key already committed by an earlier attempt on this run_key.
+    src key already committed by an earlier attempt on this run_key.
     Returns how many NEW rows were inserted this call (not the total on
     file).
 
-    rule_name/dgr_nbr/universe_version are copied straight from `rule`
+    rule_nm/dgr_nbr/universe_version are copied straight from `rule`
     (gre_rules), same as element_name/project_name/process_name above --
     purely descriptive, NULL if the rule row doesn't set them.
     run_type/batch_schedule are copied from `run_params` ONLY if the
@@ -358,24 +358,24 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
 
     sql = f"""
         INSERT INTO {meta_db}.gre_exceptions (
-            run_id, rule_id, database_name, table_name, project_name, process_name,
-            element_name, source_name, issue_desc, run_key, natural_key_value,
-            rule_name, dgr_nbr, universe_version, run_type, batch_schedule
+            run_id, rule_id, database_name, src_tbl_nm, project_name, process_name,
+            element_name, source_name, issue_desc, run_key, src_key_value,
+            rule_nm, dgr_nbr, universe_version, run_type, batch_schedule
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     seen = set()
     params = []
     for row in rows:
-        nk = build_natural_key(rule, row)
+        nk = build_src_key(rule, row)
         if nk in seen:
             continue
         seen.add(nk)
-        issue_desc = f"Rule '{rule.get('rule_name')}' violated (natural_key={nk})"
+        issue_desc = f"Rule '{rule.get('rule_nm')}' violated (src_key={nk})"
         params.append([
             run_id,
             rule.get("rule_id"),
             rule.get("database_name"),
-            rule.get("table_name"),
+            rule.get("src_tbl_nm"),
             rule.get("project_name"),
             rule.get("process_name"),
             rule.get("element_name"),
@@ -383,7 +383,7 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
             issue_desc,
             run_key,
             nk,
-            rule.get("rule_name"),
+            rule.get("rule_nm"),
             rule.get("dgr_nbr"),
             rule.get("universe_version"),
             run_params.get("run_type"),
@@ -464,24 +464,24 @@ def _build_total_query(table_ref: str, run_params: dict) -> str:
     "SELECT COUNT(*) AS total_count FROM {table_ref} WHERE k1 = '{k1}' AND
     k2 = '{k2}' ..." built straight from run_params' OWN keys -- there is
     no separate scope_sql to hand-author or keep in sync. The dict that
-    scopes rule_sql already says what's "in scope" for this run, so
+    scopes rule_syntax already says what's "in scope" for this run, so
     re-deriving that as a second, independently-written SQL blob was pure
-    duplication with real drift risk (rule_sql's WHERE and scope_sql's
+    duplication with real drift risk (rule_syntax's WHERE and scope_sql's
     WHERE could silently disagree over time). Every key present in
     run_params is treated as a literal column name on this rule's table
     and applied as an equality filter, AND'd together -- a project's
-    run_params IS its scoping definition, for the rule_sql substitution
+    run_params IS its scoping definition, for the rule_syntax substitution
     AND the denominator alike.
 
     table_ref is the adapter's own FROM-clause identifier for this rule
-    (SourceAdapter.qualified_name()) -- "database_name.table_name" for a
+    (SourceAdapter.qualified_name()) -- "database_name.src_tbl_nm" for a
     real database, or the prepared view name for a file/S3 source.
 
     Sorted key order makes the resulting query text deterministic
     regardless of run_params' own insertion order, so _compute_total()'s
     total_cache key is stable for two calls with the same effective
     filters. Escaping/quoting is delegated to _substitute_params() (same
-    logic rule_sql substitution uses) rather than reimplemented here.
+    logic rule_syntax substitution uses) rather than reimplemented here.
     """
     where_clause = " AND ".join(f"{key} = '{{{key}}}'" for key in sorted(run_params)) or "1=1"
     template = f"SELECT COUNT(*) AS total_count FROM {table_ref} WHERE {where_clause}"
@@ -491,14 +491,14 @@ def _build_total_query(table_ref: str, run_params: dict) -> str:
 def _compute_total(db_conn, rule: dict, run_params: dict, total_cache: dict = None) -> int:
     """
     total_records = COUNT(*) FROM the rule's table (db_conn.qualified_name(rule)),
-    filtered by the SAME run_params dict used to scope rule_sql -- see
+    filtered by the SAME run_params dict used to scope rule_syntax -- see
     _build_total_query()'s docstring.
 
     total_cache: an optional dict shared across every rule in one
     run_rule_group() call (see runner.py), keyed by (sql_dialect,
     effective query text). Multiple rules in a group very often ask the
     identical question -- same table + the same run_params -- so caching
-    by the actual resolved query (not just table_name) reuses the
+    by the actual resolved query (not just src_tbl_nm) reuses the
     COUNT(*) result across every rule that would otherwise re-run the
     exact same scan. A fresh cache per run means this never sees stale
     data across runs; within one run the source isn't expected to change
@@ -534,7 +534,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
                   total_cache: dict = None) -> str:
     """
     Execute one rule end-to-end: prepare its source (file/S3 rules register
-    their DuckDB view here), substitute run_params into rule_sql, run it,
+    their DuckDB view here), substitute run_params into rule_syntax, run it,
     write every violating row to gre_exceptions, evaluate the rule-level
     threshold, upsert gre_results, and log the attempt.
 
@@ -552,7 +552,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
                   year+month pair, a specific date, or any other
                   column/combination) via shared/db_ops.py::build_run_key(),
                   or pass your own string directly.
-    run_params  : dict of named values substituted into rule_sql's "{key}"
+    run_params  : dict of named values substituted into rule_syntax's "{key}"
                   tokens (see shared/db_ops.py::_substitute_params()) AND
                   used, key-for-key, as the equality filters for the
                   auto-generated total-record count (see
@@ -591,11 +591,11 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
 
     Big-dataset path
     -----------------
-    rule_sql is scanned ONCE (STEP 1, _scan_violations) instead of once
+    rule_syntax is scanned ONCE (STEP 1, _scan_violations) instead of once
     for a COUNT(*) and again for detail-row capture -- see that function's
     docstring for the exact trade-off this makes. failed_records comes
     from that same scan's true row count, exact no matter how many rows
-    rule_sql actually matches, even though detail-row capture (also from
+    rule_syntax actually matches, even though detail-row capture (also from
     that scan) is capped at MAX_EXCEPTIONS. Because count and capture now
     share one query, a failure during STEP 1 fails the whole rule (there's
     no longer an independently-obtained count to fall back on) -- whereas
@@ -609,7 +609,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
 
     # ── STEP 0: prepare the source -- fail fast, never mid-run ───────────────
     # No-op for teradata/postgres; a file/S3 rule registers its DuckDB view
-    # here, driven entirely by rule['database_name']/rule['table_name'] --
+    # here, driven entirely by rule['database_name']/rule['src_tbl_nm'] --
     # see db/connection_factory.py's FileAdapter/S3Adapter.prepare().
     try:
         db_conn.prepare(rule)
@@ -621,18 +621,18 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
 
     # ── STEP 0b: run_params substitution -- fail fast, never mid-run ─────────
     try:
-        query = _substitute_params(rule["rule_sql"], run_params)
+        query = _substitute_params(rule["rule_syntax"], run_params)
     except ValueError as exc:
         logger.error("Rule %s: run_params substitution failed: %s", rule.get("rule_id"), exc)
         _log_error(meta_conn, meta_db, run_id, rule, run_key, "PARAM_SUBSTITUTION_ERROR", str(exc))
         _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, start, str(exc))
         return "ERROR"
 
-    # ── STEP 1: ONE scan of rule_sql -- TRUE failed count + capped rows ──────
+    # ── STEP 1: ONE scan of rule_syntax -- TRUE failed count + capped rows ───
     try:
         failed, violating_rows = _scan_violations(db_conn, query)
     except Exception as exc:
-        logger.error("Rule %s: rule_sql scan failed: %s", rule.get("rule_id"), exc, exc_info=True)
+        logger.error("Rule %s: rule_syntax scan failed: %s", rule.get("rule_id"), exc, exc_info=True)
         _log_error(meta_conn, meta_db, run_id, rule, run_key, "SQL_RUNTIME", str(exc))
         _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, start, str(exc))
         return "ERROR"

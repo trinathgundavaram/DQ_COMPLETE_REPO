@@ -50,8 +50,8 @@ def _gre_meta_tables(conn):
             sample_name VARCHAR, source_type VARCHAR, universe_table VARCHAR,
             key_columns VARCHAR, scope_sql VARCHAR, exclusion_sql VARCHAR,
             target_volume INTEGER, sampling_method VARCHAR, priority_rank_sql VARCHAR,
-            rounding_mode VARCHAR, schedule_cron VARCHAR, active_flag INTEGER,
-            created_at TIMESTAMP DEFAULT current_timestamp
+            rounding_mode VARCHAR, schedule_cron VARCHAR, act_ind INTEGER,
+            load_datetime TIMESTAMP DEFAULT current_timestamp
         )
     """)
     conn.execute("""
@@ -70,14 +70,14 @@ def _gre_meta_tables(conn):
             sample_run_id VARCHAR, config_id INTEGER, project_name VARCHAR,
             process_name VARCHAR, sample_cycle DATE, case_key VARCHAR,
             priority_rank INTEGER, excluded_flag INTEGER, exclusion_reason VARCHAR,
-            selected_flag INTEGER, created_at TIMESTAMP DEFAULT current_timestamp
+            selected_flag INTEGER, load_datetime TIMESTAMP DEFAULT current_timestamp
         )
     """)
     conn.execute("""
         CREATE TABLE gre_sample_selection_attrs (
             sample_run_id VARCHAR, case_key VARCHAR, strata_id INTEGER,
             level_order INTEGER, bucket_value VARCHAR,
-            created_at TIMESTAMP DEFAULT current_timestamp
+            load_datetime TIMESTAMP DEFAULT current_timestamp
         )
     """)
     conn.execute("""
@@ -87,7 +87,7 @@ def _gre_meta_tables(conn):
             total_rules INTEGER, rules_succeeded INTEGER, rules_errored INTEGER,
             sample_config_id INTEGER, sampling_method VARCHAR, random_seed BIGINT,
             target_volume INTEGER, total_candidates INTEGER, total_selected INTEGER,
-            triggered_by VARCHAR, created_at TIMESTAMP DEFAULT current_timestamp
+            triggered_by VARCHAR, load_datetime TIMESTAMP DEFAULT current_timestamp
         )
     """)
     conn.execute("""
@@ -110,17 +110,17 @@ def _insert_config(conn, config_id=1, sampling_method="RANKED", priority_rank_sq
                    key_columns="case_id", exclusion_sql="auto_closed = 1",
                    scope_sql="pull_date = '{batch_id}'",
                    project_name="ANY_PROJECT", process_name="WEEKLY_REVIEW_SAMPLE",
-                   sample_name="weekly_review_sample", active_flag=1):
+                   sample_name="weekly_review_sample", act_ind=1):
     conn.execute("""
         INSERT INTO gre_sampling_config (
             config_id, project_name, process_name, sample_name, source_type,
             universe_table, key_columns, scope_sql, exclusion_sql, target_volume,
-            sampling_method, priority_rank_sql, rounding_mode, active_flag
+            sampling_method, priority_rank_sql, rounding_mode, act_ind
         ) VALUES (?, ?, ?, ?, 'duckdb_test',
                   ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [config_id, project_name, process_name, sample_name,
           universe_table, key_columns, scope_sql, exclusion_sql, target_volume,
-          sampling_method, priority_rank_sql, rounding_mode, active_flag])
+          sampling_method, priority_rank_sql, rounding_mode, act_ind])
 
 
 def _insert_strata(conn, strata_id, config_id, level_order, level_name, stratify_expr, mix: dict):
@@ -552,7 +552,7 @@ def test_discover_sampling_configs_filters_by_project_and_process():
     _insert_config(conn, config_id=1, project_name="PROJECT_A", process_name="PROC_A")
     _insert_config(conn, config_id=2, project_name="PROJECT_A", process_name="PROC_B")
     _insert_config(conn, config_id=3, project_name="PROJECT_B", process_name="PROC_A")
-    _insert_config(conn, config_id=4, project_name="PROJECT_A", process_name="PROC_A", active_flag=0)
+    _insert_config(conn, config_id=4, project_name="PROJECT_A", process_name="PROC_A", act_ind=0)
 
     assert discover_sampling_configs(conn, META_DB) == [1, 2, 3]   # inactive config_id=4 excluded
     assert discover_sampling_configs(conn, META_DB, project_name="PROJECT_A") == [1, 2]

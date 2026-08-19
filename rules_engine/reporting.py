@@ -15,7 +15,7 @@ live re-join rather than a stored copy.
 import logging
 
 from shared.db_ops import execute_query, _run_source_query, _escape_sql_literal, EXCEPTION_CHUNK
-from rules_engine.executor import parse_natural_key, _format_natural_key
+from rules_engine.executor import parse_src_key, _format_src_key
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ def get_records_for_result(meta_conn, meta_db: str, rule_id, run_key: str) -> li
     down join described in the prompt: gre_results -> gre_exceptions on
     (rule_id, run_key), filtered to the current record version.
 
-    This returns gre_exceptions' OWN columns only (natural_key_value,
+    This returns gre_exceptions' OWN columns only (src_key_value,
     issue_desc, ...) -- not the source record itself. For the full source
     row behind each of these, see get_source_records_for_rule() below.
     """
@@ -60,13 +60,13 @@ def get_records_for_result(meta_conn, meta_db: str, rule_id, run_key: str) -> li
 # Tie-back: gre_exceptions -> the actual source record
 # ---------------------------------------------------------------------------
 
-def _build_natural_key_where(keys: list) -> str:
+def _build_src_key_where(keys: list) -> str:
     """
-    Build a WHERE-clause fragment that matches every parsed natural key
-    (dicts from parse_natural_key(), one per gre_exceptions row) in one
+    Build a WHERE-clause fragment that matches every parsed src key
+    (dicts from parse_src_key(), one per gre_exceptions row) in one
     query.
 
-    A single-column natural key (the common case, and by far the cheapest
+    A single-column src key (the common case, and by far the cheapest
     query shape) becomes a plain "col IN (...)"; a composite key becomes
     an OR of per-record ANDs, since there's no portable way to express
     "match any of these N (col1, col2) pairs" as a single IN-list across
@@ -109,15 +109,15 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, run_key: s
 
     gre_exceptions deliberately never stores the violating row's own data
     (see rules_engine/schema.sql's header on that table) -- only enough
-    to re-identify it: database_name/table_name/source_name (copied from
-    the rule at write time) plus natural_key_value. A row that fails
+    to re-identify it: database_name/src_tbl_nm/source_name (copied from
+    the rule at write time) plus src_key_value. A row that fails
     every rule in a 10-rule group would otherwise get its full column set
     captured 10 times, once per rule, purely because the SAME source data
     is already sitting right there in the source table. This function
     re-joins back to that LIVE source table at report/analysis time
-    instead: parse each gre_exceptions row's natural_key_value, batch the
+    instead: parse each gre_exceptions row's src_key_value, batch the
     parsed keys into EXCEPTION_CHUNK-sized groups, and pull the matching
-    rows straight from source_name/database_name/table_name via the same
+    rows straight from source_name/database_name/src_tbl_nm via the same
     ConnectionFactory every rule run already uses.
 
     Each returned dict is the source row's own columns, PLUS this
@@ -125,7 +125,7 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, run_key: s
     any real source column name):
         _record_id           gre_exceptions.record_id, to cite back to it
         _rule_id              the rule_id passed in
-        _natural_key_value    the same key gre_exceptions stored
+        _src_key_value        the same key gre_exceptions stored
         _issue_desc            gre_exceptions.issue_desc
         _exception_flag         gre_exceptions.exception_flag (compliance
                                  disposition -- 'OPEN' etc.)
@@ -144,7 +144,7 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, run_key: s
     exceptions = execute_query(
         meta_conn,
         f"""
-        SELECT record_id, natural_key_value, database_name, table_name, source_name,
+        SELECT record_id, src_key_value, database_name, src_tbl_nm, source_name,
                issue_desc, exception_flag
         FROM {meta_db}.gre_exceptions
         WHERE rule_id = ? AND run_key = ? AND etl_is_curr_ind = 'Y'
@@ -154,17 +154,17 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, run_key: s
     if not exceptions:
         return []
 
-    # Grouped by (database_name, table_name, source_name) defensively --
+    # Grouped by (database_name, src_tbl_nm, source_name) defensively --
     # in practice every gre_exceptions row for one rule_id shares the same
     # triple (a rule targets exactly one table), but nothing here assumes
     # that rather than handling it correctly if it's ever not the case.
     groups = {}
     for exc in exceptions:
-        key = (exc.get("database_name"), exc.get("table_name"), exc.get("source_name"))
+        key = (exc.get("database_name"), exc.get("src_tbl_nm"), exc.get("source_name"))
         groups.setdefault(key, []).append(exc)
 
     records = []
-    for (database_name, table_name, source_name), group in groups.items():
+    for (database_name, src_tbl_nm, source_name), group in groups.items():
         db_conn = cf.get(source_name)
         if db_conn is None:
             raise RuntimeError(
@@ -176,39 +176,39 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, run_key: s
         # (source_type) at write time -- a file/S3 rule needs its DuckDB
         # view re-registered here the same way execute_rule() does, via
         # the shim dict below (all qualified_name()/prepare() need is
-        # database_name/table_name); a no-op for teradata/postgres.
-        table_ref_rule = {"database_name": database_name, "table_name": table_name}
+        # database_name/src_tbl_nm); a no-op for teradata/postgres.
+        table_ref_rule = {"database_name": database_name, "src_tbl_nm": src_tbl_nm}
         db_conn.prepare(table_ref_rule)
         table_ref = db_conn.qualified_name(table_ref_rule)
 
-        keys = [parse_natural_key(exc["natural_key_value"]) for exc in group]
+        keys = [parse_src_key(exc["src_key_value"]) for exc in group]
         cols = list(keys[0].keys())
-        by_natural_key = {exc["natural_key_value"]: exc for exc in group}
+        by_src_key = {exc["src_key_value"]: exc for exc in group}
         matched_keys = set()
 
         for chunk_start in range(0, len(keys), EXCEPTION_CHUNK):
             chunk = keys[chunk_start:chunk_start + EXCEPTION_CHUNK]
-            where = _build_natural_key_where(chunk)
+            where = _build_src_key_where(chunk)
             query = f"SELECT * FROM {table_ref} WHERE {where}"
             for row in _run_source_query(db_conn, query):
-                nk = _format_natural_key(cols, row)
-                exc = by_natural_key.get(nk)
+                nk = _format_src_key(cols, row)
+                exc = by_src_key.get(nk)
                 matched_keys.add(nk)
                 merged = dict(row)
                 merged["_record_id"] = exc.get("record_id") if exc else None
                 merged["_rule_id"] = rule_id
-                merged["_natural_key_value"] = nk
+                merged["_src_key_value"] = nk
                 merged["_issue_desc"] = exc.get("issue_desc") if exc else None
                 merged["_exception_flag"] = exc.get("exception_flag") if exc else None
                 records.append(merged)
 
-        missing = set(by_natural_key) - matched_keys
+        missing = set(by_src_key) - matched_keys
         if missing:
             logger.info(
                 "get_source_records_for_rule: %d of %d exception(s) for rule_id=%s "
                 "run_key=%s no longer match a row in %s.%s (likely corrected/deleted "
                 "upstream since the rule ran).",
-                len(missing), len(group), rule_id, run_key, database_name, table_name,
+                len(missing), len(group), rule_id, run_key, database_name, src_tbl_nm,
             )
 
     return records

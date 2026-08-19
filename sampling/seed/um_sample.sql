@@ -25,13 +25,13 @@
 INSERT INTO CMSUNIV_FILELAND_DEV_T.gre_sampling_config (
     config_id, project_name, process_name, sample_name, source_type,
     universe_table, key_columns, scope_sql, exclusion_sql, target_volume,
-    sampling_method, priority_rank_sql, rounding_mode, schedule_cron, active_flag
+    sampling_method, priority_rank_sql, rounding_mode, schedule_cron, act_ind
 ) VALUES (
     1, 'HEALTHSPRING_UM', 'COMO_WEEKLY_SAMPLE', 'COMO_WEEKLY_SAMPLE', 'teradata',
     'um_universe', 'enrollee_id, auth_or_claim_number',
     -- scope_sql: a WHERE-fragment (unlike gre_rules.scope_sql, which is a
     -- COUNT query) -- {batch_id} is this cycle's pull_date, substituted
-    -- the same way gre_rules.rule_sql substitutes it.
+    -- the same way gre_rules.rule_syntax substitutes it.
     'pull_date = ''{batch_id}''',
     -- Exclusion list: auto-approvals, SHRPA-no-PA, diabetic supplies --
     -- identical to dq_sampling_config.config_id=1.

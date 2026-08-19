@@ -18,33 +18,33 @@ def _conn():
     conn = duckdb.connect(":memory:")
     conn.execute("""
         CREATE TABLE gre_rules (
-            rule_id INTEGER, rule_name VARCHAR, database_name VARCHAR, table_name VARCHAR,
-            sql_dialect VARCHAR, rule_sql VARCHAR,
+            rule_id INTEGER, rule_nm VARCHAR, database_name VARCHAR, src_tbl_nm VARCHAR,
+            sql_dialect VARCHAR, rule_syntax VARCHAR,
             rule_group VARCHAR, rule_variant VARCHAR,
             seq_no INTEGER, sequencing_mode VARCHAR, on_failure VARCHAR,
             threshold_pct DOUBLE, threshold_count INTEGER, threshold_operator VARCHAR,
-            severity VARCHAR, natural_key_columns VARCHAR, element_name VARCHAR,
-            active_flag INTEGER, created_at TIMESTAMP DEFAULT current_timestamp,
-            updated_at TIMESTAMP
+            severity VARCHAR, src_key_cols VARCHAR, element_name VARCHAR,
+            act_ind INTEGER, load_datetime TIMESTAMP DEFAULT current_timestamp,
+            last_updated_datetime TIMESTAMP
         )
     """)
     return conn
 
 
-def _insert(conn, rule_id, rule_group="claims_dq", seq_no=100, active_flag=1, rule_variant=None):
+def _insert(conn, rule_id, rule_group="claims_dq", seq_no=100, act_ind=1, rule_variant=None):
     conn.execute("""
         INSERT INTO gre_rules (
-            rule_id, rule_name, database_name, table_name, sql_dialect, rule_sql,
-            rule_group, rule_variant, seq_no, natural_key_columns, active_flag
+            rule_id, rule_nm, database_name, src_tbl_nm, sql_dialect, rule_syntax,
+            rule_group, rule_variant, seq_no, src_key_cols, act_ind
         ) VALUES (?, ?, 'main', 't', 'teradata', 'SELECT 1', ?, ?, ?, 'k', ?)
-    """, [rule_id, f"rule {rule_id}", rule_group, rule_variant, seq_no, active_flag])
+    """, [rule_id, f"rule {rule_id}", rule_group, rule_variant, seq_no, act_ind])
 
 
-def test_load_rules_filters_by_group_and_active_flag():
+def test_load_rules_filters_by_group_and_act_ind():
     conn = _conn()
     _insert(conn, 1, rule_group="claims_dq")
     _insert(conn, 2, rule_group="other_group")
-    _insert(conn, 3, rule_group="claims_dq", active_flag=0)
+    _insert(conn, 3, rule_group="claims_dq", act_ind=0)
 
     rows = load_rules(conn, META_DB, "claims_dq")
     assert [r["rule_id"] for r in rows] == [1]

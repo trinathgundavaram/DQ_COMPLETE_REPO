@@ -32,11 +32,11 @@ not two drifting copies. Metadata connection/db resolution comes from
 shared/config.py.
 
 scope_sql AND exclusion_sql both go through the same {key} run_params
-substitution as rules_engine's rule_sql -- see
+substitution as rules_engine's rule_syntax -- see
 shared/db_ops.py::_substitute_params()'s docstring for why this is a
 free-form dict rather than a single fixed value. Unlike rules_engine (which auto-
 derives its total-record count straight from run_params against
-database_name.table_name -- see rules_engine/executor.py::
+database_name.src_tbl_nm -- see rules_engine/executor.py::
 _build_total_query()), sampling's candidate universe isn't always a plain
 equality filter (exclusions, priority ordering, ...), so scope_sql/
 exclusion_sql stay as explicit, hand-authored WHERE-fragments here.
@@ -104,7 +104,7 @@ def load_sampling_config(meta_conn, meta_db: str, config_id) -> tuple:
     """
     rows = execute_query(
         meta_conn,
-        f"SELECT * FROM {meta_db}.gre_sampling_config WHERE config_id = ? AND active_flag = 1",
+        f"SELECT * FROM {meta_db}.gre_sampling_config WHERE config_id = ? AND act_ind = 1",
         [config_id],
     )
     if not rows:
@@ -410,7 +410,7 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
     `run_key` and whatever else `run_params` supplies (substituted into
     scope_sql's/exclusion_sql's "{key}" tokens -- same convention, and the
     same shared.db_ops.py::_substitute_params() mechanism, as
-    gre_rules.rule_sql in rules_engine/).
+    gre_rules.rule_syntax in rules_engine/).
 
     Parameters
     ----------
@@ -554,7 +554,7 @@ def discover_sampling_configs(meta_conn, meta_db: str, project_name: str = None,
     project_name and/or process_name. Returns config_ids sorted for a
     deterministic run order.
     """
-    where = ["active_flag = 1"]
+    where = ["act_ind = 1"]
     params = []
     if project_name is not None:
         where.append("project_name = ?")
