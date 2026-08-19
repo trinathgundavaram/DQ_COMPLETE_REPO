@@ -145,7 +145,7 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, run_key: s
         meta_conn,
         f"""
         SELECT record_id, src_key_value, database_name, src_tbl_nm, source_name,
-               issue_desc, exception_flag
+               issue_desc, exception_flag, rule_nm, process_name, project_name
         FROM {meta_db}.gre_exceptions
         WHERE rule_id = ? AND run_key = ? AND etl_is_curr_ind = 'Y'
         """,
@@ -208,6 +208,9 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, run_key: s
                 merged = dict(row)
                 merged["_record_id"] = exc.get("record_id") if exc else None
                 merged["_rule_id"] = rule_id
+                merged["_rule_nm"] = exc.get("rule_nm") if exc else None
+                merged["_process_name"] = exc.get("process_name") if exc else None
+                merged["_project_name"] = exc.get("project_name") if exc else None
                 merged["_src_key_value"] = nk
                 merged["_issue_desc"] = exc.get("issue_desc") if exc else None
                 merged["_exception_flag"] = exc.get("exception_flag") if exc else None
@@ -222,4 +225,67 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, run_key: s
                 len(missing), len(group), rule_id, run_key, database_name, src_tbl_nm,
             )
 
+    return records
+
+
+def get_source_records_for_process(cf, meta_conn, meta_db: str, process_name: str, run_key: str,
+                                   project_name: str = None, rule_nm: str = None) -> list:
+    """
+    get_source_records_for_rule(), fanned out across every rule_id that
+    actually wrote an exception for this process_name/run_key -- "pull
+    every failing record, tied back to its source data, for this whole
+    process's run" (the ODAG3-style analyst report the tool prompt is
+    for), instead of calling the single-rule function once per rule_id by
+    hand.
+
+    Rule discovery reads gre_exceptions itself (not gre_rules): the set of
+    rule_ids that actually produced a current exception this run_key,
+    scoped to process_name (and, optionally, project_name/rule_nm) --
+    exactly the rows a "show me every ODAG3 failure this run" report
+    needs, and nothing for a rule that ran clean.
+
+    rule_nm : optional exact match (e.g. 'ODAG3V22R16') to narrow to one
+              rule by name instead of every rule in the process; omit to
+              get every rule_id in scope.
+
+    Returns the concatenation of get_source_records_for_rule()'s own
+    per-rule lists (each row already carries _rule_id/_rule_nm/
+    _process_name/_project_name/_src_key_value/_issue_desc/
+    _exception_flag -- see that function's docstring) -- one row per
+    source record per rule it failed, so a record failing 3 rules this
+    run appears 3 times, once per rule, each tagged with which one.
+    """
+    where = ["process_name = ?", "run_key = ?", "etl_is_curr_ind = 'Y'"]
+    params = [process_name, run_key]
+    if project_name is not None:
+        where.append("project_name = ?")
+        params.append(project_name)
+    if rule_nm is not None:
+        where.append("rule_nm = ?")
+        params.append(rule_nm)
+
+    rows = execute_query(
+        meta_conn,
+        f"""
+        SELECT DISTINCT rule_id
+        FROM {meta_db}.gre_exceptions
+        WHERE {' AND '.join(where)}
+        ORDER BY rule_id
+        """,
+        params,
+    )
+    rule_ids = [r["rule_id"] for r in rows]
+    if not rule_ids:
+        logger.info(
+            "get_source_records_for_process: no current exceptions for process_name=%s "
+            "run_key=%s%s%s -- nothing to tie back.",
+            process_name, run_key,
+            f" project_name={project_name}" if project_name else "",
+            f" rule_nm={rule_nm}" if rule_nm else "",
+        )
+        return []
+
+    records = []
+    for rule_id in rule_ids:
+        records.extend(get_source_records_for_rule(cf, meta_conn, meta_db, rule_id, run_key))
     return records
