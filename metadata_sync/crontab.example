@@ -1,0 +1,9 @@
+# metadata_sync -- example schedule. Adjust the path and env-loading to
+# your environment; don't put credentials directly in crontab.
+
+# Incremental sync every 15 minutes
+*/15 * * * * /usr/bin/env bash -lc 'cd /path/to/DQ_COMPLETE_REPO && python -m metadata_sync.sync_from_teradata >> /var/log/metadata_sync.log 2>&1'
+
+# Nightly full refresh of the small config tables at 2am (catches
+# Teradata-side deletes, which an incremental watermark sync can't see)
+0 2 * * * /usr/bin/env bash -lc 'cd /path/to/DQ_COMPLETE_REPO && python -m metadata_sync.sync_from_teradata --full-refresh --tables gre_rules,gre_sampling_config,gre_sampling_strata,gre_sampling_mix >> /var/log/metadata_sync.log 2>&1'
