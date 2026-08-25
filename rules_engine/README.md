@@ -11,11 +11,80 @@ upserts a `gre_results` verdict row.
 
 `run_key` is an opaque, caller-supplied string -- the ONE tracking/
 idempotency identifier `gre_log`, `gre_exceptions` (`gre_exceptions_uix`),
-`gre_results` (`gre_results_uix`), and `gre_audit` all key off. There's no
+`gre_results` (`gre_results_uix`), and `gre_rule_audit` all key off. There's no
 fixed shape to it: a plain batch id, a year+month combo, a specific date,
 a region, or any combination all work equally well. `shared/db_ops.py`'s
 `build_run_key(*parts, delimiter="_")` is a convenience formatter
 (`build_run_key(2026, 8) -> "2026_8"`), or just pass your own string.
+
+## Identifying an attempt: `run_id`
+
+`run_key` (above) says WHICH logical run this is -- a batch, a period, a
+date. `run_id` says WHICH SPECIFIC ATTEMPT at it this is: `run_rule_group()`
+mints a brand new `run_id` every time it's called, even when called again
+with the exact same `run_key` (a deliberate rerun, or a resumed run after a
+crash). Every row `gre_log`, `gre_exceptions`, `gre_results`, `gre_errors`,
+and `gre_rule_audit` write for one call all carry that same `run_id`.
+
+`run_id` is built by `rules_engine/runner.py::_build_group_run_id()` on top
+of `shared/db_ops.py::generate_run_id()` (the same underlying helper
+`sampling/sampling.py` uses for `sample_run_id`), shaped as:
+
+```
+{project_name}.{rule_group}::{run_key}::attempt-{N}::{triggered_by}::{YYYYMMDDTHHMMSS.ffffff}::{6 hex chars}
+
+e.g. HEALTHSPRING_UM.claims_dq::BATCH_2026_08_19::attempt-2::jsmith::20260819T151500.500000::f9e8d7
+```
+
+(`project_name` is omitted, along with its trailing `.`, when a rule_group's
+rules have no `project_name` set -- the id then starts straight from
+`rule_group`.)
+
+- `{project_name}.{rule_group}` says which business process this run
+  belongs to, not just which rule_group -- readable at a glance in
+  `gre_log`/`gre_exceptions`/a log line without a join back to `gre_rules`.
+- `run_key` right after it means a human can tell what ran and for which
+  batch/period together, in one look.
+- `attempt-{N}` (`N` = `count_prior_attempts()` + 1, counted from
+  `gre_rule_audit` for this exact `(rule_group, run_key)` pair) makes a rerun
+  visibly a rerun -- "this is the 2nd attempt at BATCH_2026_08_19" reads
+  directly off the id, instead of requiring a human to compare two run_ids'
+  timestamps to work out which came first. This is a convenience LABEL,
+  not the uniqueness mechanism (see the hex suffix below) -- a rare race
+  between two callers starting the same run_key at the same instant could
+  in principle produce the same attempt number on both, which is harmless
+  cosmetically since nothing's correctness depends on it.
+- `triggered_by` -- who/what kicked this off (a login, a scheduler name,
+  or `"SYSTEM"` for the default/unattended case) -- is already collected
+  as a `run_rule_group()` parameter and recorded on `gre_rule_audit`; folding it
+  into the id too makes it visible on `gre_log`/`gre_exceptions`/
+  `gre_results` rows as well, which don't otherwise carry it.
+- `::` separates the parts because `rule_group`/`run_key`/`triggered_by`
+  often already contain `_` or `-` themselves; nothing in this codebase
+  parses a run_id back apart, so this is purely for readability, not
+  machine parsing.
+- The timestamp is microsecond-precision and sortable
+  (`ORDER BY run_id` already sorts oldest-to-newest), so the exact moment
+  an attempt started is readable directly off the id.
+- The trailing 6 hex characters guarantee uniqueness even if two calls
+  land in the same microsecond -- a real risk under the old
+  second-precision-only format this replaced, since a run_id collision
+  corrupts the `active_ind`/`etl_is_curr_ind` "which attempt is current"
+  reconciliation every write path here relies on (each filters on
+  `run_id <> this_run_id` to tell "this attempt" from "an earlier one").
+
+Like `run_key`, `run_id` is opaque as far as the engine is concerned --
+nothing re-parses it. `gre_rule_audit` is still the place to look up the FULL
+context of one `run_id` (its `run_key`, `rule_group`, `status`,
+`started_at`, `triggered_by`, etc.) rather than trying to decode it from
+the string -- the label parts above exist purely so the common questions
+(what ran, for which batch, which attempt, triggered by whom) don't
+*require* that lookup for a quick glance.
+
+`rules_engine.runner.generate_run_id(rule_group, run_key)` -- the plain
+2-part shape (no project/attempt/triggered_by) -- is kept as a public
+function for any external caller still relying on it, but `run_rule_group()`
+itself no longer uses it internally.
 
 ## Scoping a rule's data: `run_params`
 
@@ -120,7 +189,7 @@ They are **not** a second filter key: `rule_group` remains the one literal
 column `load_rules()` filters on. `run_rule_group()` reads them off the
 loaded rules (lowest `seq_no` wins if a group's rows disagree with
 themselves -- logged as a warning, same pattern as its `sequencing_mode`
-consistency check) and stamps them onto `gre_audit` for the run; every
+consistency check) and stamps them onto `gre_rule_audit` for the run; every
 `gre_log`/`gre_exceptions`/`gre_results` row carries its own rule's
 `project_name`/`process_name` too, so any of those tables can be sliced or
 joined by project without a round trip back to `gre_rules`.
@@ -165,7 +234,7 @@ this is required.
 ## Running multiple projects/processes: `run_all_active_groups()`
 
 `run_rule_group()` is deliberately single-`rule_group`: one call, one
-checkpoint/resume scope, one `gre_audit` row. Driving several
+checkpoint/resume scope, one `gre_rule_audit` row. Driving several
 projects/processes through the engine in one operation (e.g. a nightly job
 covering more than one use case) is a thin orchestration layer on top,
 not a change to that contract:
@@ -190,7 +259,7 @@ for rule_group, summary in outcome["rule_groups"].items():
 does the lookup alone (distinct, active `rule_group` values, via
 `gre_rules_project_process_ix` when either filter is supplied) if you want
 to inspect or reorder the group list yourself before running anything.
-Each discovered group still gets its own `run_id`, `gre_audit` row, and
+Each discovered group still gets its own `run_id`, `gre_rule_audit` row, and
 checkpoint/resume via an unmodified `run_rule_group()` call -- this is a
 fan-out, not a merged run, and one group erroring doesn't stop the rest.
 
@@ -216,7 +285,7 @@ run_by_process.py rules --process-name UNIVERSE_VALIDATION`.
 
 This package is deliberately independent of [`sampling/`](../sampling/README.md)
 -- the two share only what's in [`shared/`](../shared/README.md) (DB
-helpers, credential/config loading, and the `gre_audit`/`gre_errors`
+helpers, credential/config loading, and the `gre_rule_audit`/`gre_errors`
 tables). Nothing in `rules_engine/` imports from `sampling/`, or vice
 versa.
 
@@ -226,7 +295,7 @@ versa.
 |---|---|
 | `rules.py` | `load_rules()` -- loads active `gre_rules` rows for a rule_group (+ optional `rule_variant` filter), ordered by `seq_no`. |
 | `executor.py` | `execute_rule()` -- runs one rule end-to-end: source prepare (`db_conn.prepare(rule)`), `run_params` substitution, single-scan evaluation (`_scan_violations`), threshold evaluation, `gre_exceptions`/`gre_results`/`gre_log` writes. |
-| `runner.py` | `run_rule_group()` -- orchestration entry point: readiness gate, checkpoint/resume, sequencing_mode-aware loop over `execute_rule()`, `gre_audit` start/finish. `discover_rule_groups()`/`run_all_active_groups()` -- multi-group fan-out by project/process (see "Running multiple projects/processes" above). Also the opt-in parallel path (`_run_pending_parallel()`) -- see "Parallel rule execution" below. |
+| `runner.py` | `run_rule_group()` -- orchestration entry point: readiness gate, checkpoint/resume, sequencing_mode-aware loop over `execute_rule()`, `gre_rule_audit` start/finish. `discover_rule_groups()`/`run_all_active_groups()` -- multi-group fan-out by project/process (see "Running multiple projects/processes" above). Also the opt-in parallel path (`_run_pending_parallel()`) -- see "Parallel rule execution" below. |
 | `parallel.py` | `ConnectionPool`/`build_pools()`/`close_pools()` -- the bounded per-connection connection pooling the parallel path uses instead of the single shared `cf.get()` connection. |
 | `reporting.py` | `get_breaches()` / `get_records_for_result()` -- thin read-only queries against `gre_results`/`gre_exceptions`. `get_source_records_for_rule()` -- ties `gre_exceptions` back to the live source record (see "Tying exceptions back to source records" below). |
 | `schema.sql` | `gre_rules` (incl. `project_name`/`process_name`), `gre_log`, `gre_exceptions`, `gre_results`. Deploy after `shared/schema.sql`. |
@@ -274,7 +343,7 @@ a blocking queue, whose `get()` is what actually enforces the
 per-connection cap. This applies to the metadata connection too: every worker gets its
 own pooled connection for writing to `gre_exceptions`/`gre_results`/
 `gre_log`, not the single connection the top-level run uses for
-`gre_audit` bookkeeping. Every pooled connection is closed once the group
+`gre_rule_audit` bookkeeping. Every pooled connection is closed once the group
 finishes, win or lose.
 
 A connection that can't be pooled at all (unconfigured, or every build
@@ -338,9 +407,13 @@ Two optimizations that matter once a rule matches millions of rows (see
 
 - **Single-scan evaluation** (`_scan_violations`): `rule_syntax` is scanned
   ONCE via streamed `fetchmany()`, producing both the true failed-record
-  count (uncapped) and a `GRE_MAX_EXCEPTIONS`-capped row list for detail
-  capture -- instead of a separate `COUNT(*)` query plus a full detail
-  fetch.
+  count and the complete violating-row list for detail capture -- instead
+  of a separate `COUNT(*)` query plus a full detail fetch. There is no cap
+  on how many rows get captured: every violating row is written to
+  `gre_exceptions`, every attempt, no matter how many rows `rule_syntax`
+  matches (memory for the scan scales with the violation count as a
+  result -- that trade-off is accepted so compliance/audit review never
+  gets a partial record set).
 - **Memoized total counts** (`_compute_total`'s `total_cache`): rules in
   the same group that ask the identical "how many rows are in this batch"
   question share one `COUNT(*)` result for the whole `run_rule_group()`

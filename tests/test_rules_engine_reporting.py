@@ -93,6 +93,7 @@ def _conn():
             total_records BIGINT, failed_records BIGINT, failure_pct DOUBLE,
             threshold_pct_used DOUBLE, threshold_count_used INTEGER,
             threshold_operator_used VARCHAR, severity VARCHAR, status VARCHAR,
+            active_ind VARCHAR DEFAULT 'Y',
             evaluated_at TIMESTAMP DEFAULT current_timestamp
         )
     """)

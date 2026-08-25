@@ -44,7 +44,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from shared import config as gre_config
-from shared.db_ops import execute_query, execute_dml
+from shared.db_ops import (
+    execute_query, execute_dml,
+    generate_run_id as _generate_run_id,
+    count_prior_attempts as _count_prior_attempts,
+)
 from rules_engine.rules import load_rules
 from rules_engine.executor import execute_rule, _log_error, _log_attempt
 from rules_engine.parallel import build_pools, close_pools
@@ -53,19 +57,69 @@ logger = logging.getLogger(__name__)
 
 
 def generate_run_id(rule_group: str, run_key: str) -> str:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{rule_group}_{run_key}_{ts}"
+    """
+    Plain 2-part run_id -- delegates to shared/db_ops.py::generate_run_id()
+    with just (rule_group, run_key) as label parts, e.g.
+    "claims_dq::BATCH_2026_08_19::20260819T143022.183045::a1b2c3". Kept as
+    a public, stable-signature function so any caller already importing
+    rules_engine.runner.generate_run_id keeps working unchanged.
+
+    run_rule_group() itself does NOT call this anymore -- it builds a
+    richer run_id via _build_group_run_id() below (project_name, an
+    "attempt-N" label, and triggered_by folded in). Call this directly
+    only if you specifically want the plain, minimal shape.
+    """
+    return _generate_run_id(rule_group, run_key)
+
+
+def _build_group_run_id(meta_conn, meta_db: str, rule_group: str, run_key: str,
+                         project_name: str, triggered_by: str) -> str:
+    """
+    The run_id run_rule_group() actually mints -- richer than the plain
+    generate_run_id(rule_group, run_key) above, folding in three more
+    things a human scanning gre_log/gre_audit wants without a join:
+
+        {project_name}.{rule_group}::{run_key}::attempt-{N}::{triggered_by}::{timestamp}::{hex}
+
+        e.g. UM_REVIEW.claims_dq::BATCH_2026_08_19::attempt-2::jsmith::20260819T151500.500000::f9e8d7
+
+      - "{project_name}.{rule_group}" (just rule_group if project_name is
+        NULL) -- which business process this run belongs to, not only
+        which rule_group, without looking gre_rules up.
+      - "attempt-{N}" -- N = count_prior_attempts() + 1: this reads as
+        "the 2nd attempt at this run_key" directly, instead of requiring
+        a human to compare two run_ids' timestamps to work out which
+        attempt came first. See count_prior_attempts()'s docstring for
+        why this is a label, not the uniqueness mechanism (the trailing
+        hex suffix still is).
+      - triggered_by -- who/what kicked this off (a login, a scheduler
+        name, "SYSTEM"), already collected as a parameter here and
+        recorded on gre_audit -- folding it into the id too means it's
+        visible on gre_log/gre_exceptions/gre_results rows as well,
+        which don't otherwise carry it.
+
+    Underlying shape/collision-safety is entirely generate_run_id()'s --
+    this only decides WHICH label parts to pass it.
+    """
+    attempt_no = _count_prior_attempts(meta_conn, meta_db, run_key, rule_group=rule_group) + 1
+    group_label = f"{project_name}.{rule_group}" if project_name else rule_group
+    return _generate_run_id(group_label, run_key, f"attempt-{attempt_no}", triggered_by)
 
 
 # ---------------------------------------------------------------------------
-# gre_audit
+# gre_rule_audit -- rules_engine's OWN run-tracking table, split out of the
+# old combined gre_audit (see shared/schema.sql's module header). sampling/
+# never reads or writes this table; its equivalent is
+# sampling/sampling.py::_write_audit() against gre_sampling_audit. Anything
+# still reading the old combined shape can query the gre_audit VIEW (also
+# defined in shared/schema.sql) instead -- this code never touches it.
 # ---------------------------------------------------------------------------
 
 def _start_audit(meta_conn, meta_db: str, run_id: str, rule_group: str, run_key: str,
                   total_rules: int, triggered_by: str, rule_variant: str = None,
                   project_name: str = None, process_name: str = None) -> None:
     execute_dml(meta_conn, f"""
-        INSERT INTO {meta_db}.gre_audit (
+        INSERT INTO {meta_db}.gre_rule_audit (
             run_id, rule_group, project_name, process_name, run_key, rule_variant, started_at, status,
             total_rules, rules_succeeded, rules_errored, triggered_by
         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, 0, 0, ?)
@@ -76,7 +130,7 @@ def _start_audit(meta_conn, meta_db: str, run_id: str, rule_group: str, run_key:
 def _finish_audit(meta_conn, meta_db: str, run_id: str, status: str,
                    rules_succeeded: int, rules_errored: int) -> None:
     execute_dml(meta_conn, f"""
-        UPDATE {meta_db}.gre_audit
+        UPDATE {meta_db}.gre_rule_audit
         SET ended_at = ?, status = ?, rules_succeeded = ?, rules_errored = ?
         WHERE run_id = ?
     """, [datetime.now(), status, rules_succeeded, rules_errored, run_id])
@@ -153,10 +207,30 @@ def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, run_key, reso
     for rule in pending:
         source_names.add(rule["sql_dialect"])
 
-    source_pools = build_pools(cf, source_names, max_workers)
-    meta_pool = build_pools(cf, {gre_config.get_meta_connection_name()}, max_workers)[
-        gre_config.get_meta_connection_name()
-    ]
+    # A running rule holds a source-role connection AND a meta-role
+    # connection SIMULTANEOUSLY for its whole execution (see
+    # _run_one_pending_rule() above), so when a rule's sql_dialect and the
+    # metadata connection are the SAME named connection (e.g. both
+    # "teradata" -- shared/config.py's META_CONNECTION default), that one
+    # source needs a genuinely separate pool object for each role: sharing
+    # one pool between both acquire() calls would make a single worker
+    # thread try to acquire two slots from its own pool and deadlock the
+    # moment pool size is smaller than 2x the concurrent workers touching
+    # it. But building each role's pool independently up to the SAME
+    # GRE_<NAME>_MAX_PARALLEL cap (as this used to do, unconditionally)
+    # lets the two pools' sizes double real concurrent sessions against
+    # that one source past the cap the env var is meant to enforce. Fix:
+    # keep two separate pool objects (no deadlock), but when the names
+    # collide, split that source's cap between the two roles so their
+    # combined size still honors GRE_<NAME>_MAX_PARALLEL.
+    meta_name = gre_config.get_meta_connection_name()
+    if meta_name in source_names:
+        shared_cap = max(1, gre_config.get_max_parallel_for_connection(meta_name) // 2)
+        cap_override = {meta_name: shared_cap}
+    else:
+        cap_override = None
+    source_pools = build_pools(cf, source_names, max_workers, cap_override)
+    meta_pool = build_pools(cf, {meta_name}, max_workers, cap_override)[meta_name]
 
     try:
         # meta_pool failing to build even one connection is a harder stop
@@ -221,8 +295,12 @@ def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, run_key, reso
                     else:
                         errored += 1
     finally:
+        # source_pools and meta_pool are always separate ConnectionPool
+        # objects (see above -- never the same instance, even when their
+        # underlying names collide), so closing both here never
+        # double-closes anything.
         close_pools(source_pools)
-        close_pools({gre_config.get_meta_connection_name(): meta_pool})
+        close_pools({meta_name: meta_pool})
 
     return results, succeeded, errored
 
@@ -248,8 +326,8 @@ def run_rule_group(
     ----------
     rule_group   : which group of gre_rules to run
     run_key      : opaque tracking/idempotency identifier for this run
-                   (gre_exceptions_uix, gre_log, gre_results, gre_audit key
-                   off this value) -- a batch id, a year+month pair, a
+                   (gre_exceptions_uix, gre_log, gre_results, gre_rule_audit
+                   key off this value) -- a batch id, a year+month pair, a
                    specific date, or any other column/combination the
                    caller wants; build one via shared/db_ops.py::
                    build_run_key() or pass your own string. Deliberately
@@ -268,7 +346,7 @@ def run_rule_group(
                    cf.get(gre_config.get_meta_connection_name())
     meta_db      : schema the gre_ tables live in; defaults to
                    gre_config.get_meta_db()
-    triggered_by : freeform string recorded on gre_audit
+    triggered_by : freeform string recorded on gre_rule_audit
     run_params   : optional dict of named values a rule's rule_syntax can
                    reference via "{key}" tokens -- passed through exactly
                    as given, no reserved/required key. The SAME dict also
@@ -282,8 +360,8 @@ def run_rule_group(
                    _substitute_params()'s docstring.
     rule_variant : optional extra selection level on top of rule_group/
                    table -- passed straight to rules_engine.rules.load_rules()
-                   (see its docstring) and recorded on gre_audit for this
-                   run. None (the default) loads only rules with
+                   (see its docstring) and recorded on gre_rule_audit for
+                   this run. None (the default) loads only rules with
                    rule_variant IS NULL (universal rules for the group).
 
     Returns
@@ -325,11 +403,11 @@ def run_rule_group(
     if any(r.get("project_name") != project_name or r.get("process_name") != process_name for r in rules):
         logger.warning(
             "rule_group=%s has mixed project_name/process_name values across rules -- "
-            "using project_name=%s process_name=%s (from rule_id=%s, lowest seq_no) for gre_audit.",
+            "using project_name=%s process_name=%s (from rule_id=%s, lowest seq_no) for gre_rule_audit.",
             rule_group, project_name, process_name, rules[0]["rule_id"],
         )
 
-    run_id = generate_run_id(rule_group, run_key)
+    run_id = _build_group_run_id(meta_conn, meta_db, rule_group, run_key, project_name, triggered_by)
     _start_audit(meta_conn, meta_db, run_id, rule_group, run_key, len(rules), triggered_by,
                  rule_variant=rule_variant, project_name=project_name, process_name=process_name)
     logger.info("Starting GRE run: %s (%d rule(s))", run_id, len(rules))
@@ -494,7 +572,7 @@ def run_all_active_groups(
     Discover every active rule_group in scope (optionally filtered by
     project_name/process_name) and call run_rule_group() once per group,
     against the SAME run_key/run_params/rule_variant. Each group still gets
-    its own run_id and its own gre_audit row -- this is a thin fan-out,
+    its own run_id and its own gre_rule_audit row -- this is a thin fan-out,
     not a merged run.
 
     Returns {"rule_groups": {rule_group: run_rule_group()'s own summary dict, ...}}
@@ -507,7 +585,21 @@ def run_all_active_groups(
         "run_all_active_groups: %d rule_group(s) in scope (project_name=%s process_name=%s) for run_key=%s.",
         len(rule_groups), project_name, process_name, run_key,
     )
+    return _run_rule_groups(rule_groups, meta_conn, meta_db, run_key, cf,
+                             triggered_by, run_params, rule_variant)
 
+
+def _run_rule_groups(rule_groups, meta_conn, meta_db: str, run_key: str, cf,
+                      triggered_by: str, run_params: dict, rule_variant: str) -> dict:
+    """
+    Shared tail of run_all_active_groups()/run_by_process_name(): run
+    run_rule_group() once per already-discovered rule_group and collect
+    the summaries. Factored out so run_by_process_name() -- which must
+    call discover_rule_groups() itself first, to raise ValueError on an
+    empty match -- can hand its result straight in here instead of making
+    run_all_active_groups() re-run the identical discover_rule_groups()
+    query a second time.
+    """
     summaries = {}
     for rule_group in rule_groups:
         summaries[rule_group] = run_rule_group(
@@ -515,7 +607,6 @@ def run_all_active_groups(
             meta_conn=meta_conn, meta_db=meta_db, triggered_by=triggered_by,
             run_params=run_params, rule_variant=rule_variant,
         )
-
     return {"rule_groups": summaries}
 
 
@@ -575,9 +666,11 @@ def run_by_process_name(
             f"{f' project_name={project_name!r}' if project_name else ''} -- check gre_rules for a typo, "
             f"or use run_all_active_groups() directly if an empty result is actually expected."
         )
-
-    return run_all_active_groups(
-        meta_conn, meta_db, run_key, cf,
-        project_name=project_name, process_name=process_name,
-        triggered_by=triggered_by, run_params=run_params, rule_variant=rule_variant,
+    logger.info(
+        "run_by_process_name: %d rule_group(s) in scope (project_name=%s process_name=%s) for run_key=%s.",
+        len(rule_groups), project_name, process_name, run_key,
     )
+    # Reuses the discover_rule_groups() call above instead of going through
+    # run_all_active_groups() (which would re-run that identical query).
+    return _run_rule_groups(rule_groups, meta_conn, meta_db, run_key, cf,
+                             triggered_by, run_params, rule_variant)

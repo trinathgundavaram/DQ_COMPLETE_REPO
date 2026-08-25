@@ -14,6 +14,7 @@ import pytest
 import rules_engine.executor as rules_engine_executor
 from rules_engine.runner import (
     run_rule_group, discover_rule_groups, run_all_active_groups, run_by_process_name,
+    generate_run_id,
 )
 from shared.db_ops import execute_query
 
@@ -136,7 +137,9 @@ def _conn():
             project_name VARCHAR, process_name VARCHAR,
             run_key VARCHAR, seq_no INTEGER, start_time TIMESTAMP, end_time TIMESTAMP,
             status VARCHAR, rowcount BIGINT, error_message VARCHAR,
-            load_datetime TIMESTAMP DEFAULT current_timestamp
+            active_ind VARCHAR DEFAULT 'Y',
+            load_datetime TIMESTAMP DEFAULT current_timestamp,
+            last_updated_datetime TIMESTAMP
         )
     """)
 
@@ -144,7 +147,9 @@ def _conn():
         CREATE TABLE gre_errors (
             error_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
             run_key VARCHAR, error_type VARCHAR, error_message VARCHAR,
-            error_detail VARCHAR, occurred_at TIMESTAMP DEFAULT current_timestamp
+            error_detail VARCHAR, active_ind VARCHAR DEFAULT 'Y',
+            occurred_at TIMESTAMP DEFAULT current_timestamp,
+            last_updated_datetime TIMESTAMP
         )
     """)
 
@@ -155,14 +160,14 @@ def _conn():
             total_records BIGINT, failed_records BIGINT, failure_pct DOUBLE,
             threshold_pct_used DOUBLE, threshold_count_used INTEGER,
             threshold_operator_used VARCHAR, severity VARCHAR, status VARCHAR,
-            source_tieback_sql VARCHAR,
+            source_tieback_sql VARCHAR, active_ind VARCHAR DEFAULT 'Y',
             evaluated_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
     conn.execute("CREATE UNIQUE INDEX gre_results_uix ON gre_results(rule_id, run_key)")
 
     conn.execute("""
-        CREATE TABLE gre_audit (
+        CREATE TABLE gre_rule_audit (
             run_id VARCHAR, rule_group VARCHAR, project_name VARCHAR, process_name VARCHAR,
             run_key VARCHAR, rule_variant VARCHAR,
             started_at TIMESTAMP, ended_at TIMESTAMP, status VARCHAR,
@@ -213,6 +218,70 @@ def _run_all(meta_conn, meta_db, run_key, cf, **kwargs):
     run_params = {"batch_id": run_key}
     run_params.update(kwargs.pop("run_params", None) or {})
     return run_all_active_groups(meta_conn, meta_db, run_key, cf, run_params=run_params, **kwargs)
+
+
+# ── generate_run_id (thin wrapper over shared/db_ops.py's) ──────────────
+
+def test_generate_run_id_delegates_to_shared_helper():
+    """
+    rules_engine.runner.generate_run_id() is a thin wrapper around
+    shared/db_ops.py::generate_run_id() -- the format/uniqueness
+    guarantees themselves are covered exhaustively in
+    tests/test_shared_db_ops.py; this just confirms the wrapper actually
+    delegates rather than keeping its own (possibly drifted) copy of the
+    old second-precision "{rule_group}_{run_key}_{ts}" format.
+    """
+    run_id = generate_run_id("claims_dq", "BATCH_2026_08_19")
+    assert run_id.startswith("claims_dq::BATCH_2026_08_19::")
+    parts = run_id.split("::")
+    assert len(parts) == 4   # rule_group, run_key, timestamp, uniqueness suffix
+    assert generate_run_id("claims_dq", "BATCH_2026_08_19") != run_id   # never collides
+
+
+# ── run_rule_group()'s own richer run_id (project_name.rule_group,
+#    attempt-N, triggered_by folded in -- see runner.py::_build_group_run_id()) ──
+
+def test_run_rule_group_run_id_embeds_project_attempt_and_triggered_by():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=1, project_name="HEALTHSPRING_UM")
+
+    summary = _run("claims_dq", "BATCH_2026_08_19", cf, meta_conn=conn, meta_db=META_DB, triggered_by="jsmith")
+
+    # project_name.rule_group prefix, attempt-1 (first attempt at this
+    # run_key), and triggered_by all visible directly in the id -- no join
+    # back to gre_rule_audit needed to answer "what/who/which attempt was this."
+    assert summary["run_id"].startswith("HEALTHSPRING_UM.claims_dq::BATCH_2026_08_19::attempt-1::jsmith::")
+
+    audit = execute_query(conn, "SELECT triggered_by FROM gre_rule_audit WHERE run_id = ?", [summary["run_id"]])
+    assert audit[0]["triggered_by"] == "jsmith"
+
+
+def test_run_rule_group_run_id_attempt_number_increments_on_rerun():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=1)
+
+    first = _run("claims_dq", "BATCH_2026_08_19", cf, meta_conn=conn, meta_db=META_DB)
+    second = _run("claims_dq", "BATCH_2026_08_19", cf, meta_conn=conn, meta_db=META_DB)   # deliberate rerun, same run_key
+    third = _run("claims_dq", "BATCH_2026_08_19", cf, meta_conn=conn, meta_db=META_DB)
+
+    assert "::attempt-1::" in first["run_id"]
+    assert "::attempt-2::" in second["run_id"]
+    assert "::attempt-3::" in third["run_id"]
+
+    # A different run_key starts its own attempt count from 1.
+    other_key = _run("claims_dq", "BATCH_2026_08_20", cf, meta_conn=conn, meta_db=META_DB)
+    assert "::attempt-1::" in other_key["run_id"]
+
+
+def test_run_rule_group_run_id_omits_project_prefix_when_project_name_unset():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=1, project_name=None)
+
+    summary = _run("claims_dq", "BATCH_2026_08_19", cf, meta_conn=conn, meta_db=META_DB)
+    assert summary["run_id"].startswith("claims_dq::BATCH_2026_08_19::attempt-1::")
 
 
 def test_rerun_always_re_executes_already_succeeded_rules():
@@ -368,7 +437,7 @@ def test_rule_variant_requested_runs_universal_plus_matching_variant():
     assert summary["total_rules"] == 2
     assert set(summary["results"].keys()) == {1, 2}
 
-    audit = execute_query(conn, "SELECT rule_variant FROM gre_audit WHERE run_id = ?", [summary["run_id"]])
+    audit = execute_query(conn, "SELECT rule_variant FROM gre_rule_audit WHERE run_id = ?", [summary["run_id"]])
     assert audit[0]["rule_variant"] == "2026"
 
 
@@ -527,7 +596,7 @@ def test_parallel_meta_connection_unavailable_fails_every_rule_without_deadlock(
 
 def test_parallel_respects_per_connection_max_parallel_cap(monkeypatch):
     monkeypatch.setenv("GRE_MAX_PARALLEL_RULES", "6")
-    monkeypatch.setenv("DQ_DUCKDB_TEST_MAX_PARALLEL", "2")   # cap this source at 2 concurrent sessions
+    monkeypatch.setenv("GRE_TERADATA_MAX_PARALLEL", "2")   # cap this source at 2 concurrent sessions
     conn = _conn()
     cf = _CountingFakeConnectionFactory(conn)
     for rule_id, seq_no in [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]:
@@ -537,10 +606,19 @@ def test_parallel_respects_per_connection_max_parallel_cap(monkeypatch):
 
     assert summary["status"] == "COMPLETED"
     assert summary["succeeded"] == 5
-    # Only 2 source connections were ever built for 'teradata', even
-    # though 5 rules ran and GRE_MAX_PARALLEL_RULES allowed 6 concurrent --
-    # proves DQ_<NAME>_MAX_PARALLEL, not just the group-wide cap, bounds
-    # how many sessions land on one connection.
+    # Only 2 connections were ever built for 'teradata' -- even though it
+    # serves BOTH roles here (every rule's sql_dialect AND the default meta
+    # connection name; see shared/config.py's META_CONNECTION default), a
+    # single shared pool is built per connection NAME now (runner.py::
+    # _run_pending_parallel()), not once per role. Before that fix, source
+    # and meta pools were built independently for the same name and this
+    # assertion (==2) passed for the wrong reason -- it was really 1 (source)
+    # + 1 (meta) each capped at the *default* limit of 1, since the env var
+    # here used to be misspelled and never actually applied. Now it's one
+    # pool of size min(GRE_TERADATA_MAX_PARALLEL, GRE_MAX_PARALLEL_RULES) =
+    # min(2, 6) = 2, proving GRE_<NAME>_MAX_PARALLEL bounds the real number
+    # of concurrent sessions against one connection, not per-role double
+    # counting.
     assert cf.calls["teradata"] == 2
 
 
@@ -599,7 +677,7 @@ def test_parallel_shared_total_cache_still_avoids_redundant_count_queries(monkey
 
 # ── project_name/process_name propagation ─────────────────────────────────
 
-def test_gre_audit_carries_project_and_process_name_from_rules():
+def test_gre_rule_audit_carries_project_and_process_name_from_rules():
     conn = _conn()
     cf = _FakeConnectionFactory(conn)
     _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10,
@@ -608,13 +686,13 @@ def test_gre_audit_carries_project_and_process_name_from_rules():
     summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
     assert summary["status"] == "COMPLETED"
 
-    audit = execute_query(conn, "SELECT * FROM gre_audit WHERE run_id = ?", [summary["run_id"]])
+    audit = execute_query(conn, "SELECT * FROM gre_rule_audit WHERE run_id = ?", [summary["run_id"]])
     assert len(audit) == 1
     assert audit[0]["project_name"] == "HEALTHSPRING_UM"
     assert audit[0]["process_name"] == "UNIVERSE_VALIDATION"
 
 
-def test_gre_audit_warns_and_picks_lowest_seq_no_on_mixed_project_name(caplog):
+def test_gre_rule_audit_warns_and_picks_lowest_seq_no_on_mixed_project_name(caplog):
     conn = _conn()
     cf = _FakeConnectionFactory(conn)
     _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10,
@@ -626,7 +704,7 @@ def test_gre_audit_warns_and_picks_lowest_seq_no_on_mixed_project_name(caplog):
         summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "COMPLETED"
-    audit = execute_query(conn, "SELECT * FROM gre_audit WHERE run_id = ?", [summary["run_id"]])
+    audit = execute_query(conn, "SELECT * FROM gre_rule_audit WHERE run_id = ?", [summary["run_id"]])
     assert audit[0]["project_name"] == "HEALTHSPRING_UM"      # rule 1, lowest seq_no
     assert audit[0]["process_name"] == "UNIVERSE_VALIDATION"
     assert any("mixed project_name/process_name" in r.message for r in caplog.records)
@@ -660,7 +738,7 @@ def test_run_all_active_groups_runs_one_group_per_rule_group():
     assert set(outcome["rule_groups"].keys()) == {"group_a", "group_b"}
     assert outcome["rule_groups"]["group_a"]["status"] == "COMPLETED"
     assert outcome["rule_groups"]["group_b"]["status"] == "COMPLETED"
-    # Each group gets its OWN gre_audit row / run_id -- not a merged run.
+    # Each group gets its OWN gre_rule_audit row / run_id -- not a merged run.
     assert outcome["rule_groups"]["group_a"]["run_id"] != outcome["rule_groups"]["group_b"]["run_id"]
 
 

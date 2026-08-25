@@ -66,10 +66,16 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_log (
     status          VARCHAR(20),
     rowcount        BIGINT,
     error_message   VARCHAR(2000),
-    load_datetime   TIMESTAMP
+    active_ind      CHAR(1),
+    load_datetime   TIMESTAMP,
+    last_updated_datetime TIMESTAMP
 );
+ALTER TABLE {{SCHEMA}}.gre_log ADD COLUMN IF NOT EXISTS active_ind CHAR(1);
+ALTER TABLE {{SCHEMA}}.gre_log ADD COLUMN IF NOT EXISTS last_updated_datetime TIMESTAMP;
 CREATE INDEX IF NOT EXISTS gre_log_group_run_key_ix
     ON {{SCHEMA}}.gre_log (rule_group, run_key, status);
+CREATE INDEX IF NOT EXISTS gre_log_rule_run_key_active_ix
+    ON {{SCHEMA}}.gre_log (rule_id, run_key, active_ind);
 
 CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_exceptions (
     record_id             BIGINT PRIMARY KEY,
@@ -119,14 +125,23 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_results (
     threshold_operator_used  CHAR(3),
     severity                 VARCHAR(50),
     status                   VARCHAR(10),
+    source_tieback_sql       TEXT,
+    active_ind               CHAR(1),
     evaluated_at             TIMESTAMP
 );
+ALTER TABLE {{SCHEMA}}.gre_results ADD COLUMN IF NOT EXISTS source_tieback_sql TEXT;
+ALTER TABLE {{SCHEMA}}.gre_results ADD COLUMN IF NOT EXISTS active_ind CHAR(1);
 CREATE UNIQUE INDEX IF NOT EXISTS gre_results_uix
     ON {{SCHEMA}}.gre_results (rule_id, run_key);
 
-CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_audit (
+-- gre_audit split into gre_rule_audit / gre_sampling_audit (2026-08) --
+-- mirrors the same split on the Teradata side, see shared/schema.sql's
+-- module header for the full rationale. metadata_sync/tables.py syncs
+-- these two tables directly (GRE_RULE_AUDIT/GRE_SAMPLING_AUDIT specs);
+-- gre_audit below is a VIEW here too, for anything still querying it
+-- directly against the Postgres mirror.
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_rule_audit (
     run_id              VARCHAR(200) PRIMARY KEY,
-    run_type            VARCHAR(20),
     rule_group          VARCHAR(100),
     project_name        VARCHAR(100),
     process_name        VARCHAR(100),
@@ -138,16 +153,68 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_audit (
     total_rules         INTEGER,
     rules_succeeded     INTEGER,
     rules_errored       INTEGER,
+    triggered_by        VARCHAR(100),
+    load_datetime       TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS gre_rule_audit_status_ix ON {{SCHEMA}}.gre_rule_audit (status);
+CREATE INDEX IF NOT EXISTS gre_rule_audit_group_run_key_ix ON {{SCHEMA}}.gre_rule_audit (rule_group, run_key);
+
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_sampling_audit (
+    run_id              VARCHAR(200) PRIMARY KEY,
+    run_key             VARCHAR(100),
     sample_config_id    INTEGER,
     sampling_method     VARCHAR(20),
     random_seed         BIGINT,
     target_volume       INTEGER,
     total_candidates    INTEGER,
     total_selected      INTEGER,
+    started_at          TIMESTAMP,
+    ended_at            TIMESTAMP,
+    status              VARCHAR(20),
     triggered_by        VARCHAR(100),
     load_datetime       TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS gre_audit_status_ix ON {{SCHEMA}}.gre_audit (status);
+CREATE INDEX IF NOT EXISTS gre_sampling_audit_status_ix ON {{SCHEMA}}.gre_sampling_audit (status);
+CREATE INDEX IF NOT EXISTS gre_sampling_audit_config_run_key_ix ON {{SCHEMA}}.gre_sampling_audit (sample_config_id, run_key);
+
+-- Idempotent across reruns regardless of which object currently exists
+-- under this name (a leftover pre-split TABLE the first time this runs
+-- against an older mirror, or the VIEW itself on every rerun after) --
+-- whichever doesn't exist is a harmless no-op, the other gets dropped so
+-- CREATE VIEW below always starts clean.
+DROP VIEW IF EXISTS {{SCHEMA}}.gre_audit;
+DROP TABLE IF EXISTS {{SCHEMA}}.gre_audit;
+
+CREATE VIEW {{SCHEMA}}.gre_audit AS
+SELECT
+    run_id, 'RULE_GROUP'::VARCHAR(20) AS run_type,
+    rule_group, project_name, process_name, run_key, rule_variant,
+    started_at, ended_at, status,
+    total_rules, rules_succeeded, rules_errored,
+    NULL::INTEGER      AS sample_config_id,
+    NULL::VARCHAR(20)  AS sampling_method,
+    NULL::BIGINT       AS random_seed,
+    NULL::INTEGER      AS target_volume,
+    NULL::INTEGER      AS total_candidates,
+    NULL::INTEGER      AS total_selected,
+    triggered_by, load_datetime
+FROM {{SCHEMA}}.gre_rule_audit
+UNION ALL
+SELECT
+    run_id, 'SAMPLING'::VARCHAR(20) AS run_type,
+    NULL::VARCHAR(100) AS rule_group,
+    NULL::VARCHAR(100) AS project_name,
+    NULL::VARCHAR(100) AS process_name,
+    run_key,
+    NULL::VARCHAR(100) AS rule_variant,
+    started_at, ended_at, status,
+    NULL::INTEGER AS total_rules,
+    NULL::INTEGER AS rules_succeeded,
+    NULL::INTEGER AS rules_errored,
+    sample_config_id, sampling_method, random_seed,
+    target_volume, total_candidates, total_selected,
+    triggered_by, load_datetime
+FROM {{SCHEMA}}.gre_sampling_audit;
 
 CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_errors (
     error_id         BIGINT PRIMARY KEY,
@@ -158,9 +225,15 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_errors (
     error_type       VARCHAR(50),
     error_message    VARCHAR(2000),
     error_detail     TEXT,
-    occurred_at      TIMESTAMP
+    active_ind       CHAR(1),
+    occurred_at      TIMESTAMP,
+    last_updated_datetime TIMESTAMP
 );
+ALTER TABLE {{SCHEMA}}.gre_errors ADD COLUMN IF NOT EXISTS active_ind CHAR(1);
+ALTER TABLE {{SCHEMA}}.gre_errors ADD COLUMN IF NOT EXISTS last_updated_datetime TIMESTAMP;
 CREATE INDEX IF NOT EXISTS gre_errors_run_rule_ix ON {{SCHEMA}}.gre_errors (run_id, rule_id);
+CREATE INDEX IF NOT EXISTS gre_errors_rule_run_key_active_ix
+    ON {{SCHEMA}}.gre_errors (rule_id, run_key, active_ind);
 
 CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_sampling_config (
     config_id           INTEGER PRIMARY KEY,
@@ -213,9 +286,13 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_sample_selections (
     excluded_flag      SMALLINT,
     exclusion_reason   VARCHAR(500),
     selected_flag      SMALLINT,
+    etl_is_curr_ind    CHAR(1),
     load_datetime      TIMESTAMP,
+    last_updated_datetime TIMESTAMP,
     PRIMARY KEY (sample_run_id, case_key)
 );
+ALTER TABLE {{SCHEMA}}.gre_sample_selections ADD COLUMN IF NOT EXISTS etl_is_curr_ind CHAR(1);
+ALTER TABLE {{SCHEMA}}.gre_sample_selections ADD COLUMN IF NOT EXISTS last_updated_datetime TIMESTAMP;
 CREATE INDEX IF NOT EXISTS gre_sample_selections_lookup_ix
     ON {{SCHEMA}}.gre_sample_selections (project_name, process_name, sample_cycle, selected_flag);
 
@@ -225,6 +302,10 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_sample_selection_attrs (
     strata_id        INTEGER NOT NULL,
     level_order      INTEGER,
     bucket_value     VARCHAR(200),
+    etl_is_curr_ind  CHAR(1),
     load_datetime    TIMESTAMP,
+    last_updated_datetime TIMESTAMP,
     PRIMARY KEY (sample_run_id, case_key, strata_id)
 );
+ALTER TABLE {{SCHEMA}}.gre_sample_selection_attrs ADD COLUMN IF NOT EXISTS etl_is_curr_ind CHAR(1);
+ALTER TABLE {{SCHEMA}}.gre_sample_selection_attrs ADD COLUMN IF NOT EXISTS last_updated_datetime TIMESTAMP;

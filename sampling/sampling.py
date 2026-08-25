@@ -57,7 +57,7 @@ re-expressed in this shape).
 Reproducibility for RANDOM/SYSTEMATIC
 --------------------------------------
 ONE random seed is generated (or supplied) per sample_run_id and stored on
-the gre_audit summary row. Buckets at every level are always processed in
+the gre_sampling_audit summary row. Buckets at every level are always processed in
 a fixed, deterministic order (bucket values sorted ascending) using a
 single random.Random(seed) instance threaded through the whole recursion,
 so re-running _stratify with the same seed reproduces every bucket's
@@ -77,13 +77,16 @@ from datetime import datetime
 
 from shared.db_ops import (
     execute_query, execute_dml, bulk_insert, log_error,
-    _run_source_query, _substitute_params,
+    _run_source_query, _substitute_params, generate_run_id, count_prior_attempts,
 )
 
-# gre_audit is written to via _write_audit() below with run_type='SAMPLING';
-# _deactivate_prior_sampling_runs() reads it back with this same literal to
-# find a config_id+run_key's prior sample_run_id(s).
-_SAMPLING_AUDIT_RUN_TYPE = "SAMPLING"
+# gre_sampling_audit -- sampling's OWN run-tracking table, split out of the
+# old combined gre_audit (see shared/schema.sql's module header). Written
+# to via _write_audit() below; rules_engine/ never reads or writes it (its
+# equivalent is rules_engine/runner.py::_start_audit()/_finish_audit()
+# against gre_rule_audit). Anything still reading the old combined shape
+# can query the gre_audit VIEW (also defined in shared/schema.sql) instead
+# -- this code never touches it.
 
 logger = logging.getLogger(__name__)
 
@@ -153,22 +156,35 @@ def _round_target(value: float, rounding_mode: str) -> int:
     return max(0, math.floor(value))  # FLOOR (default)
 
 
-def _target_for_bucket(bucket_value: str, mix: dict, total: int, rounding_mode: str) -> int:
+def _target_for_bucket(bucket_value: str, mix: dict, total: int, rounding_mode: str,
+                        unmixed_count: int = 1) -> int:
     """
     Same rule as core/stratified_sampling.py::_target_for_bucket, generalized
     to a config-driven rounding_mode instead of hardcoded floor(): a
     bucket_value present in `mix` gets that fraction of `total`; any
-    bucket_value NOT in `mix` gets the remainder fraction
-    (1 - sum(named fractions)) -- independently, same as the proven
-    pattern, bounded in practice by the final target_volume truncation in
-    run_sampling().
+    bucket_value NOT in `mix` SHARES the remainder fraction
+    (1 - sum(named fractions)) among however many distinct unmixed values
+    are actually present at this level (`unmixed_count`), bounded in
+    practice by the final target_volume truncation in run_sampling().
+
+    `unmixed_count` defaults to 1 -- the single-unnamed-bucket case this
+    was originally written for, and what a direct call (e.g. from a unit
+    test) gets if it doesn't know how many sibling unmixed buckets exist.
+    _stratify() below is the one caller that knows the real count (from
+    the level's actual bucketed data) and passes it explicitly -- giving
+    the FULL remainder to every unmixed bucket independently, instead of
+    splitting it, over-allocates quota whenever a level has more than one
+    bucket_value absent from gre_sampling_mix (e.g. an "Approved"/"Denied"
+    mix with three OTHER statuses present in the data would previously
+    give each of those three the whole remainder instead of a third of
+    it).
     """
     if not mix:
         return total
     if bucket_value in mix:
         return _round_target(total * mix[bucket_value], rounding_mode)
     named_fraction = sum(mix.values())
-    remainder_fraction = max(0.0, 1.0 - named_fraction)
+    remainder_fraction = max(0.0, 1.0 - named_fraction) / max(1, unmixed_count)
     return _round_target(total * remainder_fraction, rounding_mode)
 
 
@@ -247,18 +263,26 @@ def _stratify(candidates: list, levels: list, target: int, method: str, rounding
 
     level = levels[level_index]
     key = _bucket_key(level["strata_id"])
+    mix = level["mix"]
 
     buckets: dict = {}
     for row in candidates:
         bval = str(row.get(key))
         buckets.setdefault(bval, []).append(row)
 
+    # How many of this level's ACTUAL bucket values are absent from
+    # gre_sampling_mix -- computed once per level (not per bucket) so
+    # _target_for_bucket can split the remainder fraction evenly across
+    # all of them, instead of giving each one the full remainder
+    # independently. See _target_for_bucket()'s docstring.
+    unmixed_count = sum(1 for bval in buckets if bval not in mix)
+
     selected = []
     # Deterministic bucket order (sorted) -- required so a seeded rng
     # produces the exact same sequence of draws on every replay.
     for bval in sorted(buckets.keys()):
         brows = buckets[bval]
-        btarget = _target_for_bucket(bval, level["mix"], target, rounding_mode)
+        btarget = _target_for_bucket(bval, mix, target, rounding_mode, unmixed_count)
         sub_path = f"{path}/{bval}" if path else bval
         selected.extend(_stratify(brows, levels, btarget, method, rounding_mode,
                                   rng, level_index + 1, by_stratum, sub_path))
@@ -269,6 +293,11 @@ def _stratify(candidates: list, levels: list, target: int, method: str, rounding
 # ---------------------------------------------------------------------------
 # Candidate pull
 # ---------------------------------------------------------------------------
+
+def _key_columns(config: dict) -> list:
+    """gre_sampling_config.key_columns is a comma-separated string; one place to split/trim it."""
+    return [c.strip() for c in config["key_columns"].split(",") if c.strip()]
+
 
 def _pull_candidates(db_conn, config: dict, levels: list, run_params: dict) -> list:
     """
@@ -284,7 +313,7 @@ def _pull_candidates(db_conn, config: dict, levels: list, run_params: dict) -> l
     substitution at all, silently unable to reference {run_key} or any
     other run param even though scope_sql could.
     """
-    key_cols = [c.strip() for c in config["key_columns"].split(",") if c.strip()]
+    key_cols = _key_columns(config)
     strata_select = [f"{lvl['stratify_expr']} AS {_bucket_key(lvl['strata_id'])}" for lvl in levels]
 
     scope = (config.get("scope_sql") or "").strip() or "1=1"
@@ -310,7 +339,18 @@ def _pull_candidates(db_conn, config: dict, levels: list, run_params: dict) -> l
     # RANDOM may or may not -- if it does, the pull is still ordered by it
     # (unchanged from the prior behavior), but the rank itself stays NULL
     # below since RANDOM's own selection is a shuffle, not a rank read.
-    order_clause = f"ORDER BY {priority_sql}" if priority_sql else ""
+    #
+    # A RANDOM pull with no priority_rank_sql still needs SOME
+    # deterministic ORDER BY, or this whole feature's core promise --
+    # "the same seed reproduces every bucket's draw exactly" (see this
+    # module's docstring) -- silently breaks: rng.shuffle() is only
+    # reproducible given the SAME starting row order every run, and most
+    # source engines make no ordering guarantee at all for a query with no
+    # ORDER BY. Falling back to key_cols keeps the pull's row order
+    # (and therefore the shuffle) stable across reruns, without requiring
+    # every RANDOM config to also author a priority_rank_sql it has no
+    # other use for.
+    order_clause = f"ORDER BY {priority_sql}" if priority_sql else f"ORDER BY {', '.join(key_cols)}"
 
     if method in _METHODS_REQUIRING_PRIORITY:
         rank_select = f"ROW_NUMBER() OVER (ORDER BY {priority_sql}) AS _priority_rank"
@@ -427,10 +467,12 @@ def _deactivate_prior_sampling_runs(meta_conn, meta_db: str, config_id, run_key:
 
     run_key is not stored directly on gre_sample_selections (only embedded
     inside the sample_run_id string), so prior sample_run_id(s) for this
-    (config_id, run_key) are found via gre_audit instead -- one row per
-    sampling run, with run_type='SAMPLING', sample_config_id, and run_key
-    all recorded by _write_audit(). Never deletes: a superseded run's rows
-    stay in both tables with etl_is_curr_ind='N' for history/audit.
+    (config_id, run_key) are found via gre_sampling_audit instead -- one
+    row per sampling run, with sample_config_id and run_key recorded by
+    _write_audit(). (gre_sampling_audit holds sampling runs ONLY -- no
+    run_type filter needed here anymore, unlike when this queried the old
+    combined gre_audit table.) Never deletes: a superseded run's rows stay
+    in both tables with etl_is_curr_ind='N' for history/audit.
 
     Called AFTER this run's own rows are persisted as active (see
     run_sampling()), so a failure here never leaves a (config_id, run_key)
@@ -445,10 +487,10 @@ def _deactivate_prior_sampling_runs(meta_conn, meta_db: str, config_id, run_key:
         meta_conn,
         f"""
         SELECT DISTINCT run_id
-        FROM {meta_db}.gre_audit
-        WHERE run_type = ? AND sample_config_id = ? AND run_key = ? AND run_id <> ?
+        FROM {meta_db}.gre_sampling_audit
+        WHERE sample_config_id = ? AND run_key = ? AND run_id <> ?
         """,
-        [_SAMPLING_AUDIT_RUN_TYPE, config_id, run_key, current_sample_run_id],
+        [config_id, run_key, current_sample_run_id],
     )
     prior_run_ids = [r["run_id"] for r in prior_runs]
     if not prior_run_ids:
@@ -484,17 +526,17 @@ def _deactivate_prior_sampling_runs(meta_conn, meta_db: str, config_id, run_key:
 
 def _write_audit(meta_conn, meta_db: str, sample_run_id: str, run_key: str, config: dict, method: str,
                  seed, target_vol: int, total_candidates: int, total_selected: int,
-                 started_at: datetime, status: str) -> None:
+                 started_at: datetime, status: str, triggered_by: str = "SYSTEM") -> None:
     execute_dml(meta_conn, f"""
-        INSERT INTO {meta_db}.gre_audit (
-            run_id, run_type, run_key, started_at, ended_at, status,
+        INSERT INTO {meta_db}.gre_sampling_audit (
+            run_id, run_key, started_at, ended_at, status,
             sample_config_id, sampling_method, random_seed,
             target_volume, total_candidates, total_selected, triggered_by
-        ) VALUES (?, 'SAMPLING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SYSTEM')
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [
         sample_run_id, run_key, started_at, datetime.now(), status,
         config.get("config_id"), method, seed,
-        target_vol, total_candidates, total_selected,
+        target_vol, total_candidates, total_selected, triggered_by,
     ])
 
 
@@ -516,7 +558,7 @@ def _log_sampling_error(meta_conn, meta_db: str, sample_run_id: str, run_key: st
 # ---------------------------------------------------------------------------
 
 def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = None, seed: int = None,
-                 run_params: dict = None) -> dict:
+                 run_params: dict = None, triggered_by: str = "SYSTEM") -> dict:
     """
     Execute one stratified sampling pass for `config_id`, scoped to
     `run_key` and whatever else `run_params` supplies (substituted into
@@ -526,28 +568,32 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
 
     Parameters
     ----------
-    config_id  : gre_sampling_config.config_id to run
-    run_key    : opaque tracking/idempotency identifier for this run
-                 (embedded into sample_run_id, and recorded on gre_audit) --
-                 a batch id, a year+month pair, a specific date, or any
-                 other column/combination the caller wants; build one via
-                 shared/db_ops.py::build_run_key() or pass your own
-                 string. Deliberately NOT merged into run_params -- see
-                 run_params below -- if scope_sql/exclusion_sql need to
-                 reference the run's tracking value, pass it explicitly
-                 via run_params under whatever key they choose.
-    cf         : ConnectionFactory, already loaded
-    meta_conn  : adapter for the gre_ metadata store; defaults to
-                 cf.get(gre_config.get_meta_connection_name())
-    meta_db    : schema the gre_ tables live in; defaults to
-                 gre_config.get_meta_db()
-    seed       : explicit seed for RANDOM/SYSTEMATIC reproducibility; a
-                 fresh one is generated and persisted if not supplied
-    run_params : optional dict of named values scope_sql/exclusion_sql can
-                 reference via "{key}" tokens -- passed through exactly as
-                 given, no reserved/required key. Lets each project scope
-                 its candidate universe however it needs, the same way
-                 rules_engine's run_params does.
+    config_id    : gre_sampling_config.config_id to run
+    run_key      : opaque tracking/idempotency identifier for this run
+                   (embedded into sample_run_id, and recorded on gre_sampling_audit) --
+                   a batch id, a year+month pair, a specific date, or any
+                   other column/combination the caller wants; build one via
+                   shared/db_ops.py::build_run_key() or pass your own
+                   string. Deliberately NOT merged into run_params -- see
+                   run_params below -- if scope_sql/exclusion_sql need to
+                   reference the run's tracking value, pass it explicitly
+                   via run_params under whatever key they choose.
+    cf           : ConnectionFactory, already loaded
+    meta_conn    : adapter for the gre_ metadata store; defaults to
+                   cf.get(gre_config.get_meta_connection_name())
+    meta_db      : schema the gre_ tables live in; defaults to
+                   gre_config.get_meta_db()
+    seed         : explicit seed for RANDOM/SYSTEMATIC reproducibility; a
+                   fresh one is generated and persisted if not supplied
+    run_params   : optional dict of named values scope_sql/exclusion_sql can
+                   reference via "{key}" tokens -- passed through exactly as
+                   given, no reserved/required key. Lets each project scope
+                   its candidate universe however it needs, the same way
+                   rules_engine's run_params does.
+    triggered_by : freeform string recorded on gre_sampling_audit AND folded into
+                   sample_run_id -- same parameter/purpose as
+                   rules_engine/runner.py::run_rule_group()'s triggered_by.
+                   Defaults to "SYSTEM" for unattended/scheduled callers.
 
     Returns
     -------
@@ -572,16 +618,34 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
 
     rounding_mode = config.get("rounding_mode") or "FLOOR"
     target_vol = int(config.get("target_volume") or 150)
-    key_cols = [c.strip() for c in config["key_columns"].split(",") if c.strip()]
+    key_cols = _key_columns(config)
 
-    sample_run_id = f"{config.get('sample_name', 'SAMPLE')}_{run_key}_{started_at.strftime('%Y%m%d_%H%M%S')}"
+    # Same shape/rationale as rules_engine/runner.py::_build_group_run_id()
+    # -- see that function's docstring and shared/db_ops.py::
+    # generate_run_id()'s. Folds in project_name (if set on this config),
+    # an "attempt-N" label (N = count_prior_attempts() + 1, keyed on
+    # (run_key, config_id)), and triggered_by, on top of the plain
+    # sample_name::run_key shape this used to be:
+    #
+    #   {project_name}.{sample_name}::{run_key}::attempt-{N}::{triggered_by}::{timestamp}::{hex}
+    #
+    # `timestamp=started_at` keeps the id's embedded timestamp identical to
+    # what _write_audit() below persists as gre_sampling_audit.started_at, rather
+    # than a separate datetime.now() call drifting from it by however long
+    # load_sampling_config() took.
+    attempt_no = count_prior_attempts(meta_conn, meta_db, run_key, sample_config_id=config_id) + 1
+    sample_name = config.get("sample_name", "SAMPLE")
+    group_label = f"{config['project_name']}.{sample_name}" if config.get("project_name") else sample_name
+    sample_run_id = generate_run_id(
+        group_label, run_key, f"attempt-{attempt_no}", triggered_by, timestamp=started_at
+    )
 
     db_conn = cf.get(config["source_type"])
     if db_conn is None:
         _log_sampling_error(meta_conn, meta_db, sample_run_id, run_key, config,
                             "CONNECTION_UNAVAILABLE", f"No connection '{config['source_type']}'")
         _write_audit(meta_conn, meta_db, sample_run_id, run_key, config, method, None,
-                    target_vol, 0, 0, started_at, "ERROR")
+                    target_vol, 0, 0, started_at, "ERROR", triggered_by=triggered_by)
         return {"sample_run_id": sample_run_id, "status": "ERROR", "candidates": 0, "selected": 0,
                "target_volume": target_vol, "by_stratum": {}, "seed": None}
 
@@ -598,13 +662,13 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
         logger.error("Sampling config_id=%s: candidate pull failed: %s", config_id, exc, exc_info=True)
         _log_sampling_error(meta_conn, meta_db, sample_run_id, run_key, config, "PULL_FAILURE", str(exc))
         _write_audit(meta_conn, meta_db, sample_run_id, run_key, config, method, run_seed,
-                    target_vol, 0, 0, started_at, "ERROR")
+                    target_vol, 0, 0, started_at, "ERROR", triggered_by=triggered_by)
         return {"sample_run_id": sample_run_id, "status": "ERROR", "candidates": 0, "selected": 0,
                "target_volume": target_vol, "by_stratum": {}, "seed": run_seed}
 
     if not candidates:
         _write_audit(meta_conn, meta_db, sample_run_id, run_key, config, method, run_seed,
-                    target_vol, 0, 0, started_at, "COMPLETED")
+                    target_vol, 0, 0, started_at, "COMPLETED", triggered_by=triggered_by)
         return {"sample_run_id": sample_run_id, "status": "COMPLETED", "candidates": 0, "selected": 0,
                "target_volume": target_vol, "by_stratum": {}, "seed": run_seed}
 
@@ -613,7 +677,7 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
     # key_columns/config mismatch -- see its docstring) previously
     # propagated all the way out of run_sampling() uncaught, unlike every
     # other failure mode in this function, which logs to gre_errors and
-    # writes an ERROR gre_audit row instead of crashing the caller.
+    # writes an ERROR gre_sampling_audit row instead of crashing the caller.
     try:
         by_stratum: dict = {}
         selected = _stratify(candidates, levels, target_vol, method, rounding_mode, rng,
@@ -641,7 +705,7 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
         logger.error("Sampling config_id=%s: select/persist failed: %s", config_id, exc, exc_info=True)
         _log_sampling_error(meta_conn, meta_db, sample_run_id, run_key, config, "SELECT_PERSIST_FAILURE", str(exc))
         _write_audit(meta_conn, meta_db, sample_run_id, run_key, config, method, run_seed,
-                    target_vol, len(candidates), 0, started_at, "ERROR")
+                    target_vol, len(candidates), 0, started_at, "ERROR", triggered_by=triggered_by)
         return {"sample_run_id": sample_run_id, "status": "ERROR", "candidates": len(candidates), "selected": 0,
                "target_volume": target_vol, "by_stratum": {}, "seed": run_seed}
 
@@ -667,7 +731,8 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
                             "DEACTIVATE_PRIOR_RUNS_FAILURE", str(exc))
 
     _write_audit(meta_conn, meta_db, sample_run_id, run_key, config, method, run_seed,
-                target_vol, len(candidates), len(selected), started_at, "COMPLETED")
+                target_vol, len(candidates), len(selected), started_at, "COMPLETED",
+                triggered_by=triggered_by)
 
     logger.info(
         "Sampling complete: sample_run_id=%s candidates=%d selected=%d/%d target (method=%s).",
@@ -731,6 +796,7 @@ def run_sampling_for_process_name(
     project_name: str = None,
     seed: int = None,
     run_params: dict = None,
+    triggered_by: str = "SYSTEM",
 ) -> dict:
     """
     Thin convenience wrapper around run_sampling(): discovers every active
@@ -764,6 +830,8 @@ def run_sampling_for_process_name(
                    substitution, passed through to every run_sampling()
                    call unchanged. run_key is deliberately NOT merged into
                    this -- see run_sampling()'s docstring.
+    triggered_by : freeform string passed through to every run_sampling()
+                   call unchanged -- see that function's docstring.
 
     Returns {"sampling_configs": {config_id: run_sampling()'s own summary
     dict, ...}} so a caller can inspect or aggregate per-config outcomes; a
@@ -799,6 +867,7 @@ def run_sampling_for_process_name(
         summaries[config_id] = run_sampling(
             config_id, run_key, cf,
             meta_conn=meta_conn, meta_db=meta_db, seed=seed, run_params=run_params,
+            triggered_by=triggered_by,
         )
 
     return {"sampling_configs": summaries}

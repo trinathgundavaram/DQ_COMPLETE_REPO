@@ -72,13 +72,26 @@ def _escape(value: str) -> str:
 def _view_name(src_tbl_nm: str) -> str:
     """
     A safe SQL identifier for a file/S3 rule's DuckDB view, derived from
-    src_tbl_nm (e.g. "claims.csv" -> "claims", "pull_date=*/*.parquet" ->
-    "pull_date___"). rule_syntax for a file/S3 rule references this same name,
-    so keep src_tbl_nm simple (no need to match it exactly -- just be aware
-    non-alnum characters become underscores).
+    the WHOLE src_tbl_nm string (e.g. "claims.csv" -> "claims",
+    "pull_date=*/*.parquet" -> "pull_date___2A___2Aparquet"-shaped --
+    every character outside [0-9a-zA-Z_] becomes '_', not just the final
+    path segment). rule_syntax for a file/S3 rule references this same
+    name, so keep src_tbl_nm simple (no need to match it exactly -- just
+    be aware non-alnum characters become underscores).
+
+    Deliberately does NOT use Path(src_tbl_nm).stem: that only looks at
+    the final path segment, so two different multi-segment paths/globs
+    that happen to share a final segment (e.g. "pull_date=*/*.parquet" and
+    "region=*/*.parquet" both end in "*.parquet") previously collapsed to
+    the SAME view name -- the second rule prepared under that name was
+    silently treated as "already registered" and read the first rule's
+    data instead of its own. Stripping only the trailing file extension
+    (if any) and cleaning the rest of the string keeps every distinct
+    src_tbl_nm mapped to a distinct view name.
     """
-    stem = Path(src_tbl_nm).stem or src_tbl_nm
-    cleaned = re.sub(r"[^0-9a-zA-Z_]", "_", stem) or "t"
+    suffix = Path(src_tbl_nm).suffix
+    base = src_tbl_nm[: -len(suffix)] if suffix else src_tbl_nm
+    cleaned = re.sub(r"[^0-9a-zA-Z_]", "_", base) or "t"
     return f"t_{cleaned}" if cleaned[0].isdigit() else cleaned
 
 
@@ -106,11 +119,15 @@ class SourceAdapter(ABC):
     def ping(self) -> bool:
         try:
             cur = self.cursor()
+        except Exception:
+            return False
+        try:
             cur.execute("SELECT 1")
-            cur.close()
             return True
         except Exception:
             return False
+        finally:
+            cur.close()
 
     def prepare(self, rule: dict) -> None:
         """Per-rule setup hook. No-op for real databases; file/S3 override this."""
@@ -312,7 +329,11 @@ class FileAdapter(SourceAdapter):
             self._local.registered = registered
 
     def qualified_name(self, rule: dict) -> str:
-        return _view_name(rule["src_tbl_nm"])
+        # Must strip the same way prepare() does -- otherwise a src_tbl_nm
+        # with leading/trailing whitespace gets registered under one view
+        # name here but referenced under a different (unstripped) one in
+        # the generated FROM-clause SQL, and the query fails to find it.
+        return _view_name((rule.get("src_tbl_nm") or "").strip())
 
     @classmethod
     def build(cls) -> "FileAdapter":
@@ -399,7 +420,9 @@ class S3Adapter(SourceAdapter):
         logger.info("S3 view prepared: %s -> %s", view_name, uri)
 
     def qualified_name(self, rule: dict) -> str:
-        return _view_name(rule["src_tbl_nm"])
+        # Same rationale as FileAdapter.qualified_name() -- strip to match
+        # the name prepare() actually registered the view under.
+        return _view_name((rule.get("src_tbl_nm") or "").strip())
 
     @classmethod
     def build(cls) -> "S3Adapter":
@@ -501,12 +524,23 @@ class ConnectionFactory:
         if not adapter.ping():
             logger.warning("Connection '%s' is stale -- reconnecting.", source_type)
             try:
-                adapter = self._build(source_type)
-                self._conns[source_type] = adapter
-                logger.info("Connection '%s' reconnected.", source_type)
+                new_adapter = self._build(source_type)
             except Exception as exc:
                 logger.error("Reconnect failed for '%s': %s", source_type, exc, exc_info=True)
                 return None
+            # Build succeeded before we drop the old handle, so a failed
+            # reconnect never leaves this source_type with no adapter at
+            # all. Close the stale connection only now, after the new one
+            # is already in place -- otherwise a dead TCP/session handle
+            # (and, for Teradata/Postgres, its server-side session slot)
+            # would leak on every stale-connection reconnect.
+            try:
+                adapter.close()
+            except Exception as exc:
+                logger.warning("Error closing stale connection '%s': %s", source_type, exc)
+            adapter = new_adapter
+            self._conns[source_type] = adapter
+            logger.info("Connection '%s' reconnected.", source_type)
 
         return adapter
 
@@ -547,3 +581,17 @@ class ConnectionFactory:
                 f"Unknown source_type '{source_type}'. Supported: {', '.join(sorted(_TYPE_MAP))}"
             )
         return adapter_cls.build()
+
+
+def build_and_load_connection_factory() -> "ConnectionFactory":
+    """
+    ConnectionFactory() + .load() in one call -- the two-line "bring up
+    every configured source_type" boilerplate every root-level CLI script
+    (run_by_process.py, report_source_records.py) needs before it can do
+    anything. Was duplicated verbatim as each script's own private
+    _build_connection_factory(); factored out here since both already
+    import from this module anyway.
+    """
+    cf = ConnectionFactory()
+    cf.load()
+    return cf

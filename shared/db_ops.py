@@ -26,11 +26,17 @@ _substitute_params()'s docstring below for the substitution mechanics,
 and build_run_key() for a convenience way to build a run_key out of
 whatever column(s) a caller wants (a batch id, a year+month pair, a
 specific date, or any other combination).
+
+`run_key` (which logical run this is) and `run_id` (which specific
+attempt at it this is) are different things -- see generate_run_id()'s
+docstring below for the full distinction and the shape `run_id` takes.
 """
 
 import logging
 import os
 import re
+import secrets
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -73,28 +79,30 @@ except ImportError:
 def execute_query(conn, query: str, params=None) -> list:
     """Run a SELECT and return rows as list-of-dicts (column names lowercased)."""
     cursor = conn.cursor()
-    if params is not None:
-        cursor.execute(query, params)
-    else:
-        cursor.execute(query)
-    if cursor.description is None:
+    try:
+        if params is not None:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        if cursor.description is None:
+            return []
+        columns = [c[0].lower() for c in cursor.description]
+        return [dict(zip(columns, r)) for r in cursor.fetchall()]
+    finally:
         cursor.close()
-        return []
-    columns = [c[0].lower() for c in cursor.description]
-    rows = [dict(zip(columns, r)) for r in cursor.fetchall()]
-    cursor.close()
-    return rows
 
 
 def execute_dml(conn, query: str, params=None):
     """Execute one DML statement and commit immediately -- every call is its own transaction."""
     cursor = conn.cursor()
-    if params is not None:
-        cursor.execute(query, params)
-    else:
-        cursor.execute(query)
-    conn.commit()
-    cursor.close()
+    try:
+        if params is not None:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        conn.commit()
+    finally:
+        cursor.close()
 
 
 _DUPLICATE_KEY_MARKERS = (
@@ -144,6 +152,28 @@ def _insert_or_skip(conn, sql: str, params: list) -> bool:
         cursor.close()
 
 
+def _chunked_executemany(conn, sql: str, rows: list, chunk_size: int = None) -> int:
+    """
+    Shared body for bulk_insert()/bulk_execute() below -- both are a plain
+    chunked executemany() with one commit per chunk (not per row), and
+    differ only in what they return (bulk_insert() has never had a
+    meaningful count to give back; bulk_execute() returns len(rows)). One
+    loop, two thin public wrappers, rather than the same chunking logic
+    kept twice.
+    """
+    if not rows:
+        return 0
+    size = chunk_size or EXCEPTION_CHUNK
+    cursor = conn.cursor()
+    try:
+        for i in range(0, len(rows), size):
+            cursor.executemany(sql, rows[i:i + size])
+            conn.commit()
+    finally:
+        cursor.close()
+    return len(rows)
+
+
 def bulk_insert(conn, sql: str, rows: list, chunk_size: int = None) -> None:
     """
     Plain chunked executemany() -- no duplicate-key handling. Use only for
@@ -157,16 +187,7 @@ def bulk_insert(conn, sql: str, rows: list, chunk_size: int = None) -> None:
     DB-API cursor.executemany()'s convention -- the same shape
     core/executor.py::bulk_insert expects.
     """
-    if not rows:
-        return
-    size = chunk_size or EXCEPTION_CHUNK
-    cursor = conn.cursor()
-    try:
-        for i in range(0, len(rows), size):
-            cursor.executemany(sql, rows[i:i + size])
-            conn.commit()
-    finally:
-        cursor.close()
+    _chunked_executemany(conn, sql, rows, chunk_size)
 
 
 def bulk_insert_or_skip(conn, sql: str, rows: list, chunk_size: int = None) -> int:
@@ -246,17 +267,7 @@ def bulk_execute(conn, sql: str, rows: list, chunk_size: int = None) -> int:
     every DB-API driver exposes a uniform "rows actually matched" count,
     and the caller already knows which record_ids/keys it targeted.
     """
-    if not rows:
-        return 0
-    size = chunk_size or EXCEPTION_CHUNK
-    cursor = conn.cursor()
-    try:
-        for i in range(0, len(rows), size):
-            cursor.executemany(sql, rows[i:i + size])
-            conn.commit()
-    finally:
-        cursor.close()
-    return len(rows)
+    return _chunked_executemany(conn, sql, rows, chunk_size)
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +371,148 @@ def build_run_key(*parts, delimiter: str = "_") -> str:
     return delimiter.join(str(p) for p in parts)
 
 
+def generate_run_id(*label_parts, timestamp: datetime = None) -> str:
+    """
+    Build one `run_id` -- the identifier `gre_log`, `gre_exceptions`,
+    `gre_results`, `gre_errors`, and `gre_audit` all stamp on every row
+    written by ONE execution (rules_engine/runner.py::run_rule_group() or
+    sampling/sampling.py::run_sampling()), as opposed to `run_key`, which
+    identifies WHICH LOGICAL RUN a caller is tracking/re-running (see
+    build_run_key() above) and can be shared across many `run_id`s over
+    time (a rerun of the same `run_key` always mints a brand new
+    `run_id`). If `run_key` answers "which batch/period is this," `run_id`
+    answers "which specific attempt at it is this."
+
+    Shape: "{label_parts joined by '::'}::{timestamp to the microsecond}::{6 hex chars}"
+
+        generate_run_id("claims_dq", "BATCH_2026_08_19")
+            -> "claims_dq::BATCH_2026_08_19::20260819T143022.183045::a1b2c3"
+        generate_run_id("HealthSpring UM Sample", "2026-08-01")
+            -> "HealthSpring UM Sample::2026-08-01::20260819T143022.183045::f9e8d7"
+
+    Why this shape, piece by piece:
+      - Label parts (e.g. rule_group + run_key, or a sample config's name +
+        run_key) come first so a human scanning `gre_log`/`gre_audit`/a log
+        line can immediately tell WHAT ran and for WHICH run_key without
+        decoding anything -- no separate lookup needed for the common case
+        of "which rule_group/run_key does this row belong to."
+      - '::' (not '_' or '-') separates the parts visually, chosen
+        specifically because rule_group/run_key/sample_name are free-form
+        VARCHAR columns that very often already contain '_' or '-'
+        themselves (e.g. run_key="BATCH_2026_08_19") -- '::' reads clearly
+        as a segment boundary in a log line or a SQL result grid even when
+        the labels around it don't. This is for human readability ONLY:
+        nothing in this codebase parses a run_id back apart by delimiter
+        (searched and confirmed -- every table just compares run_id for
+        exact equality), so this is safe to pick for legibility without
+        an ambiguous-parsing risk to worry about.
+      - The timestamp is microsecond-precision and in a sortable
+        YYYYMMDDTHHMMSS.ffffff shape (lexicographic sort == chronological
+        sort), so `ORDER BY run_id` on any of these tables already sorts
+        runs oldest-to-newest without touching load_datetime/started_at,
+        AND a human can read the exact moment an attempt started directly
+        off the id, no join required.
+      - The trailing 6 hex characters (`secrets.token_hex(3)`) exist
+        SOLELY to make collision effectively impossible even if two calls
+        land in the same microsecond (a real, observed risk with the
+        previous second-precision-only format -- e.g.
+        rules_engine/runner.py::generate_run_id() used to produce the
+        exact same run_id for two run_rule_group() calls issued within
+        the same wall-clock second, which is why
+        tests/test_sampling.py::test_deactivates_prior_run_on_rerun
+        used to need an artificial time.sleep(1.1) between two calls just
+        to dodge that collision -- see that test's history). A run_id
+        collision is a real correctness risk, not just a cosmetic one:
+        every reconciliation query in this codebase (gre_exceptions'
+        etl_is_curr_ind flip, gre_log/gre_errors' active_ind flip) filters
+        on "run_id <> this_run_id" to tell "this attempt" from "an earlier
+        one" -- two attempts sharing a run_id would each treat the other's
+        rows as its own, silently corrupting that logic.
+
+    `timestamp`: defaults to `datetime.now()`; pass an explicit value
+    (e.g. a run's own `started_at`) so the run_id's embedded timestamp
+    matches a timestamp already being persisted elsewhere for the same
+    run, instead of a call to this function drifting by however many
+    milliseconds elapsed since that earlier `datetime.now()`.
+
+    Label parts that are `None` or empty string are skipped rather than
+    producing an empty, doubled-up '::' segment -- lets a caller pass
+    something optional (e.g. a `rule_variant` that might be `None`)
+    without special-casing it themselves.
+
+    Length: the timestamp + suffix + delimiters overhead is a fixed 34
+    characters ("::20260819T143022.183045::a1b2c3"), leaving comfortable
+    room for label parts under every gre_*.run_id column's VARCHAR(200)
+    (e.g. rules_engine's rule_group and run_key are each VARCHAR(100) at
+    the source -- ordinary values leave this well under the limit). Logs
+    a warning rather than silently truncating if a caller's label parts
+    are unusually long enough to push the total over 200 -- the resulting
+    INSERT would fail loudly at the database instead in that case, which
+    is preferable to a truncated, ambiguous run_id, but this warning
+    surfaces the problem before that point.
+    """
+    ts = (timestamp or datetime.now()).strftime("%Y%m%dT%H%M%S.%f")
+    suffix = secrets.token_hex(3)
+    labels = [str(p) for p in label_parts if p not in (None, "")]
+    run_id = "::".join([*labels, ts, suffix])
+    if len(run_id) > 200:
+        logger.warning(
+            "generate_run_id(): generated run_id is %d characters, over the 200-char "
+            "VARCHAR(200) run_id/sample_run_id column width used across gre_* tables -- "
+            "the write that uses this run_id may fail. Label parts: %r",
+            len(run_id), labels,
+        )
+    return run_id
+
+
+def count_prior_attempts(meta_conn, meta_db: str, run_key, rule_group: str = None,
+                          sample_config_id=None) -> int:
+    """
+    How many prior attempts at this (run_key, rule_group) -- a RULE_GROUP
+    run, counted from `gre_rule_audit` -- or this (run_key,
+    sample_config_id) -- a SAMPLING run, counted from `gre_sampling_audit`
+    -- already exist. Callers use `this count + 1` as a human-readable
+    "attempt-N" label folded into `run_id`/`sample_run_id` (see
+    rules_engine/runner.py::run_rule_group() and
+    sampling/sampling.py::run_sampling()), so a rerun of the same run_key
+    is visibly attempt 2, 3, ... at a glance in `gre_log`/`gre_rule_audit`/
+    `gre_sampling_audit` instead of requiring a human to compare two
+    run_ids' timestamps to tell which came first.
+
+    Queries gre_rule_audit/gre_sampling_audit directly, NOT the gre_audit
+    compatibility view (see shared/schema.sql's module header for why that
+    view exists) -- both are indexed for exactly this lookup
+    (gre_rule_audit_group_run_key_ix / gre_sampling_audit_config_run_key_ix),
+    the view isn't.
+
+    Exactly one of `rule_group`/`sample_config_id` must be given -- they
+    pick which table this counts against; passing both or neither raises
+    ValueError rather than silently counting the wrong thing.
+
+    This is a LABEL, not a uniqueness mechanism: run_id's own trailing hex
+    suffix (see generate_run_id() above) is what actually guarantees no
+    two attempts collide. Two callers racing to start the same run_key at
+    the exact same instant could in principle compute the same attempt
+    number (a COUNT-then-INSERT race, not wrapped in a transaction) -- an
+    accepted cosmetic edge case, since it never affects correctness of the
+    active_ind/etl_is_curr_ind reconciliation, which keys off the
+    (unique) run_id, not this number.
+    """
+    if (rule_group is None) == (sample_config_id is None):
+        raise ValueError(
+            "count_prior_attempts(): pass exactly one of rule_group or sample_config_id "
+            f"(got rule_group={rule_group!r}, sample_config_id={sample_config_id!r})."
+        )
+    if rule_group is not None:
+        sql = f"SELECT COUNT(*) AS cnt FROM {meta_db}.gre_rule_audit WHERE run_key = ? AND rule_group = ?"
+        params = [run_key, rule_group]
+    else:
+        sql = f"SELECT COUNT(*) AS cnt FROM {meta_db}.gre_sampling_audit WHERE run_key = ? AND sample_config_id = ?"
+        params = [run_key, sample_config_id]
+    rows = execute_query(meta_conn, sql, params)
+    return int(rows[0]["cnt"]) if rows else 0
+
+
 # ---------------------------------------------------------------------------
 # Retry-wrapped source query
 # ---------------------------------------------------------------------------
@@ -373,11 +526,62 @@ def _run_source_query(db_conn, sql: str) -> list:
 # gre_errors -- shared error log
 # ---------------------------------------------------------------------------
 
+def _deactivate_prior_errors(meta_conn, meta_db: str, rule_id, run_key, current_run_id) -> None:
+    """
+    Soft-deactivate every gre_errors row for (rule_id, run_key) left active
+    from an EARLIER run_id, mirroring rules_engine/executor.py::
+    _deactivate_prior_log_attempts() for gre_log and
+    sampling/sampling.py::_deactivate_prior_sampling_runs() for
+    gre_sample_selections/gre_sample_selection_attrs -- the same "always
+    re-execute, deactivate stale, activate new" pattern applied here to
+    gre_errors, the one error log both rules_engine/ and sampling/ share.
+
+    rule_id is NULL for a sampling-run error (see sampling.py::
+    _log_sampling_error()) -- matched here with "rule_id IS NULL" instead
+    of "rule_id = NULL" (which would match nothing under normal SQL NULL
+    semantics) so a sampling run_key's own prior errors still get
+    deactivated the same way a rule's do. Never deletes -- gre_errors
+    keeps full history for audit; only active_ind flips. Never raises: a
+    failure here must not mask the real error being logged.
+    """
+    try:
+        if rule_id is None:
+            execute_dml(
+                meta_conn,
+                f"""
+                UPDATE {meta_db}.gre_errors
+                SET active_ind = 'N', last_updated_datetime = CURRENT_TIMESTAMP
+                WHERE rule_id IS NULL AND run_key = ? AND run_id <> ? AND active_ind = 'Y'
+                """,
+                [run_key, current_run_id],
+            )
+        else:
+            execute_dml(
+                meta_conn,
+                f"""
+                UPDATE {meta_db}.gre_errors
+                SET active_ind = 'N', last_updated_datetime = CURRENT_TIMESTAMP
+                WHERE rule_id = ? AND run_key = ? AND run_id <> ? AND active_ind = 'Y'
+                """,
+                [rule_id, run_key, current_run_id],
+            )
+    except Exception as exc:
+        logger.error(
+            "Failed to deactivate prior gre_errors rows for rule_id=%s run_key=%s: %s",
+            rule_id, run_key, exc,
+        )
+
+
 def log_error(meta_conn, meta_db: str, run_id, rule_id, rule_group, run_key,
               error_type: str, message: str, detail: str = None) -> None:
     """
-    Insert one gre_errors row from explicit scalar fields. Never raises --
-    an errors-table failure must not mask the real error.
+    Insert one gre_errors row from explicit scalar fields, after
+    deactivating any gre_errors row(s) left active for this
+    (rule_id, run_key) from an earlier run_id -- see
+    _deactivate_prior_errors()'s docstring. This error is always inserted
+    with active_ind='Y': it belongs to the run_id currently executing,
+    which is by definition the newest one for this run_key. Never raises
+    -- an errors-table failure must not mask the real error.
 
     This is the ONE shared gre_errors write path for the whole engine:
     rule execution (via rules_engine/executor.py's rule-dict convenience
@@ -387,10 +591,12 @@ def log_error(meta_conn, meta_db: str, run_id, rule_id, rule_group, run_key,
     instead of each keeping its own INSERT+try/except copy. gre_errors
     itself lives in shared/schema.sql for the same reason.
     """
+    _deactivate_prior_errors(meta_conn, meta_db, rule_id, run_key, run_id)
+
     sql = f"""
         INSERT INTO {meta_db}.gre_errors (
-            run_id, rule_id, rule_group, run_key, error_type, error_message, error_detail
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            run_id, rule_id, rule_group, run_key, error_type, error_message, error_detail, active_ind
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'Y')
     """
     try:
         execute_dml(meta_conn, sql, [run_id, rule_id, rule_group, run_key, error_type, message, detail])

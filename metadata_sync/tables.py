@@ -1,4 +1,4 @@
-"""Declarative registry of the 11 gre_* tables this tool mirrors.
+"""Declarative registry of the 12 gre_* tables this tool mirrors.
 sync_from_teradata.py and create_postgres_tables.py just loop over
 TABLE_SPECS -- add a table here (+ its CREATE TABLE in ddl_postgres.sql)
 and nothing else needs to change.
@@ -12,7 +12,14 @@ and nothing else needs to change.
                    against the stored watermark
     reopen_filter  incremental only, optional: extra predicate OR'd into
                    the WHERE clause so rows updated without bumping
-                   watermark_col keep getting re-pulled (see gre_audit)
+                   watermark_col keep getting re-pulled (see gre_rule_audit/
+                   gre_sampling_audit)
+
+Note: gre_audit itself (the old combined table, now a Teradata VIEW over
+gre_rule_audit/gre_sampling_audit -- see shared/schema.sql) is deliberately
+NOT in this registry -- a view has nothing of its own to sync
+incrementally against. ddl_postgres.sql creates the equivalent view on the
+Postgres side too, built from the two tables this DOES sync.
 """
 
 GRE_RULES = {
@@ -34,11 +41,14 @@ GRE_LOG = {
     "name": "gre_log",
     "primary_key": ("log_id",),
     "mode": "incremental",
-    "watermark_col": "load_datetime",
+    # active_ind flips (superseded by a later rerun of the same run_key)
+    # without bumping load_datetime -- watermark on whichever timestamp
+    # actually moved, same COALESCE pattern gre_exceptions below uses.
+    "watermark_col": "COALESCE(last_updated_datetime, load_datetime)",
     "columns": [
         "log_id", "run_id", "rule_id", "rule_group", "project_name", "process_name",
         "run_key", "seq_no", "start_time", "end_time", "status", "rowcount",
-        "error_message", "load_datetime",
+        "error_message", "active_ind", "load_datetime", "last_updated_datetime",
     ],
 }
 
@@ -68,26 +78,50 @@ GRE_RESULTS = {
         "result_id", "rule_id", "run_key", "run_id", "project_name", "process_name",
         "total_records", "failed_records", "failure_pct", "threshold_pct_used",
         "threshold_count_used", "threshold_operator_used", "severity", "status",
-        "evaluated_at",
+        "source_tieback_sql", "active_ind", "evaluated_at",
     ],
 }
 
-# gre_audit's ended_at/status UPDATE never bumps load_datetime (see
+# gre_audit split into gre_rule_audit / gre_sampling_audit (2026-08) -- see
+# shared/schema.sql's module header for the full rationale (rule-engine
+# users no longer drag along six always-NULL sampling columns and vice
+# versa). Both replace the single GRE_AUDIT entry that used to sync the
+# old combined table; the old gre_audit name now refers to a VIEW on the
+# Teradata side (a UNION ALL of these two tables, for anything still
+# querying it directly) -- deliberately NOT synced here: syncing the two
+# real tables gives Postgres the same segregation Teradata now has, and a
+# view has no watermark column of its own to sync incrementally against
+# anyway. If a Postgres consumer still wants the old combined shape,
+# ddl_postgres.sql defines the equivalent gre_audit view there too, built
+# from these two synced tables -- see that file.
+#
+# Both tables' ended_at/status UPDATE never bumps load_datetime (see
 # rules_engine/runner.py::_finish_audit, sampling/sampling.py::_write_audit),
 # so a plain watermark sync would miss every run's completion --
 # reopen_filter re-pulls any still-RUNNING row every time.
-GRE_AUDIT = {
-    "name": "gre_audit",
+GRE_RULE_AUDIT = {
+    "name": "gre_rule_audit",
     "primary_key": ("run_id",),
     "mode": "incremental",
     "watermark_col": "load_datetime",
     "reopen_filter": "status = 'RUNNING'",
     "columns": [
-        "run_id", "run_type", "rule_group", "project_name", "process_name", "run_key",
+        "run_id", "rule_group", "project_name", "process_name", "run_key",
         "rule_variant", "started_at", "ended_at", "status", "total_rules",
-        "rules_succeeded", "rules_errored", "sample_config_id", "sampling_method",
+        "rules_succeeded", "rules_errored", "triggered_by", "load_datetime",
+    ],
+}
+
+GRE_SAMPLING_AUDIT = {
+    "name": "gre_sampling_audit",
+    "primary_key": ("run_id",),
+    "mode": "incremental",
+    "watermark_col": "load_datetime",
+    "reopen_filter": "status = 'RUNNING'",
+    "columns": [
+        "run_id", "run_key", "sample_config_id", "sampling_method",
         "random_seed", "target_volume", "total_candidates", "total_selected",
-        "triggered_by", "load_datetime",
+        "started_at", "ended_at", "status", "triggered_by", "load_datetime",
     ],
 }
 
@@ -95,10 +129,12 @@ GRE_ERRORS = {
     "name": "gre_errors",
     "primary_key": ("error_id",),
     "mode": "incremental",
-    "watermark_col": "occurred_at",
+    # Same reasoning as gre_log above: active_ind flips without bumping
+    # occurred_at, so watermark on whichever timestamp actually moved.
+    "watermark_col": "COALESCE(last_updated_datetime, occurred_at)",
     "columns": [
         "error_id", "run_id", "rule_id", "rule_group", "run_key", "error_type",
-        "error_message", "error_detail", "occurred_at",
+        "error_message", "error_detail", "active_ind", "occurred_at", "last_updated_datetime",
     ],
 }
 
@@ -134,11 +170,21 @@ GRE_SAMPLE_SELECTIONS = {
     "name": "gre_sample_selections",
     "primary_key": ("sample_run_id", "case_key"),
     "mode": "incremental",
-    "watermark_col": "load_datetime",
+    # etl_is_curr_ind (sampling's own active_ind, see
+    # sampling/sampling.py::_deactivate_prior_sampling_runs()) flips
+    # without bumping load_datetime -- watermark on whichever timestamp
+    # actually moved, same COALESCE pattern gre_exceptions/gre_log use.
+    # NOTE: etl_is_curr_ind/last_updated_datetime were already live columns
+    # on this table (added by alter_sampling_tables.sql) but were missing
+    # from this sync spec entirely -- the Postgres mirror was silently
+    # never receiving the "is this the current sample run" flag or its
+    # flip timestamp. Fixed here alongside the gre_log/gre_errors/
+    # gre_results active_ind additions, same underlying bug class.
+    "watermark_col": "COALESCE(last_updated_datetime, load_datetime)",
     "columns": [
         "sample_run_id", "config_id", "project_name", "process_name", "sample_cycle",
         "case_key", "priority_rank", "excluded_flag", "exclusion_reason",
-        "selected_flag", "load_datetime",
+        "selected_flag", "etl_is_curr_ind", "load_datetime", "last_updated_datetime",
     ],
 }
 
@@ -146,17 +192,17 @@ GRE_SAMPLE_SELECTION_ATTRS = {
     "name": "gre_sample_selection_attrs",
     "primary_key": ("sample_run_id", "case_key", "strata_id"),
     "mode": "incremental",
-    "watermark_col": "load_datetime",
+    "watermark_col": "COALESCE(last_updated_datetime, load_datetime)",
     "columns": [
         "sample_run_id", "case_key", "strata_id", "level_order", "bucket_value",
-        "load_datetime",
+        "etl_is_curr_ind", "load_datetime", "last_updated_datetime",
     ],
 }
 
 TABLE_SPECS = [
-    GRE_RULES, GRE_LOG, GRE_EXCEPTIONS, GRE_RESULTS, GRE_AUDIT, GRE_ERRORS,
+    GRE_RULES, GRE_LOG, GRE_EXCEPTIONS, GRE_RESULTS, GRE_RULE_AUDIT, GRE_ERRORS,
     GRE_SAMPLING_CONFIG, GRE_SAMPLING_STRATA, GRE_SAMPLING_MIX,
-    GRE_SAMPLE_SELECTIONS, GRE_SAMPLE_SELECTION_ATTRS,
+    GRE_SAMPLE_SELECTIONS, GRE_SAMPLE_SELECTION_ATTRS, GRE_SAMPLING_AUDIT,
 ]
 
 TABLE_SPECS_BY_NAME = {spec["name"]: spec for spec in TABLE_SPECS}

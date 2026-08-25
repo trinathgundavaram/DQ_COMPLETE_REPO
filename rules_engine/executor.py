@@ -32,13 +32,27 @@ proven fix #1 fixes the equivalent problem for the dq_* engine:
      deriving failed_records from a COUNT(*) against the *destination*
      table after the write, ties the accuracy of failed_records to
      whatever exception-detail capture happens to write. _scan_violations()
-     runs rule_syntax ONCE, streamed via fetchmany(), producing both a true
-     failed count (counts every row, uncapped) and a GRE_MAX_EXCEPTIONS-
-     capped row list for detail capture from that same pass -- so a rule
-     that matches 10 million rows still gets an exact failed_records/
-     threshold verdict, with gre_exceptions detail capture bounded to a
-     safe, configurable ceiling, instead of trying to hold every row in
-     memory. See execute_rule()'s docstring for the trade-off this makes.
+     runs rule_syntax ONCE, streamed via fetchmany() in EXCEPTION_CHUNK-
+     sized batches rather than one giant fetchall(), producing both the
+     true failed count AND the full row list for gre_exceptions detail
+     capture from that same pass -- so a rule that matches 10 million rows
+     is still scanned only once instead of twice.
+
+     There is deliberately NO cap on how many violating rows get a
+     gre_exceptions detail row: every violating row is captured, in full,
+     every attempt -- compliance/audit review needs the complete record
+     set, not a sample of it. (An earlier version of this file capped
+     detail capture at GRE_MAX_EXCEPTIONS and only kept failed_records
+     exact past the cap; that capping behavior has been removed --
+     `rows` returned by _scan_violations() is always the complete
+     violation set.) The trade-off this makes: `rows` is held in memory
+     for the whole scan, so a rule matching an extremely large number of
+     rows needs memory proportional to that count -- accepted here in
+     exchange for gre_exceptions never silently missing a violating
+     record. See execute_rule()'s docstring for how this affects
+     _write_exceptions()'s deactivation reconciliation (it can now always
+     run, unconditionally, on every attempt -- see that function's
+     docstring).
   3. Running rule_syntax AGAIN just to count it (a separate COUNT(*)-wrapped
      query) means every rule scanned its own base data twice per attempt.
      _scan_violations() replaces that two-query design (formerly
@@ -49,7 +63,6 @@ proven fix #1 fixes the equivalent problem for the dq_* engine:
 """
 
 import logging
-import os
 import time
 from datetime import datetime
 
@@ -60,12 +73,6 @@ from shared.db_ops import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Cap on how many violating rows get a gre_exceptions detail row per rule
-# execution attempt. 0 or negative = unlimited. failed_records itself is
-# ALWAYS the true source-side count (_scan_violations), never capped --
-# only the row-level detail capture is bounded. Mirrors DQ_MAX_EXCEPTIONS.
-MAX_EXCEPTIONS = int(os.getenv("GRE_MAX_EXCEPTIONS", "10000"))
 
 # Severity values (case-insensitive) that resolve a breach to WARN rather
 # than FAIL -- same convention as core/executor.py's _SOFT_SEVERITIES, so a
@@ -93,21 +100,25 @@ def _log_error(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str,
 # as a hard error for this attempt (see execute_rule()'s STEP 1).
 def _scan_violations(db_conn, query: str) -> tuple:
     """
-    Run rule_syntax ONCE, streamed via fetchmany(), instead of the old
-    two-query design (a separate COUNT(*)-wrapped query, then rule_syntax
-    run again in full to fetch detail rows) -- roughly halving read load
-    against the source table/connection for every rule, since both old
-    queries evaluated the identical predicate against the identical rows.
+    Run rule_syntax ONCE, streamed via fetchmany() in EXCEPTION_CHUNK-sized
+    batches rather than one giant fetchall(), instead of the old two-query
+    design (a separate COUNT(*)-wrapped query, then rule_syntax run again
+    in full to fetch detail rows) -- roughly halving read load against the
+    source table/connection for every rule, since both old queries
+    evaluated the identical predicate against the identical rows.
 
     Returns (failed, rows):
-      failed : TRUE count of every row the query returns. This keeps
-               counting past MAX_EXCEPTIONS (it just stops appending to
-               `rows` once the cap is hit) -- failed_records/threshold
-               math stays exact no matter how many rows rule_syntax matches,
-               same guarantee the old _count_failed() gave.
-      rows   : up to MAX_EXCEPTIONS violating rows (0/negative = unlimited)
-               for gre_exceptions detail capture -- same cap/shape the old
-               _fetch_violating_rows() returned.
+      failed : count of every row the query returns -- always == len(rows).
+      rows   : EVERY violating row, uncapped, for gre_exceptions detail
+               capture -- there is no ceiling here (see the module
+               docstring's "Big-dataset path" section): compliance/audit
+               review needs the complete violation set, not a sample, so
+               nothing is ever dropped from `rows` regardless of how many
+               rows rule_syntax matches. This does mean memory use for
+               `rows` scales with the violation count for a single
+               attempt -- a rule matching an extremely large number of
+               rows needs correspondingly more memory to hold them all
+               before _write_exceptions() bulk-writes them.
 
     Trade-off vs. the two-query design: previously, a failure that hit
     ONLY the detail-fetch step -- AFTER a separate COUNT(*) had already
@@ -120,42 +131,27 @@ def _scan_violations(db_conn, query: str) -> tuple:
     whose result rows are unusually wide/expensive to materialize (many
     columns, large text fields), where a bare COUNT(*) might succeed even
     if pulling full rows hits a resource limit -- accepted here in
-    exchange for cutting the common-case scan cost in half. Note this
-    also means the scan can no longer stop early once the cap is hit (it
-    has to keep reading, just not storing, to keep `failed` exact) --
-    in practice a wash-or-better trade against the old design, since the
-    old COUNT(*) query already had to evaluate the full matching set on
-    the server regardless of any cap.
+    exchange for cutting the common-case scan cost in half.
     """
     cursor = db_conn.cursor()
-    cursor.execute(query)
-    if cursor.description is None:
-        cursor.close()
-        return 0, []
-    columns = [c[0].lower() for c in cursor.description]
-    cap = MAX_EXCEPTIONS if MAX_EXCEPTIONS > 0 else float("inf")
+    try:
+        cursor.execute(query)
+        if cursor.description is None:
+            return 0, []
+        columns = [c[0].lower() for c in cursor.description]
 
-    failed = 0
-    rows = []
-    cap_logged = False
-    while True:
-        batch = cursor.fetchmany(EXCEPTION_CHUNK)
-        if not batch:
-            break
-        for r in batch:
-            failed += 1
-            if len(rows) < cap:
+        failed = 0
+        rows = []
+        while True:
+            batch = cursor.fetchmany(EXCEPTION_CHUNK)
+            if not batch:
+                break
+            for r in batch:
+                failed += 1
                 rows.append(dict(zip(columns, r)))
-            elif not cap_logged:
-                logger.warning(
-                    "gre_exceptions capture cap reached (%d rows) -- failed_records stays "
-                    "exact (counted from this same scan); gre_exceptions only gets the "
-                    "first %d rows from this attempt.",
-                    MAX_EXCEPTIONS, MAX_EXCEPTIONS,
-                )
-                cap_logged = True
-    cursor.close()
-    return failed, rows
+        return failed, rows
+    finally:
+        cursor.close()
 
 
 # ---------------------------------------------------------------------------
@@ -330,11 +326,23 @@ def build_source_tieback_sql(rule: dict, run_key: str, meta_db: str) -> str:
         value_expr = _tieback_split_expr(dialect, "e.src_key_value", i, len(cols))
         # A genuinely NULL key column is stored as the literal string
         # "NULL" (see _format_src_key()'s docstring), not a real SQL NULL
-        # -- CASE this back to an IS NULL comparison so those rows still
-        # join instead of silently never matching (NULL = 'NULL' is never
-        # true in SQL).
+        # -- fall back to an IS NULL comparison so those rows still join
+        # instead of silently never matching (NULL = 'NULL' is never true
+        # in SQL). This used to be written as a CASE expression
+        # ("CASE WHEN {value_expr} = 'NULL' THEN s.{col} IS NULL ELSE
+        # s.{col} = {value_expr} END") -- that is invalid SQL in both
+        # target dialects: a CASE expression's THEN/ELSE branches must
+        # each return a scalar VALUE, and "s.{col} IS NULL" is a boolean
+        # PREDICATE, not a value, so this raised a syntax error the
+        # moment an analyst actually ran the generated SQL (Teradata has
+        # no first-class BOOLEAN type to return here at all; Postgres
+        # rejects a bare IS NULL as a CASE result for the same reason).
+        # An OR of two mutually-exclusive AND'd predicates expresses the
+        # identical logic and is valid, portable boolean SQL in both
+        # dialects.
         conditions.append(
-            f"(CASE WHEN {value_expr} = 'NULL' THEN s.{col} IS NULL ELSE s.{col} = {value_expr} END)"
+            f"(({value_expr} = 'NULL' AND s.{col} IS NULL) "
+            f"OR ({value_expr} <> 'NULL' AND s.{col} = {value_expr}))"
         )
     where_join = "\n  AND ".join(conditions)
 
@@ -456,7 +464,7 @@ def evaluate_threshold(
 # ---------------------------------------------------------------------------
 
 def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key: str, rows: list,
-                       run_params: dict = None, capped: bool = False) -> dict:
+                       run_params: dict = None) -> dict:
     """
     Reconcile gre_exceptions for (rule_id, run_key) against THIS attempt's
     true violation set, instead of a blind append-only insert. A rerun of
@@ -478,14 +486,14 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
     already filters on etl_is_curr_ind='Y', so nothing on the read side
     needs to change for deactivated rows to stop showing as open.
 
-    `capped`: True when _scan_violations()'s MAX_EXCEPTIONS cap means
-    `rows` is only a PARTIAL view of this attempt's true violations
-    (failed_records > MAX_EXCEPTIONS -- see execute_rule()'s STEP 1/STEP 3).
-    Deactivation is skipped entirely in that case: a src_key_value absent
-    from a partial `rows` list could still genuinely be violating, just
-    not captured in this attempt's capped detail set, and deactivating it
-    would incorrectly mark a still-open exception as fixed. Insert/
-    reactivate for whatever WAS captured still happens normally.
+    `rows` is always this attempt's COMPLETE violation set -- there is no
+    detail-capture cap on _scan_violations() any more (see that function's
+    docstring), so deactivation below always runs unconditionally: an
+    existing 'Y' row not present in `rows` is safely known to have been
+    fixed, never "maybe just not captured this time." (An earlier version
+    of this file skipped deactivation entirely when a MAX_EXCEPTIONS cap
+    meant `rows` was only a partial view -- that whole conditional no
+    longer applies, since `rows` can no longer be partial.)
 
     Rows are de-duplicated by src key WITHIN this call first (a
     rule_syntax that legitimately returns the same src key twice in one
@@ -567,27 +575,23 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
     """
     reactivated = bulk_execute(meta_conn, reactivate_sql, to_reactivate) if to_reactivate else 0
 
+    # `rows` is always this attempt's complete violation set (see this
+    # function's docstring), so it's always safe to deactivate an existing
+    # 'Y' row that isn't in it -- no cap-related "maybe not captured"
+    # ambiguity to guard against any more.
     deactivated = 0
-    if capped:
-        logger.warning(
-            "rule_id=%s run_key=%s: detail-row capture capped (MAX_EXCEPTIONS) -- skipping "
-            "deactivation of stale gre_exceptions rows this attempt (can't confirm a row "
-            "outside the captured set no longer violates from a partial view).",
-            rule_id, run_key,
-        )
-    else:
-        to_deactivate = [
-            [r["record_id"]]
-            for nk, r in existing_by_key.items()
-            if r["etl_is_curr_ind"] == "Y" and nk not in new_rows_by_key
-        ]
-        if to_deactivate:
-            deactivate_sql = f"""
-                UPDATE {meta_db}.gre_exceptions
-                SET etl_is_curr_ind = 'N', last_updated_by = 'SYSTEM', last_updated_datetime = CURRENT_TIMESTAMP
-                WHERE record_id = ?
-            """
-            deactivated = bulk_execute(meta_conn, deactivate_sql, to_deactivate)
+    to_deactivate = [
+        [r["record_id"]]
+        for nk, r in existing_by_key.items()
+        if r["etl_is_curr_ind"] == "Y" and nk not in new_rows_by_key
+    ]
+    if to_deactivate:
+        deactivate_sql = f"""
+            UPDATE {meta_db}.gre_exceptions
+            SET etl_is_curr_ind = 'N', last_updated_by = 'SYSTEM', last_updated_datetime = CURRENT_TIMESTAMP
+            WHERE record_id = ?
+        """
+        deactivated = bulk_execute(meta_conn, deactivate_sql, to_deactivate)
 
     return {"inserted": inserted, "reactivated": reactivated, "deactivated": deactivated}
 
@@ -598,13 +602,25 @@ def _upsert_result(meta_conn, meta_db: str, row: dict) -> None:
     unique-index duplicate-key error, UPDATE in place instead -- unlike
     gre_exceptions, this table is a summary row, not row-level history, so
     a rerun should overwrite it rather than accumulate duplicates.
+
+    active_ind is always written as 'Y' here (insert AND update): the
+    unique index (rule_id, run_key) already guarantees there is never more
+    than one gre_results row for a given rule+run_key, so there is never
+    a "stale" gre_results row left behind by a rerun to deactivate --
+    unlike gre_log/gre_errors below, which are append-only across reruns
+    of the same run_key under a NEW run_id and so genuinely need one. The
+    column is still carried here (see rules_engine/schema.sql) so every
+    gre_ table this feature touches exposes the same active_ind
+    vocabulary a downstream report can filter on uniformly, and so a
+    future move away from upsert-in-place (e.g. keeping gre_results
+    history too) wouldn't need a new column added.
     """
     insert_sql = f"""
         INSERT INTO {meta_db}.gre_results (
             rule_id, run_key, run_id, project_name, process_name, total_records, failed_records,
             failure_pct, threshold_pct_used, threshold_count_used,
-            threshold_operator_used, severity, status, source_tieback_sql
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            threshold_operator_used, severity, status, source_tieback_sql, active_ind
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Y')
     """
     params = [
         row["rule_id"], row["run_key"], row["run_id"], row.get("project_name"), row.get("process_name"),
@@ -616,6 +632,10 @@ def _upsert_result(meta_conn, meta_db: str, row: dict) -> None:
         execute_dml(meta_conn, insert_sql, params)
         return
     except Exception as exc:
+        try:
+            meta_conn.commit()   # release the aborted INSERT so the connection stays usable for the UPDATE below
+        except Exception:
+            pass
         if not _is_duplicate_key_error(exc):
             raise
 
@@ -624,7 +644,7 @@ def _upsert_result(meta_conn, meta_db: str, row: dict) -> None:
         SET run_id = ?, project_name = ?, process_name = ?, total_records = ?, failed_records = ?,
             failure_pct = ?, threshold_pct_used = ?, threshold_count_used = ?,
             threshold_operator_used = ?, severity = ?, status = ?, source_tieback_sql = ?,
-            evaluated_at = CURRENT_TIMESTAMP
+            active_ind = 'Y', evaluated_at = CURRENT_TIMESTAMP
         WHERE rule_id = ? AND run_key = ?
     """
     execute_dml(meta_conn, update_sql, [
@@ -635,18 +655,68 @@ def _upsert_result(meta_conn, meta_db: str, row: dict) -> None:
     ])
 
 
+def _deactivate_prior_log_attempts(meta_conn, meta_db: str, rule_id, run_key: str, current_run_id: str) -> None:
+    """
+    Soft-deactivate every gre_log row for (rule_id, run_key) left over from
+    an EARLIER run_id -- i.e. a previous, separate run of this same
+    run_key (rules_engine/runner.py::generate_run_id() mints a brand new
+    run_id every call, even for a repeated run_key). Mirrors
+    sampling/sampling.py::_deactivate_prior_sampling_runs()'s "always
+    re-execute, deactivate stale, activate new" pattern, applied here to
+    gre_log instead of gre_sample_selections.
+
+    Deliberately scoped to run_id <> current_run_id, NOT status: an ERROR
+    attempt from an earlier run_id is exactly as stale as a SUCCESS one
+    once this run_key has been re-run -- the LATEST run_id's own attempt
+    (whatever its status) is what should read as "active" for this
+    rule_id/run_key, not a mix of whichever old rows happened to say
+    SUCCESS. Never deletes -- gre_log keeps full history for audit; only
+    active_ind flips.
+
+    Called once per rule per attempt, immediately before _log_attempt()
+    inserts this attempt's own row -- see execute_rule()'s call sites
+    below. Never raises: a failure here must not mask the real attempt
+    outcome, same contract as _log_attempt() itself.
+    """
+    try:
+        execute_dml(
+            meta_conn,
+            f"""
+            UPDATE {meta_db}.gre_log
+            SET active_ind = 'N', last_updated_datetime = CURRENT_TIMESTAMP
+            WHERE rule_id = ? AND run_key = ? AND run_id <> ? AND active_ind = 'Y'
+            """,
+            [rule_id, run_key, current_run_id],
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to deactivate prior gre_log attempts for rule_id=%s run_key=%s: %s",
+            rule_id, run_key, exc,
+        )
+
+
 def _log_attempt(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str,
                   status: str, rowcount: int, start_time: float, error_message: str = None) -> None:
-    """Insert one gre_log row for this execution attempt. Never raises."""
+    """
+    Insert one gre_log row for this execution attempt, after deactivating
+    any gre_log row(s) left active for this (rule_id, run_key) from an
+    earlier run_id -- see _deactivate_prior_log_attempts()'s docstring.
+    This attempt's own row is always inserted with active_ind='Y': it is,
+    by definition, the newest attempt for this rule_id/run_key the moment
+    it's written. Never raises.
+    """
+    rule_id = rule.get("rule_id")
+    _deactivate_prior_log_attempts(meta_conn, meta_db, rule_id, run_key, run_id)
+
     sql = f"""
         INSERT INTO {meta_db}.gre_log (
             run_id, rule_id, rule_group, project_name, process_name, run_key, seq_no,
-            start_time, end_time, status, rowcount, error_message
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            start_time, end_time, status, rowcount, error_message, active_ind
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Y')
     """
     try:
         execute_dml(meta_conn, sql, [
-            run_id, rule.get("rule_id"), rule.get("rule_group"), rule.get("project_name"),
+            run_id, rule_id, rule.get("rule_group"), rule.get("project_name"),
             rule.get("process_name"), run_key, rule.get("seq_no"),
             datetime.fromtimestamp(start_time), datetime.now(), status, rowcount, error_message,
         ])
@@ -793,16 +863,16 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     rule_syntax is scanned ONCE (STEP 1, _scan_violations) instead of once
     for a COUNT(*) and again for detail-row capture -- see that function's
     docstring for the exact trade-off this makes. failed_records comes
-    from that same scan's true row count, exact no matter how many rows
-    rule_syntax actually matches, even though detail-row capture (also from
-    that scan) is capped at MAX_EXCEPTIONS. Because count and capture now
-    share one query, a failure during STEP 1 fails the whole rule (there's
-    no longer an independently-obtained count to fall back on) -- whereas
-    a failure specifically WRITING the already-fetched rows (STEP 3) is
-    still logged but non-fatal, since `failed`/`total` are already known
-    by then. total_cache (STEP 2) similarly avoids a redundant COUNT(*)
-    scan when several rules in a group ask the same "how many rows are in
-    this run" question.
+    from that same scan's true row count, and gre_exceptions detail
+    capture gets EVERY one of those rows, uncapped -- there is no
+    MAX_EXCEPTIONS ceiling any more (see _scan_violations()'s docstring).
+    Because count and capture share one query, a failure during STEP 1
+    fails the whole rule (there's no independently-obtained count to fall
+    back on) -- whereas a failure specifically WRITING the already-fetched
+    rows (STEP 3) is still logged but non-fatal, since `failed`/`total`
+    are already known by then. total_cache (STEP 2) similarly avoids a
+    redundant COUNT(*) scan when several rules in a group ask the same
+    "how many rows are in this run" question.
     """
     start = time.time()
 
@@ -827,7 +897,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
         _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, start, str(exc))
         return "ERROR"
 
-    # ── STEP 1: ONE scan of rule_syntax -- TRUE failed count + capped rows ───
+    # ── STEP 1: ONE scan of rule_syntax -- TRUE failed count + all rows ──────
     try:
         failed, violating_rows = _scan_violations(db_conn, query)
     except Exception as exc:
@@ -857,18 +927,16 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     # rules_engine/runner.py -- every run_rule_group() call now
     # re-executes every rule for its run_key (no more silent
     # already-succeeded skip), so this reconciliation runs on every rerun.
-    capped = MAX_EXCEPTIONS > 0 and failed > MAX_EXCEPTIONS
     reconcile = {"inserted": 0, "reactivated": 0, "deactivated": 0}
     try:
         reconcile = _write_exceptions(meta_conn, meta_db, rule, run_id, run_key, violating_rows,
-                                      run_params=run_params, capped=capped)
+                                      run_params=run_params)
     except Exception as exc:
         logger.warning(
             "Rule %s: exception-row reconciliation failed (failed_records is still accurate): %s",
             rule.get("rule_id"), exc, exc_info=True,
         )
         _log_error(meta_conn, meta_db, run_id, rule, run_key, "WRITE_FAILURE", str(exc))
-    written = reconcile["inserted"] + reconcile["reactivated"]
 
     verdict = evaluate_threshold(
         total, failed,
@@ -917,7 +985,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
         except Exception as exc:
             logger.error("Rule %s: gre_results upsert failed: %s", rule.get("rule_id"), exc, exc_info=True)
             _log_error(meta_conn, meta_db, run_id, rule, run_key, "RESULTS_WRITE_FAILURE", str(exc))
-            _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", written, start, str(exc))
+            _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", failed, start, str(exc))
             return "ERROR"
 
     logger.info(
@@ -926,12 +994,24 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
         rule.get("rule_id"), total, failed, reconcile["inserted"], reconcile["reactivated"],
         reconcile["deactivated"], verdict["status"], verdict["write_result"], time.time() - start,
     )
-    # gre_log.rowcount is "violating rows now ACTIVE in gre_exceptions as of
-    # THIS attempt" per the schema comment -- inserted + reactivated
-    # (rows _write_exceptions() actually flipped/created to
-    # etl_is_curr_ind='Y' this attempt), not `failed` (the true total,
-    # which would double-count rows already on file and still current from
-    # a prior attempt), and not `deactivated` (the opposite direction --
-    # records closed out this attempt, not newly/still-open ones).
-    _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "SUCCESS", written, start)
+    # gre_log.rowcount = `failed` -- the TRUE, exact count of violating rows
+    # from THIS attempt's own scan (rules_engine/schema.sql's comment:
+    # "violating rows written to gre_exceptions this attempt"), identical
+    # to what gets written as gre_results.failed_records for the same
+    # attempt. This used to log `written` (= reconcile["inserted"] +
+    # reconcile["reactivated"]) instead -- the count of rows that CHANGED
+    # to active THIS attempt, not the count of rows active as of this
+    # attempt. Those agree only on a rule's very first run: on any rerun
+    # where the violation set is unchanged (nothing newly broke, nothing
+    # got fixed), inserted=reactivated=0, so the old logic reported
+    # rowcount=0 for an attempt that still had `failed` genuine, currently-
+    # active violations on file -- a real rule with open violations reading
+    # as "0 rows" in gre_log every stable rerun, silently disagreeing with
+    # gre_results.failed_records and with a COUNT(*) against gre_exceptions
+    # itself. `failed` cannot "double-count" anything (the concern the old
+    # comment raised): it is a fresh COUNT from this attempt's own scan,
+    # not an accumulator across attempts. See
+    # tests/test_rules_engine_executor.py::
+    # test_execute_rule_gre_log_rowcount_matches_failed_records_on_unchanged_rerun.
+    _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "SUCCESS", failed, start)
     return "SUCCESS"

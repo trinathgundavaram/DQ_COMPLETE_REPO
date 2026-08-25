@@ -104,16 +104,26 @@ class ConnectionPool:
                 logger.warning("Error closing pooled connection '%s': %s", self.name, exc)
 
 
-def build_pools(cf, names: set, max_workers: int) -> dict:
+def build_pools(cf, names: set, max_workers: int, cap_override: dict = None) -> dict:
     """
     One ConnectionPool per name in `names`, each sized to the SMALLER of
-    that connection's own configured cap (GRE_<TYPE>_MAX_PARALLEL) and
-    max_workers -- no point building more slots for a connection than the
-    group-wide worker count could ever use concurrently anyway.
+    that connection's own configured cap (GRE_<TYPE>_MAX_PARALLEL, or
+    cap_override[name] when given) and max_workers -- no point building
+    more slots for a connection than the group-wide worker count could
+    ever use concurrently anyway.
+
+    cap_override lets a caller building TWO separate pools for the SAME
+    underlying connection name (e.g. runner.py::_run_pending_parallel(),
+    when a rule's sql_dialect and the metadata connection share a name)
+    shrink each pool's share of that connection's cap, so the two pools'
+    sizes stay additive within the real GRE_<TYPE>_MAX_PARALLEL limit
+    instead of each independently maxing out and doubling real concurrent
+    sessions against that one source.
     """
     pools = {}
     for name in names:
-        size = min(get_max_parallel_for_connection(name), max_workers)
+        cap = (cap_override or {}).get(name, get_max_parallel_for_connection(name))
+        size = min(cap, max_workers)
         pools[name] = ConnectionPool(cf, name, size)
     return pools
 

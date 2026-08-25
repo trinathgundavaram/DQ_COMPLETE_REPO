@@ -36,14 +36,8 @@ import argparse
 import sys
 from datetime import date
 
-from db.connection_factory import ConnectionFactory
+from db.connection_factory import build_and_load_connection_factory
 from shared.db_ops import build_run_key
-
-
-def _build_connection_factory():
-    cf = ConnectionFactory()
-    cf.load()  # brings up every configured source_type; skips/logs the rest
-    return cf
 
 
 def _default_run_key():
@@ -53,7 +47,7 @@ def _default_run_key():
 def _run_rules(args):
     from rules_engine.runner import run_by_process_name
 
-    cf = _build_connection_factory()
+    cf = build_and_load_connection_factory()
     run_key = args.run_key or _default_run_key()
     print(f"Running rules_engine for process_name={args.process_name!r} "
           f"project_name={args.project_name!r} run_key={run_key!r} ...")
@@ -79,7 +73,7 @@ def _run_rules(args):
 def _run_sampling(args):
     from sampling.sampling import run_sampling_for_process_name
 
-    cf = _build_connection_factory()
+    cf = build_and_load_connection_factory()
     run_key = args.run_key or _default_run_key()
     print(f"Running sampling for process_name={args.process_name!r} "
           f"project_name={args.project_name!r} run_key={run_key!r} ...")

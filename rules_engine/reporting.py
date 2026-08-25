@@ -21,13 +21,22 @@ logger = logging.getLogger(__name__)
 
 
 def get_breaches(meta_conn, meta_db: str, run_id: str) -> list:
-    """Every rule that breached its threshold (FAIL or WARN) for a given run."""
+    """
+    Every rule that breached its threshold (FAIL or WARN) for a given run.
+
+    active_ind='Y' is always true in practice for every gre_results row
+    (gre_results_uix guarantees exactly one row per rule_id/run_key,
+    upserted in place -- see rules_engine/executor.py::_upsert_result()),
+    so this filter is a no-op today. Included anyway so this query reads
+    the same active_ind vocabulary gre_log/gre_errors queries do, and
+    keeps working unchanged if gre_results ever stops being upsert-only.
+    """
     return execute_query(
         meta_conn,
         f"""
         SELECT *
         FROM {meta_db}.gre_results
-        WHERE run_id = ? AND status IN ('FAIL', 'WARN')
+        WHERE run_id = ? AND status IN ('FAIL', 'WARN') AND active_ind = 'Y'
         ORDER BY status, rule_id
         """,
         [run_id],

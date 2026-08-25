@@ -23,7 +23,6 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import random as random_module
-import time
 
 import duckdb
 import pytest
@@ -83,12 +82,11 @@ def _gre_meta_tables(conn):
         )
     """)
     conn.execute("""
-        CREATE TABLE gre_audit (
-            run_id VARCHAR, run_type VARCHAR DEFAULT 'RULE_GROUP', rule_group VARCHAR,
-            run_key VARCHAR, started_at TIMESTAMP, ended_at TIMESTAMP, status VARCHAR,
-            total_rules INTEGER, rules_succeeded INTEGER, rules_errored INTEGER,
-            sample_config_id INTEGER, sampling_method VARCHAR, random_seed BIGINT,
+        CREATE TABLE gre_sampling_audit (
+            run_id VARCHAR, run_key VARCHAR, sample_config_id INTEGER,
+            sampling_method VARCHAR, random_seed BIGINT,
             target_volume INTEGER, total_candidates INTEGER, total_selected INTEGER,
+            started_at TIMESTAMP, ended_at TIMESTAMP, status VARCHAR,
             triggered_by VARCHAR, load_datetime TIMESTAMP DEFAULT current_timestamp
         )
     """)
@@ -96,7 +94,9 @@ def _gre_meta_tables(conn):
         CREATE TABLE gre_errors (
             error_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
             run_key VARCHAR, error_type VARCHAR, error_message VARCHAR,
-            error_detail VARCHAR, occurred_at TIMESTAMP DEFAULT current_timestamp
+            error_detail VARCHAR, active_ind VARCHAR DEFAULT 'Y',
+            occurred_at TIMESTAMP DEFAULT current_timestamp,
+            last_updated_datetime TIMESTAMP
         )
     """)
 
@@ -194,6 +194,73 @@ def test_target_for_bucket_remainder_absorbed_by_unnamed_value():
 
 def test_target_for_bucket_no_mix_takes_everything():
     assert _target_for_bucket("anything", {}, 42, "FLOOR") == 42
+
+
+def test_target_for_bucket_default_unmixed_count_is_one_backward_compatible():
+    """
+    A direct call with no unmixed_count arg (the shape every pre-existing
+    caller/test uses) must behave EXACTLY as before this parameter
+    existed -- the single-unnamed-bucket case gets the full remainder.
+    """
+    mix = {"A": 0.80, "B": 0.10}
+    assert _target_for_bucket("C", mix, 100, "FLOOR") == _target_for_bucket("C", mix, 100, "FLOOR", 1)
+
+
+def test_target_for_bucket_remainder_splits_across_multiple_unmixed_values():
+    """
+    Regression: previously each bucket_value absent from the mix got the
+    FULL remainder fraction independently, so a level with N unnamed
+    values over-allocated N times the intended quota to "leftover"
+    buckets combined. unmixed_count divides the remainder across however
+    many distinct unmixed values are actually present.
+    """
+    mix = {"A": 0.80, "B": 0.10}   # remainder ~0.10
+    # One unnamed bucket (the old default / single-bucket case): gets the
+    # whole ~0.10.
+    solo = _target_for_bucket("C", mix, 1000, "FLOOR", unmixed_count=1)
+    # Two unnamed buckets sharing the level: each should get about half of
+    # that -- NOT the same full amount solo got.
+    split_c = _target_for_bucket("C", mix, 1000, "FLOOR", unmixed_count=2)
+    split_d = _target_for_bucket("D", mix, 1000, "FLOOR", unmixed_count=2)
+    assert split_c == split_d   # symmetric -- neither unnamed bucket is favored
+    assert split_c < solo
+    # The two shares plus the two named fractions should land close to the
+    # total (allowing for floor-rounding on each of the 4 pieces).
+    named_total = _target_for_bucket("A", mix, 1000, "FLOOR") + _target_for_bucket("B", mix, 1000, "FLOOR")
+    assert abs((named_total + split_c + split_d) - 1000) <= 4
+
+
+def test_stratify_splits_remainder_across_multiple_unmixed_buckets_end_to_end():
+    """
+    End-to-end version of the above through _stratify(): a level whose
+    actual data has THREE bucket values outside the configured 2-value
+    mix must split the remainder three ways, not give each of the three
+    the full remainder (which would happen if _stratify still called
+    _target_for_bucket without the level's real unmixed_count).
+    """
+    rows = (
+        [{"_strata_1": "Named1", "id": f"n1-{i}"} for i in range(10)]
+        + [{"_strata_1": "Named2", "id": f"n2-{i}"} for i in range(10)]
+        + [{"_strata_1": "Other1", "id": f"o1-{i}"} for i in range(10)]
+        + [{"_strata_1": "Other2", "id": f"o2-{i}"} for i in range(10)]
+        + [{"_strata_1": "Other3", "id": f"o3-{i}"} for i in range(10)]
+    )
+    levels = [{
+        "strata_id": 1, "level_order": 0, "level_name": "cat",
+        "stratify_expr": "cat", "mix": {"Named1": 0.5, "Named2": 0.3},
+    }]
+    by_stratum = {}
+    rng = random_module.Random(1)
+    _stratify(rows, levels, target=100, method="RANKED", rounding_mode="FLOOR",
+             rng=rng, by_stratum=by_stratum)
+
+    other_counts = {k: v["candidates"] for k, v in by_stratum.items() if k.startswith("Other")}
+    # All three "Other*" buckets are unmixed and equally sized in the
+    # source data -- their SELECTED counts (bounded by each bucket's own
+    # target, which is what we're actually checking) should be equal to
+    # each other, not have one bucket's target dwarf the others'.
+    other_selected = {k: v["selected"] for k, v in by_stratum.items() if k.startswith("Other")}
+    assert len(set(other_selected.values())) == 1   # all three got the same share
 
 
 # ── _select ───────────────────────────────────────────────────────────
@@ -332,6 +399,34 @@ def test_pull_candidates_random_gets_null_priority_rank():
     assert all(c["_priority_rank"] is None for c in candidates)
 
 
+def test_pull_candidates_random_without_priority_rank_sql_still_orders_deterministically():
+    """
+    Regression: a RANDOM config with no priority_rank_sql used to pull with
+    NO ORDER BY at all, so the row order feeding rng.shuffle() had no
+    reproducibility guarantee across reruns -- silently undermining this
+    module's core "same seed -> same selection" promise. Falls back to
+    ORDER BY key_columns instead, so the pull order (and therefore the
+    shuffle) is stable across reruns even without an author-supplied
+    priority_rank_sql.
+    """
+    conn = _conn()
+    _build_universe(conn, n=50)
+    config = {
+        "config_id": 1, "universe_table": "case_universe", "key_columns": "case_id",
+        "scope_sql": "pull_date = '{batch_id}'", "exclusion_sql": "auto_closed = 1",
+        "sampling_method": "RANDOM", "priority_rank_sql": None,
+    }
+    first = [c["case_id"] for c in _pull_candidates(conn, config, [], {"batch_id": "2026-08-01"})]
+    second = [c["case_id"] for c in _pull_candidates(conn, config, [], {"batch_id": "2026-08-01"})]
+    assert first == second   # stable across repeated pulls, not just "same length"
+
+    expected_order = [r[0] for r in conn.execute(
+        "SELECT case_id FROM case_universe WHERE pull_date = '2026-08-01' AND NOT (auto_closed = 1) "
+        "ORDER BY case_id"
+    ).fetchall()]
+    assert first == expected_order
+
+
 def test_pull_candidates_exclusion_sql_gets_run_params_substitution():
     # Previously exclusion_sql got NO substitution at all -- only scope_sql
     # did. Prove exclusion_sql can now reference a run_params {key} token
@@ -402,15 +497,46 @@ def test_run_sampling_ranked_end_to_end():
     assert attrs == result["candidates"] * 2   # 2 levels -> 2 attr rows per candidate
 
     audit = conn.execute(
-        "SELECT run_type, status, sampling_method, total_candidates, total_selected "
-        "FROM gre_audit WHERE run_id = ?",
+        "SELECT status, sampling_method, total_candidates, total_selected "
+        "FROM gre_sampling_audit WHERE run_id = ?",
         [result["sample_run_id"]],
     ).fetchone()
-    assert audit == ("SAMPLING", "COMPLETED", "RANKED", result["candidates"], result["selected"])
+    # No run_type column anymore -- gre_sampling_audit holds sampling runs
+    # ONLY (see shared/schema.sql's module header for the gre_audit split).
+    assert audit == ("COMPLETED", "RANKED", result["candidates"], result["selected"])
 
     excluded = {r[0] for r in conn.execute("SELECT case_id FROM case_universe WHERE auto_closed = 1").fetchall()}
     selected_ids = {r[0].split("=")[1] for r in rows if r[1] == 1}
     assert not (excluded & selected_ids)
+
+
+def test_run_sampling_sample_run_id_embeds_project_attempt_and_triggered_by():
+    """
+    sample_run_id gets the same "make it meaningful" treatment as
+    rules_engine's run_id (see rules_engine/runner.py::
+    _build_group_run_id()): {project_name}.{sample_name}::{run_key}::
+    attempt-{N}::{triggered_by}::{timestamp}::{hex}.
+    """
+    conn = _conn()
+    _build_universe(conn)
+    _insert_config(conn, target_volume=150, sampling_method="RANKED", project_name="HEALTHSPRING_UM")
+    _insert_strata(conn, 1, 1, 0, "category", "category",
+                   {"Denied": 0.80, "Withdrawn": 0.10, "Dismissed": 0.02, "Approved": 0.08})
+
+    cf = _FakeConnectionFactory(conn)
+    first = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB, triggered_by="jsmith")
+    assert first["sample_run_id"].startswith(
+        "HEALTHSPRING_UM.weekly_review_sample::2026-08-01::attempt-1::jsmith::"
+    )
+
+    audit = conn.execute(
+        "SELECT triggered_by FROM gre_sampling_audit WHERE run_id = ?", [first["sample_run_id"]],
+    ).fetchone()
+    assert audit[0] == "jsmith"
+
+    # Rerun of the same (config_id, run_key) -> attempt-2.
+    second = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB, triggered_by="jsmith")
+    assert "::attempt-2::" in second["sample_run_id"]
 
 
 def test_run_sampling_rerun_deactivates_prior_sample_run_id_for_same_run_key():
@@ -430,14 +556,16 @@ def test_run_sampling_rerun_deactivates_prior_sample_run_id_for_same_run_key():
 
     cf = _FakeConnectionFactory(conn)
     first = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
-    # sample_run_id is timestamp-suffixed at second precision -- sleep past a
-    # second boundary so the two calls can't collide onto the same id.
-    time.sleep(1.1)
+    # sample_run_id is now built via shared/db_ops.py::generate_run_id()
+    # (microsecond-precision timestamp + a random uniqueness suffix -- see
+    # tests/test_shared_db_ops.py's generate_run_id tests), so back-to-back
+    # calls can no longer collide onto the same id even within the same
+    # wall-clock second -- no artificial sleep needed between them any more.
     second = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
 
     assert first["status"] == "COMPLETED"
     assert second["status"] == "COMPLETED"
-    assert first["sample_run_id"] != second["sample_run_id"]   # fresh id each call (timestamp-suffixed)
+    assert first["sample_run_id"] != second["sample_run_id"]   # fresh id each call, guaranteed unique
 
     first_sel = conn.execute(
         "SELECT DISTINCT etl_is_curr_ind FROM gre_sample_selections WHERE sample_run_id = ?",
@@ -496,7 +624,6 @@ def test_run_sampling_different_run_key_does_not_deactivate_other_runs():
 
     cf = _FakeConnectionFactory(conn)
     day1 = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
-    time.sleep(1.1)   # avoid colliding onto the same second-precision sample_run_id
     day2 = _run_sampling(1, "2026-08-02", cf, meta_conn=conn, meta_db=META_DB)
 
     day1_flag = conn.execute(
@@ -602,7 +729,7 @@ def test_run_sampling_select_persist_failure_writes_error_audit_not_crash(monkey
     assert result["selected"] == 0
 
     audit = conn.execute(
-        "SELECT status FROM gre_audit WHERE run_id = ?", [result["sample_run_id"]],
+        "SELECT status FROM gre_sampling_audit WHERE run_id = ?", [result["sample_run_id"]],
     ).fetchone()
     assert audit == ("ERROR",)
 
@@ -651,7 +778,7 @@ def test_run_sampling_systematic_persists_seed():
     assert result["seed"] is not None
 
     audit_seed = conn.execute(
-        "SELECT random_seed FROM gre_audit WHERE run_id = ?", [result["sample_run_id"]]
+        "SELECT random_seed FROM gre_sampling_audit WHERE run_id = ?", [result["sample_run_id"]]
     ).fetchone()[0]
     assert audit_seed == result["seed"]
 
@@ -788,7 +915,7 @@ def test_run_sampling_run_key_and_run_params_batch_id_are_decoupled():
     # sampling/sampling.py::run_sampling()'s docstring), so a run_key value
     # different from run_params["batch_id"] doesn't collide with anything --
     # scope_sql's {batch_id} token is driven purely by the explicit
-    # run_params value, independent of run_key/gre_audit.run_key tracking.
+    # run_params value, independent of run_key/gre_sampling_audit.run_key tracking.
     conn = _conn()
     _build_universe(conn)
     _insert_config(conn, target_volume=25, sampling_method="RANKED")
@@ -800,15 +927,15 @@ def test_run_sampling_run_key_and_run_params_batch_id_are_decoupled():
     assert result["candidates"] > 0   # scope_sql pulled against the real pull_date ('2026-08-01')
 
     audit_run_key = conn.execute(
-        "SELECT run_key FROM gre_audit WHERE run_id = ?", [result["sample_run_id"]]
+        "SELECT run_key FROM gre_sampling_audit WHERE run_id = ?", [result["sample_run_id"]]
     ).fetchone()[0]
-    assert audit_run_key == "TRACKING_KEY"   # gre_audit tracked by run_key, not the business batch_id
+    assert audit_run_key == "TRACKING_KEY"   # gre_sampling_audit tracked by run_key, not the business batch_id
 
 
 def test_run_sampling_with_year_month_run_key_not_a_batch_id():
     # run_key doesn't have to be a "batch" at all -- a year+month composite
     # (built via shared/db_ops.py::build_run_key()) works identically, and
-    # gre_audit/gre_sample_selections/gre_sample_selection_attrs all track
+    # gre_sampling_audit/gre_sample_selections/gre_sample_selection_attrs all track
     # correctly off it, with the sample_run_id embedding it too.
     from shared.db_ops import build_run_key
 
@@ -826,7 +953,7 @@ def test_run_sampling_with_year_month_run_key_not_a_batch_id():
     assert run_key in result["sample_run_id"]
 
     audit_run_key = conn.execute(
-        "SELECT run_key FROM gre_audit WHERE run_id = ?", [result["sample_run_id"]]
+        "SELECT run_key FROM gre_sampling_audit WHERE run_id = ?", [result["sample_run_id"]]
     ).fetchone()[0]
     assert audit_run_key == run_key
 

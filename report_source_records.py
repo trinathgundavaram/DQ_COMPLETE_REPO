@@ -49,13 +49,7 @@ import argparse
 import csv
 import sys
 
-from db.connection_factory import ConnectionFactory
-
-
-def _build_connection_factory():
-    cf = ConnectionFactory()
-    cf.load()  # brings up every configured source_type; skips/logs the rest
-    return cf
+from db.connection_factory import build_and_load_connection_factory
 
 
 def _write_csv(records: list, output_path: str = None) -> None:
@@ -117,7 +111,7 @@ def main():
     from shared import config as gre_config
     from rules_engine.reporting import get_source_records_for_rule, get_source_records_for_process
 
-    cf = _build_connection_factory()
+    cf = build_and_load_connection_factory()
     meta_db = gre_config.get_meta_db()
     meta_conn = cf.get(gre_config.get_meta_connection_name())
     if meta_conn is None:

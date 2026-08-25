@@ -40,8 +40,13 @@ Put it on a schedule (see `crontab.example`).
 - **incremental** -- everything else. Pull rows where the watermark column
   is >= last-synced watermark minus a lookback window
   (`METADATA_SYNC_LOOKBACK_MINUTES`, default 60), upsert on the primary key.
-  `gre_audit` also always re-pulls any `status = 'RUNNING'` row, since its
-  `ended_at`/`status` UPDATE never bumps `load_datetime`.
+  `gre_rule_audit`/`gre_sampling_audit` also always re-pull any
+  `status = 'RUNNING'` row, since their `ended_at`/`status` UPDATE never
+  bumps `load_datetime`. (`gre_audit` itself -- the pre-split combined
+  table -- is now a VIEW on both the Teradata and Postgres sides, built
+  from these two; it's not in `TABLE_SPECS` and isn't synced directly,
+  since a view has no watermark of its own. See `shared/schema.sql`'s
+  module header for the full split rationale.)
 
-Add a 12th table by adding one entry to `TABLE_SPECS` in `tables.py` and one
+Add a 13th table by adding one entry to `TABLE_SPECS` in `tables.py` and one
 `CREATE TABLE` block to `ddl_postgres.sql`.

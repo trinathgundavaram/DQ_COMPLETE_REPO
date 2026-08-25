@@ -117,7 +117,9 @@ def _conn():
             project_name VARCHAR, process_name VARCHAR,
             run_key VARCHAR, seq_no INTEGER, start_time TIMESTAMP, end_time TIMESTAMP,
             status VARCHAR, rowcount BIGINT, error_message VARCHAR,
-            created_at TIMESTAMP DEFAULT current_timestamp
+            active_ind VARCHAR DEFAULT 'Y',
+            created_at TIMESTAMP DEFAULT current_timestamp,
+            last_updated_datetime TIMESTAMP
         )
     """)
 
@@ -125,7 +127,9 @@ def _conn():
         CREATE TABLE gre_errors (
             error_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
             run_key VARCHAR, error_type VARCHAR, error_message VARCHAR,
-            error_detail VARCHAR, occurred_at TIMESTAMP DEFAULT current_timestamp
+            error_detail VARCHAR, active_ind VARCHAR DEFAULT 'Y',
+            occurred_at TIMESTAMP DEFAULT current_timestamp,
+            last_updated_datetime TIMESTAMP
         )
     """)
 
@@ -136,7 +140,7 @@ def _conn():
             total_records BIGINT, failed_records BIGINT, failure_pct DOUBLE,
             threshold_pct_used DOUBLE, threshold_count_used INTEGER,
             threshold_operator_used VARCHAR, severity VARCHAR, status VARCHAR,
-            source_tieback_sql VARCHAR,
+            source_tieback_sql VARCHAR, active_ind VARCHAR DEFAULT 'Y',
             evaluated_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
@@ -316,8 +320,13 @@ def test_build_source_tieback_sql_handles_null_sentinel():
     rule = _rule(database_name="db", src_tbl_nm="claims", src_key_cols="region", sql_dialect="teradata")
     sql = build_source_tieback_sql(rule, "B1", "META_DB")
 
-    assert "CASE WHEN STRTOK(e.src_key_value, '=', 2) = 'NULL' THEN s.region IS NULL " \
-           "ELSE s.region = STRTOK(e.src_key_value, '=', 2) END" in sql
+    # Not a CASE expression -- CASE WHEN...THEN s.region IS NULL ELSE...END
+    # is invalid SQL (a boolean predicate can't be a THEN/ELSE value); this
+    # is the OR-of-ANDs replacement that's actually valid, portable SQL.
+    assert "((STRTOK(e.src_key_value, '=', 2) = 'NULL' AND s.region IS NULL) " \
+           "OR (STRTOK(e.src_key_value, '=', 2) <> 'NULL' AND s.region = " \
+           "STRTOK(e.src_key_value, '=', 2)))" in sql
+    assert "CASE" not in sql
 
 
 def test_build_source_tieback_sql_none_for_file_and_s3_dialects():
@@ -368,6 +377,91 @@ def test_execute_rule_is_idempotent_on_rerun():
 
     logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(logs) == 2         # both attempts are logged (attempt history, unlike results)
+    by_run = {r["run_id"]: r for r in logs}
+    assert by_run["RUN1"]["active_ind"] == "N"   # superseded by the rerun
+    assert by_run["RUN2"]["active_ind"] == "Y"   # the latest run_id takes precedence
+
+
+def test_execute_rule_gre_log_rowcount_matches_failed_records_on_unchanged_rerun():
+    """
+    Regression for the gre_log.rowcount inconsistency: rowcount used to be
+    reconcile["inserted"] + reconcile["reactivated"] (rows that CHANGED
+    state this attempt), not the true violating-row count. On a rerun
+    where nothing changed (no new violations, nothing fixed), that delta
+    is 0/0 -- so gre_log reported rowcount=0 for an attempt that still had
+    genuinely-open, currently-active violations, silently disagreeing with
+    gre_results.failed_records and with a COUNT(*) against gre_exceptions
+    itself. rowcount must always equal gre_results.failed_records for the
+    same rule_id/run_id.
+    """
+    conn = _conn()
+    rule = _rule(threshold_pct=10)   # any nonzero failure_pct breaches -> gre_results row written
+
+    execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    execute_rule(rule, _Adapter(conn), conn, "RUN2", "B1", {"batch_id": "B1"}, META_DB)   # nothing changed
+
+    log_run2 = execute_query(conn, "SELECT rowcount FROM gre_log WHERE rule_id = 1 AND run_id = 'RUN2'")[0]
+    result_run2 = execute_query(conn, "SELECT failed_records FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")[0]
+    active_count = execute_query(
+        conn, "SELECT COUNT(*) AS c FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1' AND etl_is_curr_ind = 'Y'",
+    )[0]["c"]
+
+    assert log_run2["rowcount"] == 2          # true violating count (C1, C3), not 0
+    assert log_run2["rowcount"] == result_run2["failed_records"]   # must always agree with gre_results
+    assert log_run2["rowcount"] == active_count   # and with the actual active gre_exceptions count
+
+
+def test_execute_rule_deactivates_prior_log_attempts_on_rerun():
+    """
+    active_ind reconciliation regression for gre_log: a rerun of the same
+    run_key under a new run_id must deactivate every earlier run_id's
+    gre_log row for this (rule_id, run_key) -- including an ERROR attempt,
+    not just a SUCCESS one -- so a reader filtering active_ind='Y' always
+    sees exactly the latest attempt, never a stale one left behind.
+    """
+    conn = _conn()
+    broken_rule = _rule(rule_syntax="SELECT * FROM no_such_table WHERE batch_id = '{batch_id}'")
+
+    # RUN1: errors out (bad SQL) -- logged as ERROR, active_ind='Y'.
+    status1 = execute_rule(broken_rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    assert status1 == "ERROR"
+
+    # RUN2: same run_key, rule now fixed -- succeeds.
+    fixed_rule = _rule()
+    status2 = execute_rule(fixed_rule, _Adapter(conn), conn, "RUN2", "B1", {"batch_id": "B1"}, META_DB)
+    assert status2 == "SUCCESS"
+
+    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND run_key = 'B1'")
+    assert len(logs) == 2   # both attempts kept for history
+    by_run = {r["run_id"]: r for r in logs}
+    assert by_run["RUN1"]["status"] == "ERROR"
+    assert by_run["RUN1"]["active_ind"] == "N"    # deactivated even though it never succeeded
+    assert by_run["RUN2"]["status"] == "SUCCESS"
+    assert by_run["RUN2"]["active_ind"] == "Y"
+
+    active = execute_query(
+        conn, "SELECT run_id FROM gre_log WHERE rule_id = 1 AND run_key = 'B1' AND active_ind = 'Y'",
+    )
+    assert {r["run_id"] for r in active} == {"RUN2"}
+
+
+def test_execute_rule_deactivates_prior_errors_on_rerun():
+    """
+    active_ind reconciliation regression for gre_errors: two consecutive
+    failing reruns of the same run_key must leave only the LATEST run_id's
+    error row active, with the earlier one deactivated (not deleted).
+    """
+    conn = _conn()
+    broken_rule = _rule(rule_syntax="SELECT * FROM no_such_table WHERE batch_id = '{batch_id}'")
+
+    execute_rule(broken_rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    execute_rule(broken_rule, _Adapter(conn), conn, "RUN2", "B1", {"batch_id": "B1"}, META_DB)
+
+    errors = execute_query(conn, "SELECT * FROM gre_errors WHERE rule_id = 1 AND run_key = 'B1'")
+    assert len(errors) == 2
+    by_run = {r["run_id"]: r for r in errors}
+    assert by_run["RUN1"]["active_ind"] == "N"
+    assert by_run["RUN2"]["active_ind"] == "Y"
 
 
 def test_execute_rule_deactivates_exceptions_that_no_longer_violate():
@@ -465,22 +559,22 @@ def test_execute_rule_clean_rerun_deactivates_all_prior_exceptions():
     assert all(r["etl_is_curr_ind"] == "N" for r in all_rows)
 
 
-def test_write_exceptions_capped_skips_deactivation(monkeypatch):
+def test_write_exceptions_deactivation_always_runs_no_cap_param():
     """
-    When _scan_violations()'s MAX_EXCEPTIONS cap means this attempt only
-    captured a PARTIAL view of the true violation set, deactivation must
-    be skipped entirely -- a src_key_value missing from a capped `rows`
-    list could still genuinely be violating, just not captured this
-    attempt, and deactivating it would incorrectly mark a still-open
-    exception as fixed.
+    Regression for the MAX_EXCEPTIONS removal: _write_exceptions() no
+    longer takes a `capped` parameter at all, and deactivation always
+    runs unconditionally -- `rows` is now always this attempt's COMPLETE
+    violation set (see _scan_violations()'s docstring), so there is no
+    longer a "partial view, might incorrectly deactivate a still-open
+    exception" case to guard against. A src_key_value with an existing
+    active row that is genuinely absent from this attempt's (complete)
+    `rows` list is always safe to deactivate.
     """
     from rules_engine.executor import _write_exceptions
 
     conn = _conn()
     rule = _rule(threshold_pct=25)
 
-    # seed one PRE-EXISTING active exception for a key that will NOT
-    # appear in this attempt's (capped) rows
     conn.execute("""
         INSERT INTO gre_exceptions (record_id, rule_id, run_key, src_key_value, etl_is_curr_ind)
         VALUES (999, 1, 'B1', 'claim_id=PRIOR', 'Y')
@@ -488,32 +582,14 @@ def test_write_exceptions_capped_skips_deactivation(monkeypatch):
 
     summary = _write_exceptions(
         conn, META_DB, rule, "RUN1", "B1",
-        rows=[{"claim_id": "C1"}],   # does NOT include claim_id=PRIOR
-        capped=True,
+        rows=[{"claim_id": "C1"}],   # does NOT include claim_id=PRIOR -- it's genuinely fixed
     )
-    assert summary["deactivated"] == 0   # skipped -- capped view can't confirm PRIOR is fixed
+    assert summary["deactivated"] == 1
 
     prior = execute_query(
         conn, "SELECT etl_is_curr_ind FROM gre_exceptions WHERE record_id = 999",
     )[0]
-    assert prior["etl_is_curr_ind"] == "Y"   # untouched, still active
-
-    # sanity: the SAME call with capped=False WOULD have deactivated it
-    conn2 = _conn()
-    conn2.execute("""
-        INSERT INTO gre_exceptions (record_id, rule_id, run_key, src_key_value, etl_is_curr_ind)
-        VALUES (999, 1, 'B1', 'claim_id=PRIOR', 'Y')
-    """)
-    summary2 = _write_exceptions(
-        conn2, META_DB, rule, "RUN1", "B1",
-        rows=[{"claim_id": "C1"}],
-        capped=False,
-    )
-    assert summary2["deactivated"] == 1
-    prior2 = execute_query(
-        conn2, "SELECT etl_is_curr_ind FROM gre_exceptions WHERE record_id = 999",
-    )[0]
-    assert prior2["etl_is_curr_ind"] == "N"
+    assert prior["etl_is_curr_ind"] == "N"
 
 
 def test_execute_rule_batches_are_isolated():
@@ -563,7 +639,7 @@ def test_execute_rule_sql_error_routes_to_errors_and_logs():
     assert len(logs) == 1 and logs[0]["status"] == "ERROR"
 
 
-# ── big-dataset path: dedup + true-count/capped-fetch split ──────────────
+# ── big-dataset path: dedup + uncapped detail capture ─────────────────────
 
 def test_write_exceptions_dedupes_src_key_within_one_pull():
     conn = _conn()
@@ -591,22 +667,43 @@ def test_write_exceptions_dedupes_src_key_within_one_pull():
     assert results[0]["failed_records"] == 4   # true COUNT(*) on rule_syntax counts every returned row
 
 
-def test_max_exceptions_cap_keeps_failed_records_true_but_caps_detail_rows(monkeypatch):
+def test_no_max_exceptions_cap_captures_every_violating_row():
+    """
+    Regression for the removal of GRE_MAX_EXCEPTIONS: gre_exceptions
+    detail capture is uncapped. This seeds a source table with far more
+    violating rows than the OLD default cap (10000) to prove there is no
+    ceiling left anywhere in the path -- gre_exceptions,
+    gre_results.failed_records, and gre_log.rowcount must all agree on
+    the full, true count.
+    """
     conn = _conn()
-    monkeypatch.setattr(rules_engine_executor, "MAX_EXCEPTIONS", 1)
-    rule = _rule(threshold_pct=0)   # any failure breaches -> a gre_results row is written
+    n = 12000   # comfortably past the old default GRE_MAX_EXCEPTIONS=10000
+    conn.execute("CREATE TABLE big_claims (claim_id VARCHAR, denial_reason VARCHAR, batch_id VARCHAR)")
+    conn.executemany(
+        "INSERT INTO big_claims VALUES (?, NULL, 'B1')",
+        [[f"C{i}"] for i in range(n)],
+    )
+    rule = _rule(
+        database_name="main", src_tbl_nm="big_claims",
+        rule_syntax="SELECT claim_id, denial_reason FROM big_claims "
+                    "WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
+        threshold_pct=0,   # any failure breaches -> a gre_results row is written
+    )
 
     status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     assert status == "SUCCESS"
 
-    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
-    assert len(exceptions) == 1   # capped at MAX_EXCEPTIONS=1
+    exceptions = execute_query(conn, "SELECT COUNT(*) AS c FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
+    assert exceptions[0]["c"] == n   # every row captured -- no cap
 
-    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
-    assert results[0]["failed_records"] == 2   # true count stays exact -- 2 of 4 actually failed
+    results = execute_query(conn, "SELECT failed_records FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
+    assert results[0]["failed_records"] == n
 
-    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND run_key = 'B1'")
-    assert logs[0]["rowcount"] == 1   # "rows written to gre_exceptions this attempt" == the capped count
+    logs = execute_query(conn, "SELECT rowcount FROM gre_log WHERE rule_id = 1 AND run_key = 'B1'")
+    assert logs[0]["rowcount"] == n   # gre_log agrees with gre_results and gre_exceptions, no cap anywhere
+
+    # confirm the cap-related knobs are actually gone, not just unused
+    assert not hasattr(rules_engine_executor, "MAX_EXCEPTIONS")
 
 
 # ── source prepare (STEP 0 of execute_rule) ──────────────────────────────
@@ -744,17 +841,9 @@ def test_scan_violations_returns_true_count_and_all_rows_uncapped():
     query = "SELECT claim_id, denial_reason FROM claims WHERE denial_reason IS NULL AND batch_id = 'B1'"
     failed, rows = _scan_violations(conn, query)
     assert failed == 2
-    assert len(rows) == 2   # default MAX_EXCEPTIONS (10000) doesn't cap 2 rows
+    assert len(rows) == 2   # every violating row returned -- no cap of any kind
     assert {r["claim_id"] for r in rows} == {"C1", "C3"}
-
-
-def test_scan_violations_keeps_true_count_exact_past_the_cap(monkeypatch):
-    conn = _conn()
-    monkeypatch.setattr(rules_engine_executor, "MAX_EXCEPTIONS", 1)
-    query = "SELECT claim_id, denial_reason FROM claims WHERE denial_reason IS NULL AND batch_id = 'B1'"
-    failed, rows = _scan_violations(conn, query)
-    assert failed == 2      # true count, uncapped
-    assert len(rows) == 1   # detail rows capped
+    assert failed == len(rows)   # always equal now -- there is no partial-capture case
 
 
 def test_scan_violations_issues_exactly_one_query():

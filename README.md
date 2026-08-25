@@ -15,8 +15,12 @@ infrastructure layer:
   considered.
 - **[`shared/`](shared/README.md)** -- what both of the above actually
   share: low-level DB helpers (`db_ops.py`), local `.env` credential
-  loading + metadata-store resolution (`config.py`), and the two tables
-  written to by both (`gre_audit`, `gre_errors`).
+  loading + metadata-store resolution (`config.py`), the shared error log
+  (`gre_errors`), and each package's own run-tracking table
+  (`gre_rule_audit`, `gre_sampling_audit`) -- plus a `gre_audit`
+  backward-compatibility VIEW over the latter two, for anything still
+  querying the old combined shape. See `shared/README.md`'s "Why
+  `gre_audit` is now two tables plus a view".
 - **`db/connection_factory.py`** -- every source adapter (Teradata,
   Postgres, S3, file) plus `ConnectionFactory`, in one file. Exactly ONE
   connection per source_type -- no named/multi-connection setup. This is
@@ -31,10 +35,13 @@ Each package is independently testable and has its own DDL -- see
 1. **First deployment** (no `gre_*` table exists yet, or you're OK
    discarding what's in them): run `shared/schema.sql`, then
    `rules_engine/schema.sql`, then `sampling/schema.sql`, in that order
-   -- `rules_engine/`'s and `sampling/`'s tables are written to via
-   `gre_audit`/`gre_errors`, which `shared/schema.sql` creates first. See
-   "Redeploying / changing the schema" below for how to make DDL changes
-   later.
+   -- `rules_engine/` writes to `gre_rule_audit`/`gre_errors`, `sampling/`
+   writes to `gre_sampling_audit`/`gre_errors`, all of which
+   `shared/schema.sql` creates first (along with the `gre_audit`
+   backward-compatibility view). See "Redeploying / changing the schema"
+   below for how to make DDL changes later, and
+   `migrate_split_gre_audit.sql` at the repo root instead if you already
+   have real history in an existing combined `gre_audit` table.
 
 2. **Local credentials**: copy `dev.env.example` to `dev.env` (repo
    root) and fill in real values. `shared/config.py` loads it
@@ -59,9 +66,12 @@ Each package is independently testable and has its own DDL -- see
    somewhere else.
 
 5. **Tunables** (all optional, env-driven): `GRE_EXCEPTION_CHUNK`
-   (bulk-write chunk size, default 500), `GRE_MAX_EXCEPTIONS` (detail-row
-   capture cap per rule attempt, default 10000), `GRE_QUERY_MAX_RETRIES`
-   (source-query retry attempts, default 3).
+   (bulk-write chunk size, default 500), `GRE_QUERY_MAX_RETRIES`
+   (source-query retry attempts, default 3). There is no cap on
+   gre_exceptions detail-row capture -- every violating row is captured,
+   every attempt, regardless of count (see rules_engine/executor.py::
+   _scan_violations()'s docstring); a rule matching a very large number of
+   rows needs correspondingly more memory for that one attempt's scan.
 
 ## Running the engines end to end
 
@@ -171,12 +181,12 @@ rather than writing `ALTER TABLE` migrations. Each package has its own
 `schema_drop.sql` for this:
 
 ```
-shared/schema_drop.sql          -- drop gre_audit, gre_errors
+shared/schema_drop.sql          -- drop the gre_audit view, gre_rule_audit, gre_sampling_audit, gre_errors
 rules_engine/schema_drop.sql    -- drop gre_rules, gre_log, gre_exceptions, gre_results
 sampling/schema_drop.sql        -- drop the 5 gre_sampling_*/gre_sample_* tables
 
 -- then redeploy, shared first (rules_engine/ and sampling/ both assume
--- gre_audit/gre_errors already exist):
+-- gre_rule_audit/gre_sampling_audit/gre_errors already exist):
 shared/schema.sql
 rules_engine/schema.sql
 sampling/schema.sql

@@ -174,6 +174,20 @@ ON CMSUNIV_FILELAND_DEV_T.gre_rules;
 
 
 -- ── 2. gre_log -- one row per rule execution attempt ──────────────────────
+-- run_id is a new value every time rules_engine/runner.py::run_rule_group()
+-- is called (see generate_run_id()), even for a REPEATED run_key -- so a
+-- deliberate rerun of the same run_key accumulates one gre_log row per
+-- rule per run_id, not one row that gets overwritten. active_ind is how
+-- "which of these is the CURRENT attempt for this rule_id/run_key" is
+-- answered without every reader having to re-derive MAX(load_datetime)
+-- (or worse, MAX(run_id), which sorts wrong once a run_id's timestamp
+-- suffix rolls past a lexicographic boundary) themselves: the newest
+-- run_id's row is 'Y', every earlier run_id's row for the same
+-- (rule_id, run_key) is deactivated to 'N' -- see
+-- rules_engine/executor.py::_deactivate_prior_log_attempts(), called from
+-- _log_attempt() immediately before this attempt's own row is inserted.
+-- Never deletes -- full attempt history (including superseded ERROR rows)
+-- stays on file for audit; only active_ind flips.
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_log (
     log_id           BIGINT GENERATED ALWAYS AS IDENTITY,
     run_id           VARCHAR(200) NOT NULL,
@@ -186,14 +200,35 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_log (
     start_time       TIMESTAMP,
     end_time         TIMESTAMP,
     status           VARCHAR(20),          -- 'SUCCESS' | 'ERROR' -- attempt-level, not the verdict
-    rowcount         BIGINT,               -- violating rows written to gre_exceptions this attempt
+    rowcount         BIGINT,               -- TRUE count of violating rows from this attempt's own
+                                            -- scan -- always equal to gre_results.failed_records for
+                                            -- the same rule_id/run_id, even when the violation set was
+                                            -- unchanged from the prior attempt (0 new/reactivated rows
+                                            -- still means a nonzero rowcount if violations remain open).
+                                            -- gre_exceptions detail capture is uncapped -- every
+                                            -- violating row gets a row there every attempt, see
+                                            -- rules_engine/executor.py::_scan_violations()'s docstring.
+                                            -- rowcount is NOT a count of gre_exceptions rows inserted/
+                                            -- reactivated this attempt -- see
+                                            -- rules_engine/executor.py::execute_rule()'s comment above
+                                            -- its final _log_attempt() call for why that would be wrong.
     error_message    VARCHAR(2000),
-    load_datetime    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    active_ind           CHAR(1) DEFAULT 'Y',  -- 'Y' = this run_id is the CURRENT attempt for this
+                                                -- (rule_id, run_key); 'N' = superseded by a later
+                                                -- run_id's rerun of the same run_key. See comment above.
+    load_datetime    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_updated_datetime TIMESTAMP             -- set only when active_ind flips to 'N'
 )
 PRIMARY INDEX (run_id, rule_id);
 
--- Checkpoint/resume reads this per (rule_group, run_key) to find the first
--- rule with no SUCCESS row yet -- see rules_engine/runner.py::_resume_point().
+-- Reporting/dashboard lookup: "what's the current status of every rule
+-- for this run_key" -- filters straight to active_ind='Y' instead of
+-- scanning every historical attempt across every past run_id.
+CREATE INDEX gre_log_rule_run_key_active_ix (rule_id, run_key, active_ind)
+ON CMSUNIV_FILELAND_DEV_T.gre_log;
+
+-- Historical/ops lookup by (rule_group, run_key, status) -- e.g. "how many
+-- ERROR attempts has this run_key ever had, across every rerun".
 CREATE INDEX gre_log_group_run_key_ix (rule_group, run_key, status)
 ON CMSUNIV_FILELAND_DEV_T.gre_log;
 
@@ -297,6 +332,15 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_results (
                                                -- client instead of hand-deriving the join.
                                                -- ALTER TABLE ... ADD COLUMN on the real Teradata
                                                -- instance for existing deploys.
+    active_ind                  CHAR(1) DEFAULT 'Y',  -- always 'Y' in practice -- gre_results_uix
+                                               -- below already guarantees exactly one row per
+                                               -- (rule_id, run_key), upserted in place on rerun
+                                               -- (rules_engine/executor.py::_upsert_result()), so
+                                               -- there is never a stale row here to deactivate.
+                                               -- Carried for the same active_ind vocabulary
+                                               -- gre_log/gre_errors use, so a downstream report can
+                                               -- filter active_ind='Y' uniformly across all three
+                                               -- without needing to know gre_results is a special case.
     evaluated_at                TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 PRIMARY INDEX (rule_id, run_key);

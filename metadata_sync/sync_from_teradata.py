@@ -43,58 +43,85 @@ def full_refresh_table(td, pg, spec, td_db, pg_schema, batch_size, dry_run) -> i
     col_list = ", ".join(cols)
 
     td_cur = td.cursor()
-    td_cur.execute(f"SELECT {col_list} FROM {td_db}.{name}")
+    try:
+        td_cur.execute(f"SELECT {col_list} FROM {td_db}.{name}")
 
-    if dry_run:
-        n = len(td_cur.fetchall())
-        logger.info("[dry-run] %s: would full-refresh %d row(s).", name, n)
+        if dry_run:
+            n = len(td_cur.fetchall())
+            logger.info("[dry-run] %s: would full-refresh %d row(s).", name, n)
+            return n
+
+        pg_cur = pg.cursor()
+        try:
+            # Explicit BEGIN/COMMIT even though PostgresAdapter's connection
+            # is autocommit=True (see db/connection_factory.py) -- psycopg2
+            # honors an explicit BEGIN...COMMIT block regardless of the
+            # autocommit setting for statements outside one. Without this,
+            # TRUNCATE committed immediately on its own, then each
+            # execute_values() batch committed separately too -- any reader
+            # hitting this table between those commits saw it fully empty
+            # (or only partially reloaded) mid-sync. Wrapping the whole
+            # truncate-then-reload in one transaction means readers only
+            # ever see the table in its old, fully-populated state or its
+            # new, fully-populated state -- never a half-loaded one.
+            pg_cur.execute("BEGIN")
+            pg_cur.execute(f"TRUNCATE TABLE {pg_schema}.{name}")
+            insert_sql = f"INSERT INTO {pg_schema}.{name} ({col_list}) VALUES %s"
+
+            total = 0
+            while True:
+                batch = td_cur.fetchmany(batch_size)
+                if not batch:
+                    break
+                execute_values(pg_cur, insert_sql, batch)
+                total += len(batch)
+
+            pg_cur.execute("COMMIT")
+        except Exception:
+            try:
+                pg_cur.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            pg_cur.close()
+    finally:
         td_cur.close()
-        return n
 
-    pg_cur = pg.cursor()
-    pg_cur.execute(f"TRUNCATE TABLE {pg_schema}.{name}")
-    insert_sql = f"INSERT INTO {pg_schema}.{name} ({col_list}) VALUES %s"
-
-    total = 0
-    while True:
-        batch = td_cur.fetchmany(batch_size)
-        if not batch:
-            break
-        execute_values(pg_cur, insert_sql, batch)
-        total += len(batch)
-
-    td_cur.close()
-    pg_cur.close()
     logger.info("%s: full-refreshed %d row(s).", name, total)
     return total
 
 
 def _get_watermark(pg, pg_schema, table_name) -> datetime:
     cur = pg.cursor()
-    cur.execute(
-        f"SELECT last_watermark FROM {pg_schema}.metadata_sync_watermark WHERE table_name = %s",
-        [table_name],
-    )
-    row = cur.fetchone()
-    cur.close()
-    return row[0] if row and row[0] else FAR_PAST
+    try:
+        cur.execute(
+            f"SELECT last_watermark FROM {pg_schema}.metadata_sync_watermark WHERE table_name = %s",
+            [table_name],
+        )
+        row = cur.fetchone()
+        return row[0] if row and row[0] else FAR_PAST
+    finally:
+        cur.close()
 
 
 def _set_watermark(pg, pg_schema, table_name, watermark, row_count) -> None:
     cur = pg.cursor()
-    cur.execute(
-        f"""
-        INSERT INTO {pg_schema}.metadata_sync_watermark
-            (table_name, last_watermark, last_synced_at, last_row_count)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (table_name) DO UPDATE SET
-            last_watermark = EXCLUDED.last_watermark,
-            last_synced_at = EXCLUDED.last_synced_at,
-            last_row_count = EXCLUDED.last_row_count
-        """,
-        [table_name, watermark, datetime.now(), row_count],
-    )
-    cur.close()
+    try:
+        cur.execute(
+            f"""
+            INSERT INTO {pg_schema}.metadata_sync_watermark
+                (table_name, last_watermark, last_synced_at, last_row_count)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (table_name) DO UPDATE SET
+                last_watermark = EXCLUDED.last_watermark,
+                last_synced_at = EXCLUDED.last_synced_at,
+                last_row_count = EXCLUDED.last_row_count
+            """,
+            [table_name, watermark, datetime.now(), row_count],
+        )
+    finally:
+        cur.close()
 
 
 def incremental_sync_table(td, pg, spec, td_db, pg_schema, batch_size, lookback_minutes, dry_run) -> int:
@@ -119,42 +146,46 @@ def incremental_sync_table(td, pg, spec, td_db, pg_schema, batch_size, lookback_
     )
 
     td_cur = td.cursor()
-    td_cur.execute(select_sql, [effective_watermark])
+    try:
+        td_cur.execute(select_sql, [effective_watermark])
 
-    if dry_run:
-        rows = td_cur.fetchall()
-        logger.info("[dry-run] %s: watermark >= %s would pull %d row(s).",
-                     name, effective_watermark, len(rows))
+        if dry_run:
+            rows = td_cur.fetchall()
+            logger.info("[dry-run] %s: watermark >= %s would pull %d row(s).",
+                         name, effective_watermark, len(rows))
+            return len(rows)
+
+        pg_cur = pg.cursor()
+        try:
+            non_pk_cols = [c for c in cols if c not in pk]
+            pk_list = ", ".join(pk)
+            conflict_action = (
+                f"DO UPDATE SET {', '.join(f'{c} = EXCLUDED.{c}' for c in non_pk_cols)}"
+                if non_pk_cols else "DO NOTHING"
+            )
+            upsert_sql = (
+                f"INSERT INTO {pg_schema}.{name} ({col_list}) VALUES %s "
+                f"ON CONFLICT ({pk_list}) {conflict_action}"
+            )
+
+            total = 0
+            max_wm_seen = last_watermark
+            while True:
+                batch = td_cur.fetchmany(batch_size)
+                if not batch:
+                    break
+                execute_values(pg_cur, upsert_sql, [row[1:] for row in batch])
+                batch_max = max((row[0] for row in batch if row[0] is not None), default=None)
+                if batch_max and batch_max > max_wm_seen:
+                    max_wm_seen = batch_max
+                total += len(batch)
+
+            _set_watermark(pg, pg_schema, name, max_wm_seen, total)
+        finally:
+            pg_cur.close()
+    finally:
         td_cur.close()
-        return len(rows)
 
-    pg_cur = pg.cursor()
-    non_pk_cols = [c for c in cols if c not in pk]
-    pk_list = ", ".join(pk)
-    conflict_action = (
-        f"DO UPDATE SET {', '.join(f'{c} = EXCLUDED.{c}' for c in non_pk_cols)}"
-        if non_pk_cols else "DO NOTHING"
-    )
-    upsert_sql = (
-        f"INSERT INTO {pg_schema}.{name} ({col_list}) VALUES %s "
-        f"ON CONFLICT ({pk_list}) {conflict_action}"
-    )
-
-    total = 0
-    max_wm_seen = last_watermark
-    while True:
-        batch = td_cur.fetchmany(batch_size)
-        if not batch:
-            break
-        execute_values(pg_cur, upsert_sql, [row[1:] for row in batch])
-        batch_max = max((row[0] for row in batch if row[0] is not None), default=None)
-        if batch_max and batch_max > max_wm_seen:
-            max_wm_seen = batch_max
-        total += len(batch)
-
-    td_cur.close()
-    _set_watermark(pg, pg_schema, name, max_wm_seen, total)
-    pg_cur.close()
     logger.info("%s: upserted %d row(s), watermark now %s.", name, total, max_wm_seen)
     return total
 
