@@ -18,11 +18,6 @@ Two fully independent, config-driven engines:
   Postgres, S3, file) plus `ConnectionFactory`, in one file. Exactly ONE
   connection per source_type -- no named/multi-connection setup. This is
   the ONLY code either package depends on outside its own folder.
-- **`migrations/`** -- one-time DDL/data migration and validation scripts
-  for deployments that already hold real data (drop-and-recreate is fine
-  for a fresh/disposable environment, but not once real rows exist). Not
-  imported by either package -- run by hand against Teradata as needed;
-  see each script's own header.
 
 ## Package separation
 
@@ -42,24 +37,18 @@ There used to be a `shared/` package holding one copy of `db_ops.py`/
 `gre_errors` error table. It has been removed. `gre_audit` was split into
 `gre_rule_audit`/`gre_sampling_audit`, and `gre_errors` was split into
 `gre_rule_errors`/`gre_sampling_errors` -- see each package's own
-`schema.sql` for the DDL. **Neither split table has a compatibility view
-standing in for the old combined name any more** -- this is a real
-behavior change from an earlier version of this split, which did keep a
-`gre_audit` VIEW; that view (and the equivalent Postgres-mirror view) has
-been retired. Anything still querying `gre_audit` or `gre_errors`
-directly needs to move to the package-specific tables, or build its own
-UNION ALL across them. `db/connection_factory.py` is the one deliberate
-exception to "no shared code" -- it's pure source-connection
-infrastructure with no rules/sampling-specific logic, and duplicating it
-would double the number of real live connections opened per source_type
-whenever both packages run in the same process.
-
-`migrations/migrate_split_gre_audit.sql` and `migrations/migrate_split_gre_errors.sql`
-carry existing deployments through both splits without data
-loss (see their own headers) -- `migrations/migrate_split_gre_audit.sql` still
-offers an optional, transitional `gre_audit` view for external readers,
-but that view is not part of the application's own contract and should
-be dropped once those readers have moved over.
+`schema.sql` for the DDL, which each already defines the split shape
+directly (there's no migration path from the old combined tables --
+no `gre_*` table holds live/production data yet, so this is treated as a
+fresh deployment; see "Redeploying / changing the schema" below).
+Neither split table has a compatibility view standing in for the old
+combined name -- anything that queried `gre_audit`/`gre_errors` under the
+old combined shape needs to move to the package-specific tables instead,
+or build its own UNION ALL across them. `db/connection_factory.py` is the
+one deliberate exception to "no shared code" -- it's pure
+source-connection infrastructure with no rules/sampling-specific logic,
+and duplicating it would double the number of real live connections
+opened per source_type whenever both packages run in the same process.
 
 Each package is independently testable and has its own DDL -- see
 `tests/` and each package's `schema.sql`/`schema_drop.sql`. Neither
@@ -68,13 +57,12 @@ Each package is independently testable and has its own DDL -- see
 ## Setup
 
 1. **First deployment** (no `gre_*` table exists yet, or you're OK
-   discarding what's in them): run `rules_engine/schema.sql` and
-   `sampling/schema.sql` -- in either order, or just the one package you
-   need; neither depends on the other. See "Redeploying / changing the
-   schema" below for how to make DDL changes later, and
-   `migrations/migrate_split_gre_audit.sql`/`migrations/migrate_split_gre_errors.sql`
-   instead if you already have real history in an existing combined
-   `gre_audit`/`gre_errors` table.
+   discarding what's in them -- no `gre_*` table holds live/production
+   data yet, so every deployment today is treated this way): run
+   `rules_engine/schema.sql` and `sampling/schema.sql` -- in either order,
+   or just the one package you need; neither depends on the other. See
+   "Redeploying / changing the schema" below for how to make DDL changes
+   later.
 
 2. **Local credentials**: copy `dev.env.example` to `dev.env` (repo
    root) and fill in real values. Each package's own `config.py` loads it

@@ -331,9 +331,6 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_results (
                                                -- src_key_cols. Pull this straight out of
                                                -- gre_results and run it in Toad/whatever SQL
                                                -- client instead of hand-deriving the join.
-                                               -- Existing deploy with real data: see
-                                               -- migrations/migrate_gre_log_errors_results.sql
-                                               -- (drop + recreate, not ALTER TABLE).
     active_ind                  CHAR(1) DEFAULT 'Y',  -- always 'Y' in practice -- gre_results_uix
                                                -- below already guarantees exactly one row per
                                                -- (rule_id, run_key), upserted in place on rerun
