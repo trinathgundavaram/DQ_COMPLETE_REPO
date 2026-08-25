@@ -13,7 +13,7 @@ upserts a `gre_results` verdict row.
 idempotency identifier `gre_log`, `gre_exceptions` (`gre_exceptions_uix`),
 `gre_results` (`gre_results_uix`), and `gre_rule_audit` all key off. There's no
 fixed shape to it: a plain batch id, a year+month combo, a specific date,
-a region, or any combination all work equally well. `shared/db_ops.py`'s
+a region, or any combination all work equally well. `rules_engine/db_ops.py`'s
 `build_run_key(*parts, delimiter="_")` is a convenience formatter
 (`build_run_key(2026, 8) -> "2026_8"`), or just pass your own string.
 
@@ -23,11 +23,11 @@ a region, or any combination all work equally well. `shared/db_ops.py`'s
 date. `run_id` says WHICH SPECIFIC ATTEMPT at it this is: `run_rule_group()`
 mints a brand new `run_id` every time it's called, even when called again
 with the exact same `run_key` (a deliberate rerun, or a resumed run after a
-crash). Every row `gre_log`, `gre_exceptions`, `gre_results`, `gre_errors`,
+crash). Every row `gre_log`, `gre_exceptions`, `gre_results`, `gre_rule_errors`,
 and `gre_rule_audit` write for one call all carry that same `run_id`.
 
 `run_id` is built by `rules_engine/runner.py::_build_group_run_id()` on top
-of `shared/db_ops.py::generate_run_id()` (the same underlying helper
+of `rules_engine/db_ops.py::generate_run_id()` (the same underlying helper
 `sampling/sampling.py` uses for `sample_run_id`), shaped as:
 
 ```
@@ -266,7 +266,7 @@ fan-out, not a merged run, and one group erroring doesn't stop the rest.
 `run_by_process_name(process_name, run_key, cf, meta_conn=None, meta_db=None,
 project_name=None, ...)` is a thin convenience layer on top of
 `run_all_active_groups()` for the common "run everything this process
-owns" case: it resolves `meta_conn`/`meta_db` from `cf`/`shared.config`
+owns" case: it resolves `meta_conn`/`meta_db` from `cf`/`rules_engine.config`
 itself if you don't pass them, and raises `ValueError` if no active
 `rule_group` matches the `process_name` (and `project_name`, if given) --
 almost always a typo, so it fails loudly instead of silently doing
@@ -284,10 +284,10 @@ The repo root's `run_by_process.py` wraps this in a CLI: `python
 run_by_process.py rules --process-name UNIVERSE_VALIDATION`.
 
 This package is deliberately independent of [`sampling/`](../sampling/README.md)
--- the two share only what's in [`shared/`](../shared/README.md) (DB
-helpers, credential/config loading, and the `gre_rule_audit`/`gre_errors`
-tables). Nothing in `rules_engine/` imports from `sampling/`, or vice
-versa.
+-- the two share no code or tables at all (see the repo root README's
+"Package separation"). `rules_engine/` owns its own `db_ops.py`,
+`config.py`, and the `gre_rule_audit`/`gre_rule_errors` tables. Nothing
+in `rules_engine/` imports from `sampling/`, or vice versa.
 
 ## Files
 
@@ -298,8 +298,8 @@ versa.
 | `runner.py` | `run_rule_group()` -- orchestration entry point: readiness gate, checkpoint/resume, sequencing_mode-aware loop over `execute_rule()`, `gre_rule_audit` start/finish. `discover_rule_groups()`/`run_all_active_groups()` -- multi-group fan-out by project/process (see "Running multiple projects/processes" above). Also the opt-in parallel path (`_run_pending_parallel()`) -- see "Parallel rule execution" below. |
 | `parallel.py` | `ConnectionPool`/`build_pools()`/`close_pools()` -- the bounded per-connection connection pooling the parallel path uses instead of the single shared `cf.get()` connection. |
 | `reporting.py` | `get_breaches()` / `get_records_for_result()` -- thin read-only queries against `gre_results`/`gre_exceptions`. `get_source_records_for_rule()` -- ties `gre_exceptions` back to the live source record (see "Tying exceptions back to source records" below). |
-| `schema.sql` | `gre_rules` (incl. `project_name`/`process_name`), `gre_log`, `gre_exceptions`, `gre_results`. Deploy after `shared/schema.sql`. |
-| `schema_drop.sql` | Drops the 4 tables above, for the drop-and-recreate redeploy policy (see the repo root README). |
+| `schema.sql` | `gre_rules` (incl. `project_name`/`process_name`), `gre_log`, `gre_exceptions`, `gre_results`, `gre_rule_audit`, `gre_rule_errors`. Fully standalone -- no other package's `schema.sql` needs to run first. |
+| `schema_drop.sql` | Drops the 6 tables above, for the drop-and-recreate redeploy policy (see the repo root README). |
 
 ## Parallel rule execution (opt-in)
 
@@ -420,7 +420,7 @@ Two optimizations that matter once a rule matches millions of rows (see
   call, threaded through via `total_cache`.
 
 Both `_scan_violations`'s and `_write_exceptions`'s row writes go through
-`shared/db_ops.py`'s chunked `bulk_insert_or_skip()` rather than one
+`rules_engine/db_ops.py`'s chunked `bulk_insert_or_skip()` rather than one
 INSERT+commit per row.
 
 ## Quick start

@@ -1,11 +1,15 @@
 """
-tests/test_shared_config.py
+tests/test_sampling_config.py
 --------------------------
-Covers shared/config.py: the local .env loader (_load_env_file) and the
+Covers sampling/config.py: the local .env loader (_load_env_file) and the
 small env-driven helpers around it. Runs entirely with monkeypatched env
 vars / paths -- never touches a real Teradata connection or the repo's
 own dev.env (which shouldn't exist in this environment anyway; the
 whole point of _load_env_file() is that its absence is a silent no-op).
+
+sampling/config.py is a full duplicate of rules_engine/config.py -- see that
+package's own test_rules_engine_config.py for the identical coverage on
+its copy. Packages share no code (see README.md's "Package separation").
 """
 
 import importlib
@@ -13,13 +17,13 @@ import logging
 
 import pytest
 
-import shared.config as shared_config
+import sampling.config as shared_config
 
 
 @pytest.fixture
 def reload_config(monkeypatch):
     """
-    Reload shared.config after env/monkeypatch changes so module-level state
+    Reload sampling.config after env/monkeypatch changes so module-level state
     (META_CONNECTION, META_DB, and the _load_env_file() call at import
     time) is recomputed under the patched environment. Restores the real
     module afterward so later tests in the same run see normal state.
@@ -46,7 +50,7 @@ def test_load_env_file_noop_when_file_absent(tmp_path, monkeypatch, reload_confi
 
 def test_load_env_file_loads_present_file(tmp_path, monkeypatch, reload_config):
     """When GRE_ENV_FILE points at a real file (resolved relative to the
-    repo root, i.e. shared/config.py's parent's parent), its KEY=VALUE lines
+    repo root, i.e. sampling/config.py's parent's parent), its KEY=VALUE lines
     land in os.environ."""
     import os
 

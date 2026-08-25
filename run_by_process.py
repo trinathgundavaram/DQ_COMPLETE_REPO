@@ -37,11 +37,15 @@ import sys
 from datetime import date
 
 from db.connection_factory import build_and_load_connection_factory
-from shared.db_ops import build_run_key
 
 
 def _default_run_key():
-    return build_run_key(date.today().isoformat())
+    # A plain ISO date is already a valid run_key on its own -- no need to
+    # pull in either package's build_run_key() (a one-value join is just
+    # str(value)) just for this. See rules_engine/db_ops.py's or
+    # sampling/db_ops.py's build_run_key() docstring if a caller needs to
+    # join multiple parts into a run_key instead.
+    return date.today().isoformat()
 
 
 def _run_rules(args):

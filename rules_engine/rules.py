@@ -9,7 +9,7 @@ rules_engine/runner.py (which decides run order/sequencing behaviour) so
 "what rules exist for this group" is testable in isolation from "how do we
 run them."
 
-The query itself is run through shared.db_ops.execute_query() rather than
+The query itself is run through rules_engine.db_ops.execute_query() rather than
 a second hand-rolled cursor->fetchall->dict-zip loop -- there is exactly
 one place in this engine that knows how to turn a DB-API cursor into a
 list of lowercase-keyed dicts, and this module reuses it instead of
@@ -18,7 +18,7 @@ duplicating it.
 
 import logging
 
-from shared.db_ops import execute_query
+from rules_engine.db_ops import execute_query
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ def load_rules(meta_conn, meta_db: str, rule_group: str, rule_variant: str = Non
     project_name/process_name straight through from gre_rules (SELECT *) --
     they're descriptive/reporting dimensions, not part of this lookup's own
     filter (see rules_engine/schema.sql's design notes); rules_engine/
-    runner.py reads them off these dicts to stamp gre_audit/gre_log/
+    runner.py reads them off these dicts to stamp gre_rule_audit/gre_log/
     gre_exceptions/gre_results for the run.
     """
     if rule_variant:

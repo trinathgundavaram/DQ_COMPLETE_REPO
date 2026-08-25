@@ -1,4 +1,4 @@
-"""Declarative registry of the 12 gre_* tables this tool mirrors.
+"""Declarative registry of the 13 gre_* tables this tool mirrors.
 sync_from_teradata.py and create_postgres_tables.py just loop over
 TABLE_SPECS -- add a table here (+ its CREATE TABLE in ddl_postgres.sql)
 and nothing else needs to change.
@@ -15,11 +15,13 @@ and nothing else needs to change.
                    watermark_col keep getting re-pulled (see gre_rule_audit/
                    gre_sampling_audit)
 
-Note: gre_audit itself (the old combined table, now a Teradata VIEW over
-gre_rule_audit/gre_sampling_audit -- see shared/schema.sql) is deliberately
-NOT in this registry -- a view has nothing of its own to sync
-incrementally against. ddl_postgres.sql creates the equivalent view on the
-Postgres side too, built from the two tables this DOES sync.
+Note: gre_audit (the old combined run-tracking table) and gre_errors (the
+old combined error table) were both fully split, and there is no longer a
+compatibility VIEW standing in for either old name on either database --
+rules_engine/ and sampling/ are now fully independent packages that share
+no tables at all (see README.md's "Package separation"). Anything still
+querying gre_audit or gre_errors directly needs to move to the
+package-specific tables below.
 """
 
 GRE_RULES = {
@@ -82,18 +84,14 @@ GRE_RESULTS = {
     ],
 }
 
-# gre_audit split into gre_rule_audit / gre_sampling_audit (2026-08) -- see
-# shared/schema.sql's module header for the full rationale (rule-engine
-# users no longer drag along six always-NULL sampling columns and vice
-# versa). Both replace the single GRE_AUDIT entry that used to sync the
-# old combined table; the old gre_audit name now refers to a VIEW on the
-# Teradata side (a UNION ALL of these two tables, for anything still
-# querying it directly) -- deliberately NOT synced here: syncing the two
-# real tables gives Postgres the same segregation Teradata now has, and a
-# view has no watermark column of its own to sync incrementally against
-# anyway. If a Postgres consumer still wants the old combined shape,
-# ddl_postgres.sql defines the equivalent gre_audit view there too, built
-# from these two synced tables -- see that file.
+# gre_audit split into gre_rule_audit / gre_sampling_audit (2026-08) --
+# rule-engine users no longer drag along six always-NULL sampling columns
+# and vice versa. Both replace the single GRE_AUDIT entry that used to
+# sync the old combined table. There is no compatibility view standing in
+# for the old gre_audit name on either database -- rules_engine/ and
+# sampling/ share no tables at all (see README.md's "Package separation").
+# A consumer that needs both run-tracking tables together should query
+# gre_rule_audit and gre_sampling_audit separately, or UNION them itself.
 #
 # Both tables' ended_at/status UPDATE never bumps load_datetime (see
 # rules_engine/runner.py::_finish_audit, sampling/sampling.py::_write_audit),
@@ -125,8 +123,13 @@ GRE_SAMPLING_AUDIT = {
     ],
 }
 
-GRE_ERRORS = {
-    "name": "gre_errors",
+# gre_errors split into gre_rule_errors / gre_sampling_errors (2026-08),
+# same split as gre_audit above and for the same reason: the two packages
+# share no tables. gre_rule_errors keeps rule_id/rule_group (always
+# populated for rules_engine); gre_sampling_errors drops rule_id entirely
+# and carries process_name instead (sampling has no rule concept).
+GRE_RULE_ERRORS = {
+    "name": "gre_rule_errors",
     "primary_key": ("error_id",),
     "mode": "incremental",
     # Same reasoning as gre_log above: active_ind flips without bumping
@@ -134,6 +137,17 @@ GRE_ERRORS = {
     "watermark_col": "COALESCE(last_updated_datetime, occurred_at)",
     "columns": [
         "error_id", "run_id", "rule_id", "rule_group", "run_key", "error_type",
+        "error_message", "error_detail", "active_ind", "occurred_at", "last_updated_datetime",
+    ],
+}
+
+GRE_SAMPLING_ERRORS = {
+    "name": "gre_sampling_errors",
+    "primary_key": ("error_id",),
+    "mode": "incremental",
+    "watermark_col": "COALESCE(last_updated_datetime, occurred_at)",
+    "columns": [
+        "error_id", "run_id", "process_name", "run_key", "error_type",
         "error_message", "error_detail", "active_ind", "occurred_at", "last_updated_datetime",
     ],
 }
@@ -200,9 +214,10 @@ GRE_SAMPLE_SELECTION_ATTRS = {
 }
 
 TABLE_SPECS = [
-    GRE_RULES, GRE_LOG, GRE_EXCEPTIONS, GRE_RESULTS, GRE_RULE_AUDIT, GRE_ERRORS,
+    GRE_RULES, GRE_LOG, GRE_EXCEPTIONS, GRE_RESULTS, GRE_RULE_AUDIT, GRE_RULE_ERRORS,
     GRE_SAMPLING_CONFIG, GRE_SAMPLING_STRATA, GRE_SAMPLING_MIX,
     GRE_SAMPLE_SELECTIONS, GRE_SAMPLE_SELECTION_ATTRS, GRE_SAMPLING_AUDIT,
+    GRE_SAMPLING_ERRORS,
 ]
 
 TABLE_SPECS_BY_NAME = {spec["name"]: spec for spec in TABLE_SPECS}

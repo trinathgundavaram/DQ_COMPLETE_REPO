@@ -11,8 +11,8 @@ expected-output snapshot that comparison produced -- not "should work in
 theory."
 
 core/stratified_sampling.py itself is NOT imported here: this repo's
-gre-and-sampling branch only carries rules_engine/, sampling/, shared/,
-and the two reused db/ files, not the old dq_* engine. The live
+gre-and-sampling branch only carries rules_engine/, sampling/, and the
+two reused db/ files, not the old dq_* engine. The live
 side-by-side comparison this snapshot came from is preserved in the
 add-generic-rules-engine branch's history (see
 sampling/seed/um_sample.sql's header) -- what matters going forward is
@@ -91,8 +91,8 @@ def _gre_meta_tables(conn):
         )
     """)
     conn.execute("""
-        CREATE TABLE gre_errors (
-            error_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
+        CREATE TABLE gre_sampling_errors (
+            error_id BIGINT, run_id VARCHAR, process_name VARCHAR,
             run_key VARCHAR, error_type VARCHAR, error_message VARCHAR,
             error_detail VARCHAR, active_ind VARCHAR DEFAULT 'Y',
             occurred_at TIMESTAMP DEFAULT current_timestamp,
@@ -502,7 +502,8 @@ def test_run_sampling_ranked_end_to_end():
         [result["sample_run_id"]],
     ).fetchone()
     # No run_type column anymore -- gre_sampling_audit holds sampling runs
-    # ONLY (see shared/schema.sql's module header for the gre_audit split).
+    # ONLY, and shares no table with rules_engine/'s gre_rule_audit (see
+    # README.md's "Package separation").
     assert audit == ("COMPLETED", "RANKED", result["candidates"], result["selected"])
 
     excluded = {r[0] for r in conn.execute("SELECT case_id FROM case_universe WHERE auto_closed = 1").fetchall()}
@@ -556,9 +557,9 @@ def test_run_sampling_rerun_deactivates_prior_sample_run_id_for_same_run_key():
 
     cf = _FakeConnectionFactory(conn)
     first = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
-    # sample_run_id is now built via shared/db_ops.py::generate_run_id()
+    # sample_run_id is now built via sampling/db_ops.py::generate_run_id()
     # (microsecond-precision timestamp + a random uniqueness suffix -- see
-    # tests/test_shared_db_ops.py's generate_run_id tests), so back-to-back
+    # tests/test_sampling_db_ops.py's generate_run_id tests), so back-to-back
     # calls can no longer collide onto the same id even within the same
     # wall-clock second -- no artificial sleep needed between them any more.
     second = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
@@ -644,7 +645,7 @@ def test_case_key_is_case_insensitive_and_stays_distinct_per_candidate():
     Regression test for _case_key(): gre_sampling_config.key_columns is
     free-text (authored independently of the physical column casing), but
     every pulled row's dict keys are always lowercased (see
-    shared/db_ops.py::execute_query()/_run_source_query()). Before the
+    sampling/db_ops.py::execute_query()/_run_source_query()). Before the
     fix, a key_columns value like "Case_ID" (physical column: case_id)
     made row.get("Case_ID") miss for every single candidate, collapsing
     ALL of them onto the identical case_key "Case_ID=None" -- and because
@@ -734,7 +735,7 @@ def test_run_sampling_select_persist_failure_writes_error_audit_not_crash(monkey
     assert audit == ("ERROR",)
 
     error_row = conn.execute(
-        "SELECT error_type FROM gre_errors WHERE run_id = ?", [result["sample_run_id"]],
+        "SELECT error_type FROM gre_sampling_errors WHERE run_id = ?", [result["sample_run_id"]],
     ).fetchone()
     assert error_row == ("SELECT_PERSIST_FAILURE",)
 
@@ -854,7 +855,7 @@ def test_run_sampling_for_process_name_scoped_to_one_project():
 
 def test_run_sampling_for_process_name_resolves_meta_conn_and_db_from_cf_when_omitted(monkeypatch):
     # meta_conn/meta_db aren't passed explicitly -- the wrapper must resolve
-    # them itself via cf.get(...)/shared.config, the whole point of this
+    # them itself via cf.get(...)/sampling.config, the whole point of this
     # convenience function over calling run_sampling() per config directly.
     conn = _conn()
     _build_universe(conn)
@@ -862,7 +863,7 @@ def test_run_sampling_for_process_name_resolves_meta_conn_and_db_from_cf_when_om
                    project_name="PROJECT_A", process_name="WEEKLY_REVIEW_SAMPLE")
     cf = _FakeConnectionFactory(conn)
 
-    import shared.config as shared_config
+    import sampling.config as shared_config
     monkeypatch.setattr(shared_config, "get_meta_db", lambda: META_DB)
 
     outcome = run_sampling_for_process_name("WEEKLY_REVIEW_SAMPLE", "2026-08-01", cf,
@@ -934,10 +935,10 @@ def test_run_sampling_run_key_and_run_params_batch_id_are_decoupled():
 
 def test_run_sampling_with_year_month_run_key_not_a_batch_id():
     # run_key doesn't have to be a "batch" at all -- a year+month composite
-    # (built via shared/db_ops.py::build_run_key()) works identically, and
+    # (built via sampling/db_ops.py::build_run_key()) works identically, and
     # gre_sampling_audit/gre_sample_selections/gre_sample_selection_attrs all track
     # correctly off it, with the sample_run_id embedding it too.
-    from shared.db_ops import build_run_key
+    from sampling.db_ops import build_run_key
 
     conn = _conn()
     _build_universe(conn)
@@ -972,7 +973,7 @@ def test_run_sampling_unresolved_scope_token_routes_to_pull_failure():
 
     result = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)  # min_revision not supplied
     assert result["status"] == "ERROR"
-    errors = conn.execute("SELECT error_type, error_message FROM gre_errors").fetchall()
+    errors = conn.execute("SELECT error_type, error_message FROM gre_sampling_errors").fetchall()
     assert len(errors) == 1 and errors[0][0] == "PULL_FAILURE"
     assert "min_revision" in errors[0][1]
 
@@ -985,7 +986,7 @@ def test_ranked_without_priority_rank_sql_raises_clear_error():
 
     result = _run_sampling(1, "2026-08-01", cf, meta_conn=conn, meta_db=META_DB)
     assert result["status"] == "ERROR"
-    errors = conn.execute("SELECT error_type FROM gre_errors").fetchall()
+    errors = conn.execute("SELECT error_type FROM gre_sampling_errors").fetchall()
     assert len(errors) == 1 and errors[0][0] == "PULL_FAILURE"
 
 

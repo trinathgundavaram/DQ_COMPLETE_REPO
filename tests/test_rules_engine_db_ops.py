@@ -1,8 +1,16 @@
 """
-shared/db_ops.py tests: the low-level DB helpers used by BOTH
-rules_engine/ and sampling/ -- bulk writes with duplicate-key tolerance
-and {key} run_params token substitution. No live DB connection required --
-DuckDB stands in for the metadata store.
+rules_engine/db_ops.py tests: the low-level DB helpers this package
+owns -- bulk writes with duplicate-key tolerance and {key} run_params
+token substitution. No live DB connection required -- DuckDB stands in
+for the metadata store.
+
+rules_engine/db_ops.py is a full duplicate of sampling/db_ops.py for the
+generic helpers below (execute_query/execute_dml/bulk_insert/
+_substitute_params/build_run_key/generate_run_id) -- see that package's
+own test_sampling_db_ops.py for the identical coverage on its copy.
+Packages share no code (see README.md's "Package separation"). Only
+count_prior_attempts()'s rule_group-keyed signature and the
+gre_rule_audit fixture below are specific to this package.
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -12,7 +20,7 @@ from datetime import datetime
 import duckdb
 import pytest
 
-from shared.db_ops import (
+from rules_engine.db_ops import (
     execute_query, execute_dml, bulk_insert, bulk_insert_or_skip,
     _substitute_params, build_run_key, generate_run_id, count_prior_attempts,
 )
@@ -124,9 +132,7 @@ def test_generate_run_id_never_collides_within_the_same_microsecond():
     """
     Regression for the old second-precision-only run_id format: two calls
     with identical label parts AND an identical (frozen) timestamp must
-    still produce different run_ids, via the random suffix -- this is
-    exactly the scenario that used to require tests/test_sampling.py to
-    sleep(1.1) between two run_sampling() calls just to dodge a collision.
+    still produce different run_ids, via the random suffix.
     """
     ts = datetime(2026, 8, 19, 14, 30, 22, 183045)
     ids = {generate_run_id("g", "k", timestamp=ts) for _ in range(200)}
@@ -149,25 +155,14 @@ def test_generate_run_id_warns_past_200_chars(caplog):
     assert any("200" in r.message for r in caplog.records)
 
 
-# ── count_prior_attempts ─────────────────────────────────────────────────
+# ── count_prior_attempts (rule_group-keyed) ──────────────────────────────
 
 def _audit_conn():
-    """
-    gre_rule_audit / gre_sampling_audit -- the split of the old combined
-    gre_audit table (see shared/schema.sql's module header): rule-engine
-    runs and sampling runs each get their own table now, so
-    count_prior_attempts() has one to query per branch (rule_group vs
-    sample_config_id) instead of one shared table with a run_type filter.
-    """
+    """gre_rule_audit -- this package's own run-tracking table."""
     conn = duckdb.connect(":memory:")
     conn.execute("""
         CREATE TABLE gre_rule_audit (
             run_id VARCHAR, rule_group VARCHAR, run_key VARCHAR, started_at TIMESTAMP
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE gre_sampling_audit (
-            run_id VARCHAR, sample_config_id INTEGER, run_key VARCHAR, started_at TIMESTAMP
         )
     """)
     return conn
@@ -189,22 +184,6 @@ def test_count_prior_attempts_increments_per_rule_group_run_key_pair():
     # A different rule_group or run_key doesn't share the count.
     assert count_prior_attempts(conn, "main", "BATCH_2026_08_19", rule_group="other_group") == 0
     assert count_prior_attempts(conn, "main", "OTHER_BATCH", rule_group="claims_dq") == 0
-
-
-def test_count_prior_attempts_keys_sampling_runs_by_config_id():
-    conn = _audit_conn()
-    execute_dml(conn, "INSERT INTO gre_sampling_audit (run_id, sample_config_id, run_key) VALUES (?, ?, ?)",
-               ["r1", 7, "2026-08-14"])
-    assert count_prior_attempts(conn, "main", "2026-08-14", sample_config_id=7) == 1
-    assert count_prior_attempts(conn, "main", "2026-08-14", sample_config_id=8) == 0
-
-
-def test_count_prior_attempts_requires_exactly_one_of_rule_group_or_config_id():
-    conn = _audit_conn()
-    with pytest.raises(ValueError):
-        count_prior_attempts(conn, "main", "BATCH_2026_08_19")
-    with pytest.raises(ValueError):
-        count_prior_attempts(conn, "main", "BATCH_2026_08_19", rule_group="claims_dq", sample_config_id=7)
 
 
 # ── bulk writes ───────────────────────────────────────────────────────────
@@ -251,118 +230,3 @@ def test_bulk_insert_or_skip_chunk_falls_back_on_duplicate():
     assert total == 3   # C1, C2, C3 -- no duplicate row, no lost row
     keys = {r["src_key_value"] for r in execute_query(conn, "SELECT src_key_value FROM gre_exceptions")}
     assert keys == {"claim_id=C1", "claim_id=C2", "claim_id=C3"}
-
-
-# ── gre_audit compatibility VIEW (shared/schema.sql) ─────────────────────
-#
-# Not exercised by any application code (rules_engine/ and sampling/ both
-# read/write gre_rule_audit/gre_sampling_audit directly now -- see
-# shared/schema.sql's module header) -- this is purely a regression check
-# on the migration itself: anything still pointed at gre_audit must keep
-# seeing the exact same combined shape it saw before the split.
-
-def _split_audit_conn_with_view():
-    """
-    Same two tables shared/schema.sql defines, plus the gre_audit VIEW
-    that UNIONs them -- built directly in DuckDB (which supports CREATE
-    VIEW/UNION ALL/CAST the same way) so this is a genuine executable
-    check of the view definition, not just a read of the .sql file.
-    """
-    conn = duckdb.connect(":memory:")
-    conn.execute("""
-        CREATE TABLE gre_rule_audit (
-            run_id VARCHAR, rule_group VARCHAR, project_name VARCHAR, process_name VARCHAR,
-            run_key VARCHAR, rule_variant VARCHAR, started_at TIMESTAMP, ended_at TIMESTAMP,
-            status VARCHAR, total_rules INTEGER, rules_succeeded INTEGER, rules_errored INTEGER,
-            triggered_by VARCHAR, load_datetime TIMESTAMP DEFAULT current_timestamp
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE gre_sampling_audit (
-            run_id VARCHAR, run_key VARCHAR, sample_config_id INTEGER, sampling_method VARCHAR,
-            random_seed BIGINT, target_volume INTEGER, total_candidates INTEGER,
-            total_selected INTEGER, started_at TIMESTAMP, ended_at TIMESTAMP, status VARCHAR,
-            triggered_by VARCHAR, load_datetime TIMESTAMP DEFAULT current_timestamp
-        )
-    """)
-    conn.execute("""
-        CREATE VIEW gre_audit AS
-        SELECT
-            run_id, 'RULE_GROUP' AS run_type,
-            rule_group, project_name, process_name, run_key, rule_variant,
-            started_at, ended_at, status,
-            total_rules, rules_succeeded, rules_errored,
-            CAST(NULL AS INTEGER)      AS sample_config_id,
-            CAST(NULL AS VARCHAR)      AS sampling_method,
-            CAST(NULL AS BIGINT)       AS random_seed,
-            CAST(NULL AS INTEGER)      AS target_volume,
-            CAST(NULL AS INTEGER)      AS total_candidates,
-            CAST(NULL AS INTEGER)      AS total_selected,
-            triggered_by, load_datetime
-        FROM gre_rule_audit
-        UNION ALL
-        SELECT
-            run_id, 'SAMPLING' AS run_type,
-            CAST(NULL AS VARCHAR) AS rule_group,
-            CAST(NULL AS VARCHAR) AS project_name,
-            CAST(NULL AS VARCHAR) AS process_name,
-            run_key,
-            CAST(NULL AS VARCHAR) AS rule_variant,
-            started_at, ended_at, status,
-            CAST(NULL AS INTEGER) AS total_rules,
-            CAST(NULL AS INTEGER) AS rules_succeeded,
-            CAST(NULL AS INTEGER) AS rules_errored,
-            sample_config_id, sampling_method, random_seed,
-            target_volume, total_candidates, total_selected,
-            triggered_by, load_datetime
-        FROM gre_sampling_audit
-    """)
-    return conn
-
-
-def test_gre_audit_view_reproduces_old_combined_shape():
-    conn = _split_audit_conn_with_view()
-    execute_dml(
-        conn,
-        """
-        INSERT INTO gre_rule_audit (
-            run_id, rule_group, project_name, run_key, status,
-            total_rules, rules_succeeded, rules_errored, triggered_by
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        ["RID1", "claims_dq", "HEALTHSPRING_UM", "BATCH_2026_08_19", "COMPLETED", 3, 3, 0, "jsmith"],
-    )
-    execute_dml(
-        conn,
-        """
-        INSERT INTO gre_sampling_audit (
-            run_id, run_key, sample_config_id, sampling_method,
-            target_volume, total_candidates, total_selected, status, triggered_by
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        ["SID1", "2026-08-01", 1, "RANKED", 150, 900, 150, "COMPLETED", "SYSTEM"],
-    )
-
-    rows = {r["run_id"]: r for r in execute_query(conn, "SELECT * FROM gre_audit ORDER BY run_id")}
-    assert set(rows.keys()) == {"RID1", "SID1"}
-
-    rule_row = rows["RID1"]
-    assert rule_row["run_type"] == "RULE_GROUP"
-    assert rule_row["rule_group"] == "claims_dq"
-    assert rule_row["total_rules"] == 3
-    # Sampling-only columns are NULL on a rule-group row -- the exact old
-    # combined-table behavior this view is preserving.
-    assert rule_row["sample_config_id"] is None
-    assert rule_row["sampling_method"] is None
-
-    sample_row = rows["SID1"]
-    assert sample_row["run_type"] == "SAMPLING"
-    assert sample_row["sample_config_id"] == 1
-    assert sample_row["sampling_method"] == "RANKED"
-    # Rule-only columns are NULL on a sampling row.
-    assert sample_row["rule_group"] is None
-    assert sample_row["total_rules"] is None
-
-    # Same 20-column shape on both sides of the UNION -- a caller doing
-    # "SELECT * FROM gre_audit" never sees a shape difference by run_type.
-    assert set(rule_row.keys()) == set(sample_row.keys())

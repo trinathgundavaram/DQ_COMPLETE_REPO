@@ -46,7 +46,7 @@ import logging
 import queue
 
 from db.connection_factory import FileAdapter, S3Adapter
-from shared.config import get_max_parallel_for_connection
+from rules_engine.config import get_max_parallel_for_connection
 
 logger = logging.getLogger(__name__)
 

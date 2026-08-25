@@ -42,11 +42,13 @@ Put it on a schedule (see `crontab.example`).
   (`METADATA_SYNC_LOOKBACK_MINUTES`, default 60), upsert on the primary key.
   `gre_rule_audit`/`gre_sampling_audit` also always re-pull any
   `status = 'RUNNING'` row, since their `ended_at`/`status` UPDATE never
-  bumps `load_datetime`. (`gre_audit` itself -- the pre-split combined
-  table -- is now a VIEW on both the Teradata and Postgres sides, built
-  from these two; it's not in `TABLE_SPECS` and isn't synced directly,
-  since a view has no watermark of its own. See `shared/schema.sql`'s
-  module header for the full split rationale.)
+  bumps `load_datetime`. (`gre_audit` and `gre_errors` -- the old combined
+  tables -- were both split into package-specific pairs:
+  `gre_rule_audit`/`gre_sampling_audit` and `gre_rule_errors`/
+  `gre_sampling_errors`. `rules_engine/` and `sampling/` are now fully
+  independent packages that share no tables, so there's no compatibility
+  view standing in for either old name any more -- see README.md's
+  "Package separation" at the repo root.)
 
-Add a 13th table by adding one entry to `TABLE_SPECS` in `tables.py` and one
+Add a 14th table by adding one entry to `TABLE_SPECS` in `tables.py` and one
 `CREATE TABLE` block to `ddl_postgres.sql`.

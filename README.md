@@ -1,51 +1,79 @@
 # GRE + Sampling
 
-Two independent, config-driven engines that share a small common
-infrastructure layer:
+Two fully independent, config-driven engines:
 
 - **[`rules_engine/`](rules_engine/README.md)** -- the Generic Rules
   Engine (GRE). `gre_rules` rows define a negative SQL SELECT per rule;
   the engine runs each active rule for a `rule_group`/`run_key`, writes
   every violating row to `gre_exceptions`, evaluates a threshold, and
-  upserts a `gre_results` verdict.
+  upserts a `gre_results` verdict. Owns its own `db_ops.py`, `config.py`,
+  `gre_rule_audit` (run-tracking), and `gre_rule_errors` (error log).
 - **[`sampling/`](sampling/README.md)** -- generic stratified sampling.
   Given a candidate universe, an exclusion filter, any number of
   stratification levels, and a selection method (RANKED/RANDOM/
   SYSTEMATIC), picks a target-volume sample and persists every candidate
-  considered.
-- **[`shared/`](shared/README.md)** -- what both of the above actually
-  share: low-level DB helpers (`db_ops.py`), local `.env` credential
-  loading + metadata-store resolution (`config.py`), the shared error log
-  (`gre_errors`), and each package's own run-tracking table
-  (`gre_rule_audit`, `gre_sampling_audit`) -- plus a `gre_audit`
-  backward-compatibility VIEW over the latter two, for anything still
-  querying the old combined shape. See `shared/README.md`'s "Why
-  `gre_audit` is now two tables plus a view".
+  considered. Owns its own `db_ops.py`, `config.py`, `gre_sampling_audit`
+  (run-tracking), and `gre_sampling_errors` (error log).
 - **`db/connection_factory.py`** -- every source adapter (Teradata,
   Postgres, S3, file) plus `ConnectionFactory`, in one file. Exactly ONE
   connection per source_type -- no named/multi-connection setup. This is
-  the ONLY code either package depends on outside its own folder (plus
-  `shared/`).
+  the ONLY code either package depends on outside its own folder.
+
+## Package separation
+
+`rules_engine/` and `sampling/` share **no code and no tables**. Each
+package carries its own copy of the low-level DB helpers (`db_ops.py`:
+bulk writes, `{key}` run_params substitution, `generate_run_id()`,
+`build_run_key()`, `count_prior_attempts()`, `log_error()`) and its own
+copy of the config/credentials layer (`config.py`: local `.env` loading,
+metadata connection/db resolution, parallel-execution tunables,
+readiness-check registry). The two files are byte-for-byte identical
+between packages except for each package's `count_prior_attempts()`
+signature (`rule_group` vs. `sample_config_id`) and `log_error()`'s
+target table.
+
+There used to be a `shared/` package holding one copy of `db_ops.py`/
+`config.py` plus a combined `gre_audit` run-tracking table and a combined
+`gre_errors` error table. It has been removed. `gre_audit` was split into
+`gre_rule_audit`/`gre_sampling_audit`, and `gre_errors` was split into
+`gre_rule_errors`/`gre_sampling_errors` -- see each package's own
+`schema.sql` for the DDL. **Neither split table has a compatibility view
+standing in for the old combined name any more** -- this is a real
+behavior change from an earlier version of this split, which did keep a
+`gre_audit` VIEW; that view (and the equivalent Postgres-mirror view) has
+been retired. Anything still querying `gre_audit` or `gre_errors`
+directly needs to move to the package-specific tables, or build its own
+UNION ALL across them. `db/connection_factory.py` is the one deliberate
+exception to "no shared code" -- it's pure source-connection
+infrastructure with no rules/sampling-specific logic, and duplicating it
+would double the number of real live connections opened per source_type
+whenever both packages run in the same process.
+
+`migrate_split_gre_audit.sql` and `migrate_split_gre_errors.sql` at the
+repo root carry existing deployments through both splits without data
+loss (see their own headers) -- `migrate_split_gre_audit.sql` still
+offers an optional, transitional `gre_audit` view for external readers,
+but that view is not part of the application's own contract and should
+be dropped once those readers have moved over.
 
 Each package is independently testable and has its own DDL -- see
-`tests/` and each package's `schema.sql`/`schema_drop.sql`.
+`tests/` and each package's `schema.sql`/`schema_drop.sql`. Neither
+`schema.sql` needs the other to run first.
 
 ## Setup
 
 1. **First deployment** (no `gre_*` table exists yet, or you're OK
-   discarding what's in them): run `shared/schema.sql`, then
-   `rules_engine/schema.sql`, then `sampling/schema.sql`, in that order
-   -- `rules_engine/` writes to `gre_rule_audit`/`gre_errors`, `sampling/`
-   writes to `gre_sampling_audit`/`gre_errors`, all of which
-   `shared/schema.sql` creates first (along with the `gre_audit`
-   backward-compatibility view). See "Redeploying / changing the schema"
-   below for how to make DDL changes later, and
-   `migrate_split_gre_audit.sql` at the repo root instead if you already
-   have real history in an existing combined `gre_audit` table.
+   discarding what's in them): run `rules_engine/schema.sql` and
+   `sampling/schema.sql` -- in either order, or just the one package you
+   need; neither depends on the other. See "Redeploying / changing the
+   schema" below for how to make DDL changes later, and
+   `migrate_split_gre_audit.sql`/`migrate_split_gre_errors.sql` at the
+   repo root instead if you already have real history in an existing
+   combined `gre_audit`/`gre_errors` table.
 
 2. **Local credentials**: copy `dev.env.example` to `dev.env` (repo
-   root) and fill in real values. `shared/config.py` loads it
-   automatically the first time either package is imported -- see that
+   root) and fill in real values. Each package's own `config.py` loads it
+   automatically the first time that package is imported -- see either
    file's docstring, and `dev.env.example`'s header, for exactly how.
    `dev.env` is gitignored; never commit it. This is an interim, local-
    dev-only credential path -- see "Credentials" below for the planned
@@ -82,7 +110,7 @@ etc.) builds one `ConnectionFactory` and calls into `rules_engine/` and/or
 
 ```python
 from db.connection_factory import ConnectionFactory
-from shared import config as gre_config
+from rules_engine import config as gre_config
 from rules_engine.runner import run_rule_group, run_all_active_groups
 from sampling.sampling import run_sampling
 
@@ -90,10 +118,11 @@ cf = ConnectionFactory()
 cf.load()                                    # brings up every configured source_type
 
 # run_key is an opaque tracking/idempotency identifier YOU construct --
-# there's no fixed shape to it. shared/db_ops.py::build_run_key() is a
-# convenience formatter for joining parts together, but a plain string you
-# already have works just as well.
-from shared.db_ops import build_run_key
+# there's no fixed shape to it. Either package's db_ops.py::build_run_key()
+# is a convenience formatter for joining parts together (identical in both
+# -- pick whichever package you're already importing), but a plain string
+# you already have works just as well.
+from rules_engine.db_ops import build_run_key
 
 run_key = build_run_key("BATCH_2026_08_14")     # a plain batch id, or...
 run_key = build_run_key(2026, 8)                # ...a year+month scope ("2026_8"), or...
@@ -181,13 +210,11 @@ rather than writing `ALTER TABLE` migrations. Each package has its own
 `schema_drop.sql` for this:
 
 ```
-shared/schema_drop.sql          -- drop the gre_audit view, gre_rule_audit, gre_sampling_audit, gre_errors
-rules_engine/schema_drop.sql    -- drop gre_rules, gre_log, gre_exceptions, gre_results
-sampling/schema_drop.sql        -- drop the 5 gre_sampling_*/gre_sample_* tables
+rules_engine/schema_drop.sql    -- drop gre_rules, gre_log, gre_exceptions, gre_results, gre_rule_audit, gre_rule_errors
+sampling/schema_drop.sql        -- drop the 7 gre_sampling_*/gre_sample_* tables (incl. gre_sampling_audit, gre_sampling_errors)
 
--- then redeploy, shared first (rules_engine/ and sampling/ both assume
--- gre_rule_audit/gre_sampling_audit/gre_errors already exist):
-shared/schema.sql
+-- then redeploy -- independently; neither package needs the other's
+-- schema.sql to run first:
 rules_engine/schema.sql
 sampling/schema.sql
 ```
@@ -205,13 +232,13 @@ table** -- at that point, schema changes should become real migrations
 
 ## Credentials
 
-Today: local `.env` file (`dev.env`), loaded by `shared/config.py` via
-`python-dotenv`, into the exact env var names `db/connection_factory.py`
-already expects -- see `shared/config.py`'s docstring for the full
-mechanics.
+Today: local `.env` file (`dev.env`), loaded by each package's own
+`config.py` via `python-dotenv`, into the exact env var names
+`db/connection_factory.py` already expects -- see either `config.py`'s
+docstring for the full mechanics (identical between the two).
 
 Planned pivot: AWS Secrets Manager (or similar), for non-local
-deployments. This only requires changing `shared/config.py`'s
+deployments. This only requires changing each package's `config.py`'s
 `_load_env_file()` to populate the same env var names from Secrets
 Manager instead of a file -- `db/connection_factory.py`, `rules_engine/`,
 and `sampling/` all only ever see already-populated env vars either way,
@@ -229,8 +256,10 @@ Teradata/Postgres/etc. connection is needed.
 
 | Test file | Covers |
 |---|---|
-| `test_shared_config.py` | `shared/config.py` -- `.env` loading, metadata connection/db resolution, batch-readiness checks. |
-| `test_shared_db_ops.py` | `shared/db_ops.py` -- bulk writes with duplicate-key tolerance, `{key}` run_params substitution (`_substitute_params`/`build_run_key`). |
+| `test_rules_engine_config.py` | `rules_engine/config.py` -- `.env` loading, metadata connection/db resolution, batch-readiness checks. |
+| `test_rules_engine_db_ops.py` | `rules_engine/db_ops.py` -- bulk writes with duplicate-key tolerance, `{key}` run_params substitution (`_substitute_params`/`build_run_key`), `count_prior_attempts()` keyed by `rule_group`. |
+| `test_sampling_config.py` | `sampling/config.py` -- identical coverage to `test_rules_engine_config.py`, against sampling's own copy. |
+| `test_sampling_db_ops.py` | `sampling/db_ops.py` -- identical coverage to `test_rules_engine_db_ops.py`, against sampling's own copy, with `count_prior_attempts()` keyed by `sample_config_id` instead. |
 | `test_rules_engine_rules.py` | `rules_engine/rules.py` -- `load_rules()`'s group/act_ind filtering, ordering, and `rule_variant` selection (universal vs. exact-match). |
 | `test_rules_engine_executor.py` | `rules_engine/executor.py` -- threshold evaluation, natural-key building, `execute_rule()` end-to-end, the single-scan/memoized-total big-dataset path, run_params substitution and its fail-fast `PARAM_SUBSTITUTION_ERROR`. |
 | `test_rules_engine_runner.py` | `rules_engine/runner.py` -- checkpoint/resume, `sequencing_mode` (`halt_group` vs. `skip_and_continue`), the shared `total_cache`, `rule_variant` end-to-end, `run_params` threading. |

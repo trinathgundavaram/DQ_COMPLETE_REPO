@@ -1,24 +1,25 @@
 -- ============================================================
 -- sampling/ -- redeploy helper
 -- ============================================================
--- schema.sql is pure CREATE, correct as-is for a first deployment onto a
--- schema that already has shared/schema.sql applied. Once these gre_*
--- objects exist, this script drops all of them so schema.sql can be
--- re-run cleanly -- the engine's policy (given no gre_* table has live/
--- production data yet) is to redeploy schema changes by editing
--- schema.sql's CREATE statements directly and dropping/recreating, rather
--- than writing ALTER TABLE migrations. Once real data exists in these
--- tables, that policy needs revisiting -- this script is destructive and
--- will discard everything in these 5 tables.
+-- schema.sql is pure CREATE, correct as-is for a first deployment -- this
+-- package is fully standalone (see its own header: no other schema.sql
+-- needs to run first). Once these gre_* objects exist, this script drops
+-- all of them so schema.sql can be re-run cleanly -- the engine's policy
+-- (given no gre_* table has live/production data yet) is to redeploy
+-- schema changes by editing schema.sql's CREATE statements directly and
+-- dropping/recreating, rather than writing ALTER TABLE migrations. Once
+-- real data exists in these tables, that policy needs revisiting -- this
+-- script is destructive and will discard everything in these 7 tables.
 --
--- Usage: run this, then re-run schema.sql. Does NOT touch shared/'s
--- gre_audit/gre_errors or rules_engine/'s gre_rules/gre_log/
--- gre_exceptions/gre_results -- see those packages' own
--- schema_drop.sql for those.
+-- Usage: run this, then re-run schema.sql. Does NOT touch rules_engine/'s
+-- gre_rules/gre_log/gre_exceptions/gre_results/gre_rule_audit/
+-- gre_rule_errors -- see that package's own schema_drop.sql for those
+-- (the two packages share nothing -- see README.md's "Package
+-- separation").
 --
 -- In Teradata, DROP TABLE also drops every index defined on that table
 -- (CREATE INDEX is structurally part of the table, not an independent
--- object) -- so dropping the 5 tables below is sufficient; there's no
+-- object) -- so dropping the 7 tables below is sufficient; there's no
 -- separate DROP INDEX step needed.
 --
 -- Plain DROP TABLE (no IF EXISTS -- Teradata has no such clause for
@@ -33,3 +34,5 @@ DROP TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selections;
 DROP TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_mix;
 DROP TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_strata;
 DROP TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_config;
+DROP TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_audit;
+DROP TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_errors;

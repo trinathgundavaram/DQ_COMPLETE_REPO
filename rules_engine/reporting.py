@@ -14,7 +14,7 @@ live re-join rather than a stored copy.
 
 import logging
 
-from shared.db_ops import execute_query, _run_source_query, _escape_sql_literal, EXCEPTION_CHUNK
+from rules_engine.db_ops import execute_query, _run_source_query, _escape_sql_literal, EXCEPTION_CHUNK
 from rules_engine.executor import parse_src_key, _format_src_key
 
 logger = logging.getLogger(__name__)

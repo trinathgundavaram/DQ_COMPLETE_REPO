@@ -17,7 +17,7 @@ from rules_engine.reporting import (
     get_breaches, get_records_for_result, get_source_records_for_rule,
     get_source_records_for_process,
 )
-from shared.db_ops import execute_dml
+from rules_engine.db_ops import execute_dml
 
 META_DB = "main"
 

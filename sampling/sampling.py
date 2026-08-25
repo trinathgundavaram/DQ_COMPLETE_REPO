@@ -22,18 +22,22 @@ that module hardcodes exactly two stratification levels
                                 (RANKED / RANDOM / SYSTEMATIC, applied
                                 uniformly at every leaf bucket)
 
-Built on shared/db_ops.py + shared/config.py
------------------------------------------------
+Built on this package's own db_ops.py + config.py
+-----------------------------------------------------
 The low-level DB helpers (execute_query/execute_dml/bulk_insert,
-_run_source_query, _substitute_params, build_run_key) and the shared
-gre_errors writer (log_error) come from shared/db_ops.py -- the SAME
-module rules_engine/ uses, so there is exactly one implementation of each,
-not two drifting copies. Metadata connection/db resolution comes from
-shared/config.py.
+_run_source_query, _substitute_params, build_run_key) and the
+gre_sampling_errors writer (log_error) come from sampling/db_ops.py --
+this package's own copy of what used to be shared/db_ops.py, before
+rules_engine/ and sampling/ were split into fully independent packages
+with zero shared code (see README.md's "Package separation"; the two
+copies -- sampling/db_ops.py and rules_engine/db_ops.py -- are identical
+apart from their gre_sampling_errors/gre_rule_errors split). Metadata
+connection/db resolution comes from sampling/config.py, this package's
+own copy of what used to be shared/config.py.
 
 scope_sql AND exclusion_sql both go through the same {key} run_params
 substitution as rules_engine's rule_syntax -- see
-shared/db_ops.py::_substitute_params()'s docstring for why this is a
+sampling/db_ops.py::_substitute_params()'s docstring for why this is a
 free-form dict rather than a single fixed value. Unlike rules_engine (which auto-
 derives its total-record count straight from run_params against
 database_name.src_tbl_nm -- see rules_engine/executor.py::
@@ -75,18 +79,17 @@ import math
 import random
 from datetime import datetime
 
-from shared.db_ops import (
+from sampling.db_ops import (
     execute_query, execute_dml, bulk_insert, log_error,
     _run_source_query, _substitute_params, generate_run_id, count_prior_attempts,
 )
 
-# gre_sampling_audit -- sampling's OWN run-tracking table, split out of the
-# old combined gre_audit (see shared/schema.sql's module header). Written
-# to via _write_audit() below; rules_engine/ never reads or writes it (its
-# equivalent is rules_engine/runner.py::_start_audit()/_finish_audit()
-# against gre_rule_audit). Anything still reading the old combined shape
-# can query the gre_audit VIEW (also defined in shared/schema.sql) instead
-# -- this code never touches it.
+# gre_sampling_audit -- sampling's OWN run-tracking table (sampling/
+# schema.sql). Written to via _write_audit() below; rules_engine/ never
+# reads or writes it (its equivalent is rules_engine/runner.py::
+# _start_audit()/_finish_audit() against gre_rule_audit, defined in
+# rules_engine/schema.sql) -- the two packages share no tables at all, see
+# README.md's "Package separation".
 
 logger = logging.getLogger(__name__)
 
@@ -469,10 +472,10 @@ def _deactivate_prior_sampling_runs(meta_conn, meta_db: str, config_id, run_key:
     inside the sample_run_id string), so prior sample_run_id(s) for this
     (config_id, run_key) are found via gre_sampling_audit instead -- one
     row per sampling run, with sample_config_id and run_key recorded by
-    _write_audit(). (gre_sampling_audit holds sampling runs ONLY -- no
-    run_type filter needed here anymore, unlike when this queried the old
-    combined gre_audit table.) Never deletes: a superseded run's rows stay
-    in both tables with etl_is_curr_ind='N' for history/audit.
+    _write_audit(). gre_sampling_audit holds sampling runs ONLY (it's this
+    package's own table -- see sampling/schema.sql), so no run_type filter
+    is needed here. Never deletes: a superseded run's rows stay in both
+    tables with etl_is_curr_ind='N' for history/audit.
 
     Called AFTER this run's own rows are persisted as active (see
     run_sampling()), so a failure here never leaves a (config_id, run_key)
@@ -543,13 +546,10 @@ def _write_audit(meta_conn, meta_db: str, sample_run_id: str, run_key: str, conf
 def _log_sampling_error(meta_conn, meta_db: str, sample_run_id: str, run_key: str, config: dict,
                         error_type: str, message: str) -> None:
     """
-    Thin wrapper over shared/db_ops.py's shared log_error(): a sampling run
-    has no rule_id/rule_group, so process_name is carried in the
-    rule_group column for triage (same as the prior standalone
-    implementation), just without a second copy of the INSERT+try/except
-    body.
+    Thin wrapper over sampling/db_ops.py's log_error(), for config-dict
+    callers -- writes to this package's own gre_sampling_errors table.
     """
-    log_error(meta_conn, meta_db, sample_run_id, None, config.get("process_name"), run_key,
+    log_error(meta_conn, meta_db, sample_run_id, config.get("process_name"), run_key,
               error_type, message)
 
 
@@ -563,7 +563,7 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
     Execute one stratified sampling pass for `config_id`, scoped to
     `run_key` and whatever else `run_params` supplies (substituted into
     scope_sql's/exclusion_sql's "{key}" tokens -- same convention, and the
-    same shared.db_ops.py::_substitute_params() mechanism, as
+    same sampling.db_ops.py::_substitute_params() mechanism, as
     gre_rules.rule_syntax in rules_engine/).
 
     Parameters
@@ -600,7 +600,7 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
     dict summary: sample_run_id, candidates, selected, target_volume,
     by_stratum, seed (None for RANKED)
     """
-    from shared import config as gre_config
+    from sampling import config as gre_config
 
     meta_db = meta_db or gre_config.get_meta_db()
     meta_conn = meta_conn or cf.get(gre_config.get_meta_connection_name())
@@ -818,9 +818,9 @@ def run_sampling_for_process_name(
                    this cycle share one tracking value.
     cf           : a loaded db.connection_factory.ConnectionFactory.
     meta_conn    : metadata connection; defaults to
-                   cf.get(shared.config.get_meta_connection_name()).
+                   cf.get(sampling.config.get_meta_connection_name()).
     meta_db      : metadata schema/database name; defaults to
-                   shared.config.get_meta_db().
+                   sampling.config.get_meta_db().
     project_name : optional further narrowing to one project within this
                    process_name; omit to run every project under it.
     seed         : explicit seed passed through to every run_sampling()
@@ -840,7 +840,7 @@ def run_sampling_for_process_name(
     project_name, if given) -- most likely a typo'd process_name rather
     than a legitimately empty run.
     """
-    from shared import config as gre_config
+    from sampling import config as gre_config
 
     meta_conn = meta_conn or cf.get(gre_config.get_meta_connection_name())
     meta_db = meta_db or gre_config.get_meta_db()

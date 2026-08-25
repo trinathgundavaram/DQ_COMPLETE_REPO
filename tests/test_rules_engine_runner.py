@@ -16,7 +16,7 @@ from rules_engine.runner import (
     run_rule_group, discover_rule_groups, run_all_active_groups, run_by_process_name,
     generate_run_id,
 )
-from shared.db_ops import execute_query
+from rules_engine.db_ops import execute_query
 
 META_DB = "main"
 
@@ -144,7 +144,7 @@ def _conn():
     """)
 
     conn.execute("""
-        CREATE TABLE gre_errors (
+        CREATE TABLE gre_rule_errors (
             error_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
             run_key VARCHAR, error_type VARCHAR, error_message VARCHAR,
             error_detail VARCHAR, active_ind VARCHAR DEFAULT 'Y',
@@ -220,16 +220,16 @@ def _run_all(meta_conn, meta_db, run_key, cf, **kwargs):
     return run_all_active_groups(meta_conn, meta_db, run_key, cf, run_params=run_params, **kwargs)
 
 
-# ── generate_run_id (thin wrapper over shared/db_ops.py's) ──────────────
+# ── generate_run_id (thin wrapper over rules_engine/db_ops.py's) ─────────
 
 def test_generate_run_id_delegates_to_shared_helper():
     """
     rules_engine.runner.generate_run_id() is a thin wrapper around
-    shared/db_ops.py::generate_run_id() -- the format/uniqueness
+    rules_engine/db_ops.py::generate_run_id() -- the format/uniqueness
     guarantees themselves are covered exhaustively in
-    tests/test_shared_db_ops.py; this just confirms the wrapper actually
-    delegates rather than keeping its own (possibly drifted) copy of the
-    old second-precision "{rule_group}_{run_key}_{ts}" format.
+    tests/test_rules_engine_db_ops.py; this just confirms the wrapper
+    actually delegates rather than keeping its own (possibly drifted)
+    copy of the old second-precision "{rule_group}_{run_key}_{ts}" format.
     """
     run_id = generate_run_id("claims_dq", "BATCH_2026_08_19")
     assert run_id.startswith("claims_dq::BATCH_2026_08_19::")
@@ -346,7 +346,7 @@ def test_sequential_skip_and_continue_runs_next_rule_after_error():
     assert summary["results"][1] == "ERROR"
     assert summary["results"][2] == "SUCCESS"   # rule 2 still ran
 
-    errors = execute_query(conn, "SELECT * FROM gre_errors WHERE rule_id = 1")
+    errors = execute_query(conn, "SELECT * FROM gre_rule_errors WHERE rule_id = 1")
     assert len(errors) == 1
 
 
@@ -492,9 +492,9 @@ def test_run_params_batch_id_key_is_an_ordinary_key_not_reserved():
 # default -- so _CountingFakeConnectionFactory.calls["teradata"] counts
 # every new_connection() call made for the SOURCE side across a run; the
 # meta side is counted separately under get_meta_connection_name()'s value
-# ("teradata", shared.config's default -- these tests never override
+# ("teradata", rules_engine.config's default -- these tests never override
 # GRE_META_CONNECTION).
-from shared import config as gre_config  # noqa: E402  (grouped with this section deliberately)
+from rules_engine import config as gre_config  # noqa: E402  (grouped with this section deliberately)
 
 _META_NAME = gre_config.get_meta_connection_name()
 
@@ -573,7 +573,7 @@ def test_parallel_sql_dialect_unavailable_marks_rule_error_without_deadlock(monk
 
     assert summary["status"] == "COMPLETED"
     assert summary["results"] == {1: "ERROR", 2: "ERROR"}
-    errors = execute_query(conn, "SELECT * FROM gre_errors WHERE error_type = 'CONNECTION_UNAVAILABLE'")
+    errors = execute_query(conn, "SELECT * FROM gre_rule_errors WHERE error_type = 'CONNECTION_UNAVAILABLE'")
     assert len(errors) == 2
 
 
@@ -608,7 +608,7 @@ def test_parallel_respects_per_connection_max_parallel_cap(monkeypatch):
     assert summary["succeeded"] == 5
     # Only 2 connections were ever built for 'teradata' -- even though it
     # serves BOTH roles here (every rule's sql_dialect AND the default meta
-    # connection name; see shared/config.py's META_CONNECTION default), a
+    # connection name; see rules_engine/config.py's META_CONNECTION default), a
     # single shared pool is built per connection NAME now (runner.py::
     # _run_pending_parallel()), not once per role. Before that fix, source
     # and meta pools were built independently for the same name and this
@@ -792,14 +792,14 @@ def test_run_by_process_name_scoped_to_one_project():
 
 def test_run_by_process_name_resolves_meta_conn_and_db_from_cf_when_omitted(monkeypatch):
     # meta_conn/meta_db aren't passed explicitly here -- the wrapper must
-    # resolve them itself via cf.get(...)/shared.config, the whole point of
+    # resolve them itself via cf.get(...)/rules_engine.config, the whole point of
     # this convenience function over calling run_all_active_groups() directly.
     conn = _conn()
     cf = _FakeConnectionFactory(conn)
     _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_group="group_a",
                  project_name="PROJECT_A", process_name="UNIVERSE_VALIDATION")
 
-    import shared.config as shared_config
+    import rules_engine.config as shared_config
     monkeypatch.setattr(shared_config, "get_meta_db", lambda: META_DB)
 
     outcome = run_by_process_name("UNIVERSE_VALIDATION", "B1", cf, run_params={"batch_id": "B1"})

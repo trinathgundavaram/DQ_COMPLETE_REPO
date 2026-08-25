@@ -1,30 +1,44 @@
 -- ============================================================
 -- One-time migration: split the combined gre_audit table into
--- gre_rule_audit / gre_sampling_audit, with gre_audit itself becoming a
--- backward-compatibility VIEW over the two.
+-- gre_rule_audit / gre_sampling_audit.
 -- ============================================================
--- Use this INSTEAD OF shared/schema_drop.sql + shared/schema.sql if your
+-- UPDATE (2026-08): rules_engine/ and sampling/ are now fully independent
+-- packages that share no tables at all (see README.md's "Package
+-- separation") -- as part of that work, the gre_audit compatibility VIEW
+-- this script originally created in Step 4 was retired. The current
+-- application code never reads or writes gre_audit in any form. Step 4
+-- below is kept for a zero-downtime transition (so external readers of
+-- gre_audit don't break the moment this script runs), but treat the view
+-- it creates as TEMPORARY: drop it once every consumer has moved to
+-- querying gre_rule_audit/gre_sampling_audit directly (see the commented
+-- DROP VIEW at the very bottom of this file). Skip Step 4 entirely if you
+-- have no external readers of gre_audit to worry about.
+--
+-- Use this INSTEAD OF rules_engine/schema_drop.sql + rules_engine/
+-- schema.sql + sampling/schema_drop.sql + sampling/schema.sql if your
 -- gre_audit table already holds real run history you don't want to lose
 -- (the drop/recreate scripts are for a fresh or disposable-data
 -- environment only -- see their own headers).
 --
 -- Zero data loss, zero downtime for readers: gre_audit keeps returning
--- results (from the old table, unchanged) right up until the final
+-- results (from the old table, unchanged) right up until the Step 4
 -- CREATE VIEW statement, at which point it starts returning the exact
 -- same rows/shape, just sourced from the two new tables instead.
 --
 -- Run this as one script, top to bottom, in order:
---   1. Create the two new tables (see shared/schema.sql for the same DDL,
---      with matching column comments -- kept in sync manually).
+--   1. Create the two new tables (see rules_engine/schema.sql and
+--      sampling/schema.sql for the same DDL, with matching column
+--      comments -- kept in sync manually).
 --   2. Backfill each from the existing gre_audit, split by run_type.
 --   3. Rename the old gre_audit table out of the way (kept, not dropped
 --      -- see the cleanup note at the bottom).
---   4. Create gre_audit as a view reproducing the old shape exactly.
+--   4. (Optional, transitional) Create gre_audit as a view reproducing
+--      the old shape exactly, for external readers only.
 --
--- After running this, redeploy rules_engine/ and/or sampling/'s code (the
--- versions that write to gre_rule_audit/gre_sampling_audit directly, not
--- the old combined gre_audit) -- this script only migrates the DATA/DDL,
--- not the application code.
+-- After running this, redeploy rules_engine/ and sampling/'s code (both
+-- packages write to gre_rule_audit/gre_sampling_audit directly, never to
+-- gre_audit in any form) -- this script only migrates the DATA/DDL, not
+-- the application code.
 -- ============================================================
 
 
@@ -129,7 +143,9 @@ WHERE run_type = 'SAMPLING';
 RENAME TABLE CMSUNIV_FILELAND_DEV_T.gre_audit TO CMSUNIV_FILELAND_DEV_T.gre_audit_legacy;
 
 
--- ── Step 4: gre_audit becomes a view, same shape as before ─────────────
+-- ── Step 4 (optional, transitional): gre_audit becomes a view, same ────
+-- shape as before -- SKIP this step if nothing outside the application
+-- reads gre_audit; the app itself never will again.
 CREATE VIEW CMSUNIV_FILELAND_DEV_T.gre_audit AS
 SELECT
     run_id, 'RULE_GROUP' AS run_type,
@@ -162,9 +178,15 @@ SELECT
 FROM CMSUNIV_FILELAND_DEV_T.gre_sampling_audit;
 
 
+-- Once every external consumer of gre_audit (if you ran Step 4 at all)
+-- has moved to querying gre_rule_audit/gre_sampling_audit directly,
+-- retire the view -- the application code doesn't depend on it either way:
+--   DROP VIEW CMSUNIV_FILELAND_DEV_T.gre_audit;
+--   DROP TABLE CMSUNIV_FILELAND_DEV_T.gre_audit_legacy;
+--
 -- ============================================================
 -- After this script: redeploy rules_engine/ and sampling/'s application
--- code (shared/db_ops.py, rules_engine/runner.py, sampling/sampling.py --
--- the versions that target gre_rule_audit/gre_sampling_audit directly).
--- Nothing reading gre_audit needs to change at all.
+-- code (rules_engine/db_ops.py, sampling/db_ops.py, rules_engine/runner.py,
+-- sampling/sampling.py -- the versions that target
+-- gre_rule_audit/gre_sampling_audit directly, and never gre_audit).
 -- ============================================================

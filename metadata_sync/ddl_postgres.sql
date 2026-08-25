@@ -2,8 +2,9 @@
 -- of the app's perspective -- only metadata_sync/ writes here.
 -- {{SCHEMA}} is substituted by create_postgres_tables.py from
 -- METADATA_SYNC_PG_SCHEMA (default gre_mirror). Types translated from the
--- Teradata source (rules_engine/schema.sql, shared/schema.sql,
--- sampling/schema.sql): CLOB -> TEXT, BYTEINT -> SMALLINT, FLOAT ->
+-- Teradata source (rules_engine/schema.sql, sampling/schema.sql -- these
+-- two packages are fully independent and share no tables, see README.md's
+-- "Package separation"): CLOB -> TEXT, BYTEINT -> SMALLINT, FLOAT ->
 -- DOUBLE PRECISION. IDENTITY columns (log_id, record_id, result_id,
 -- error_id) are plain BIGINT -- values are copied verbatim, never minted
 -- here.
@@ -135,11 +136,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS gre_results_uix
     ON {{SCHEMA}}.gre_results (rule_id, run_key);
 
 -- gre_audit split into gre_rule_audit / gre_sampling_audit (2026-08) --
--- mirrors the same split on the Teradata side, see shared/schema.sql's
--- module header for the full rationale. metadata_sync/tables.py syncs
--- these two tables directly (GRE_RULE_AUDIT/GRE_SAMPLING_AUDIT specs);
--- gre_audit below is a VIEW here too, for anything still querying it
--- directly against the Postgres mirror.
+-- mirrors the same split on the Teradata side. rules_engine/ and
+-- sampling/ are now fully independent packages that share no tables (see
+-- README.md's "Package separation"), so unlike the first cut of this
+-- split there is no gre_audit compatibility VIEW here either -- a
+-- consumer that needs both run-tracking tables together should query
+-- gre_rule_audit and gre_sampling_audit separately, or UNION them itself.
+-- metadata_sync/tables.py syncs these two tables directly
+-- (GRE_RULE_AUDIT/GRE_SAMPLING_AUDIT specs).
 CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_rule_audit (
     run_id              VARCHAR(200) PRIMARY KEY,
     rule_group          VARCHAR(100),
@@ -177,46 +181,20 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_sampling_audit (
 CREATE INDEX IF NOT EXISTS gre_sampling_audit_status_ix ON {{SCHEMA}}.gre_sampling_audit (status);
 CREATE INDEX IF NOT EXISTS gre_sampling_audit_config_run_key_ix ON {{SCHEMA}}.gre_sampling_audit (sample_config_id, run_key);
 
--- Idempotent across reruns regardless of which object currently exists
--- under this name (a leftover pre-split TABLE the first time this runs
--- against an older mirror, or the VIEW itself on every rerun after) --
--- whichever doesn't exist is a harmless no-op, the other gets dropped so
--- CREATE VIEW below always starts clean.
+-- Drop any leftover pre-split gre_audit object from an older mirror --
+-- there is no replacement TABLE or VIEW under this name any more (see the
+-- comment above); this is purely cleanup so a rerun of this script
+-- against an old mirror doesn't leave a stale, now-orphaned object
+-- sitting around under the retired name.
 DROP VIEW IF EXISTS {{SCHEMA}}.gre_audit;
 DROP TABLE IF EXISTS {{SCHEMA}}.gre_audit;
 
-CREATE VIEW {{SCHEMA}}.gre_audit AS
-SELECT
-    run_id, 'RULE_GROUP'::VARCHAR(20) AS run_type,
-    rule_group, project_name, process_name, run_key, rule_variant,
-    started_at, ended_at, status,
-    total_rules, rules_succeeded, rules_errored,
-    NULL::INTEGER      AS sample_config_id,
-    NULL::VARCHAR(20)  AS sampling_method,
-    NULL::BIGINT       AS random_seed,
-    NULL::INTEGER      AS target_volume,
-    NULL::INTEGER      AS total_candidates,
-    NULL::INTEGER      AS total_selected,
-    triggered_by, load_datetime
-FROM {{SCHEMA}}.gre_rule_audit
-UNION ALL
-SELECT
-    run_id, 'SAMPLING'::VARCHAR(20) AS run_type,
-    NULL::VARCHAR(100) AS rule_group,
-    NULL::VARCHAR(100) AS project_name,
-    NULL::VARCHAR(100) AS process_name,
-    run_key,
-    NULL::VARCHAR(100) AS rule_variant,
-    started_at, ended_at, status,
-    NULL::INTEGER AS total_rules,
-    NULL::INTEGER AS rules_succeeded,
-    NULL::INTEGER AS rules_errored,
-    sample_config_id, sampling_method, random_seed,
-    target_volume, total_candidates, total_selected,
-    triggered_by, load_datetime
-FROM {{SCHEMA}}.gre_sampling_audit;
+-- gre_errors split into gre_rule_errors / gre_sampling_errors (2026-08),
+-- same split/rationale as gre_audit above. No compatibility view for the
+-- old gre_errors name either -- see the comment above gre_rule_audit.
+DROP TABLE IF EXISTS {{SCHEMA}}.gre_errors;
 
-CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_errors (
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_rule_errors (
     error_id         BIGINT PRIMARY KEY,
     run_id           VARCHAR(200),
     rule_id          INTEGER,
@@ -229,11 +207,24 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_errors (
     occurred_at      TIMESTAMP,
     last_updated_datetime TIMESTAMP
 );
-ALTER TABLE {{SCHEMA}}.gre_errors ADD COLUMN IF NOT EXISTS active_ind CHAR(1);
-ALTER TABLE {{SCHEMA}}.gre_errors ADD COLUMN IF NOT EXISTS last_updated_datetime TIMESTAMP;
-CREATE INDEX IF NOT EXISTS gre_errors_run_rule_ix ON {{SCHEMA}}.gre_errors (run_id, rule_id);
-CREATE INDEX IF NOT EXISTS gre_errors_rule_run_key_active_ix
-    ON {{SCHEMA}}.gre_errors (rule_id, run_key, active_ind);
+CREATE INDEX IF NOT EXISTS gre_rule_errors_run_rule_ix ON {{SCHEMA}}.gre_rule_errors (run_id, rule_id);
+CREATE INDEX IF NOT EXISTS gre_rule_errors_rule_run_key_active_ix
+    ON {{SCHEMA}}.gre_rule_errors (rule_id, run_key, active_ind);
+
+CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_sampling_errors (
+    error_id         BIGINT PRIMARY KEY,
+    run_id           VARCHAR(200),
+    process_name     VARCHAR(100),
+    run_key          VARCHAR(100),
+    error_type       VARCHAR(50),
+    error_message    VARCHAR(2000),
+    error_detail     TEXT,
+    active_ind       CHAR(1),
+    occurred_at      TIMESTAMP,
+    last_updated_datetime TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS gre_sampling_errors_run_key_active_ix
+    ON {{SCHEMA}}.gre_sampling_errors (run_key, active_ind);
 
 CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_sampling_config (
     config_id           INTEGER PRIMARY KEY,

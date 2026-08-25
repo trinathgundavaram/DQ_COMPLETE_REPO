@@ -8,8 +8,8 @@ the f"{meta_db}.table" pattern the engine uses in production works
 unchanged here).
 
 Generic DB-helper behavior (bulk writes, {key} run_params substitution) is
-covered in tests/test_shared_db_ops.py instead -- this file only exercises
-rule-specific behavior built on top of those primitives.
+covered in tests/test_rules_engine_db_ops.py instead -- this file only
+exercises rule-specific behavior built on top of those primitives.
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,7 +23,7 @@ from rules_engine.executor import (
     execute_rule, _compute_total, _scan_violations,
     build_source_tieback_sql,
 )
-from shared.db_ops import execute_query
+from rules_engine.db_ops import execute_query
 
 META_DB = "main"
 
@@ -124,7 +124,7 @@ def _conn():
     """)
 
     conn.execute("""
-        CREATE TABLE gre_errors (
+        CREATE TABLE gre_rule_errors (
             error_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
             run_key VARCHAR, error_type VARCHAR, error_message VARCHAR,
             error_detail VARCHAR, active_ind VARCHAR DEFAULT 'Y',
@@ -447,7 +447,7 @@ def test_execute_rule_deactivates_prior_log_attempts_on_rerun():
 
 def test_execute_rule_deactivates_prior_errors_on_rerun():
     """
-    active_ind reconciliation regression for gre_errors: two consecutive
+    active_ind reconciliation regression for gre_rule_errors: two consecutive
     failing reruns of the same run_key must leave only the LATEST run_id's
     error row active, with the earlier one deactivated (not deleted).
     """
@@ -457,7 +457,7 @@ def test_execute_rule_deactivates_prior_errors_on_rerun():
     execute_rule(broken_rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     execute_rule(broken_rule, _Adapter(conn), conn, "RUN2", "B1", {"batch_id": "B1"}, META_DB)
 
-    errors = execute_query(conn, "SELECT * FROM gre_errors WHERE rule_id = 1 AND run_key = 'B1'")
+    errors = execute_query(conn, "SELECT * FROM gre_rule_errors WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(errors) == 2
     by_run = {r["run_id"]: r for r in errors}
     assert by_run["RUN1"]["active_ind"] == "N"
@@ -628,7 +628,7 @@ def test_execute_rule_sql_error_routes_to_errors_and_logs():
     status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     assert status == "ERROR"
 
-    errors = execute_query(conn, "SELECT * FROM gre_errors WHERE rule_id = 1")
+    errors = execute_query(conn, "SELECT * FROM gre_rule_errors WHERE rule_id = 1")
     assert len(errors) == 1
     assert errors[0]["error_type"] == "SQL_RUNTIME"
 
@@ -722,7 +722,7 @@ def test_execute_rule_prepare_failure_routes_to_errors_before_any_query():
     status = execute_rule(rule, _FailingAdapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     assert status == "ERROR"
 
-    errors = execute_query(conn, "SELECT * FROM gre_errors WHERE rule_id = 1")
+    errors = execute_query(conn, "SELECT * FROM gre_rule_errors WHERE rule_id = 1")
     assert len(errors) == 1
     assert errors[0]["error_type"] == "SOURCE_PREPARE_ERROR"
 
@@ -908,7 +908,7 @@ def test_execute_rule_unresolved_token_fails_fast_before_any_query():
     assert status == "ERROR"
     assert wrapped_db.cursor_calls == 0   # caught before any source query ran
 
-    errors = execute_query(conn, "SELECT * FROM gre_errors WHERE rule_id = 1")
+    errors = execute_query(conn, "SELECT * FROM gre_rule_errors WHERE rule_id = 1")
     assert len(errors) == 1
     assert errors[0]["error_type"] == "PARAM_SUBSTITUTION_ERROR"
     assert "run_type" in errors[0]["error_message"]
@@ -924,11 +924,11 @@ def test_execute_rule_unresolved_token_fails_fast_before_any_query():
 
 def test_execute_rule_with_year_month_run_key_not_batch_id():
     # run_key doesn't have to be a "batch" at all -- a year+month composite
-    # (built via shared/db_ops.py::build_run_key()) works identically, and
+    # (built via rules_engine/db_ops.py::build_run_key()) works identically, and
     # run_params contains NO "batch_id" key anywhere -- rule_syntax here
     # doesn't reference {batch_id}, proving run_key is fully decoupled
     # from run_params.
-    from shared.db_ops import build_run_key
+    from rules_engine.db_ops import build_run_key
     conn = _conn()
     run_key = build_run_key(2026, 8)
     assert run_key == "2026_8"

@@ -66,7 +66,7 @@ import logging
 import time
 from datetime import datetime
 
-from shared.db_ops import (
+from rules_engine.db_ops import (
     execute_dml, execute_query, bulk_insert_or_skip, bulk_execute, _is_duplicate_key_error,
     _substitute_params, _run_source_query, _escape_sql_literal,
     log_error, EXCEPTION_CHUNK,

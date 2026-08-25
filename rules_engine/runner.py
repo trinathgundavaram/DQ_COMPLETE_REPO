@@ -22,7 +22,7 @@ docstring for the reconciliation rules.
 Parallel execution (opt-in)
 -------------------------------
 Raising GRE_MAX_PARALLEL_RULES above its default of 1 (see
-shared/config.py) turns on a second path, used ONLY for
+rules_engine/config.py) turns on a second path, used ONLY for
 sequencing_mode='independent' groups: rules run concurrently across a
 bounded thread pool, with per-connection concurrency additionally capped
 by GRE_<TYPE>_MAX_PARALLEL so a source system that can't tolerate much
@@ -30,7 +30,7 @@ concurrent load (e.g. an OLTP Postgres source, vs. a Teradata warehouse)
 isn't hit harder just because the group-wide worker count went up. See
 rules_engine/parallel.py's module docstring for the connection-pooling
 mechanics, and _run_pending_parallel() below for how it plugs into this
-file's existing per-rule execution and gre_audit bookkeeping.
+file's existing per-rule execution and gre_rule_audit bookkeeping.
 
 sequencing_mode='sequential' groups NEVER take this path, regardless of
 GRE_MAX_PARALLEL_RULES -- their whole point is a guaranteed run ORDER plus
@@ -43,8 +43,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-from shared import config as gre_config
-from shared.db_ops import (
+from rules_engine import config as gre_config
+from rules_engine.db_ops import (
     execute_query, execute_dml,
     generate_run_id as _generate_run_id,
     count_prior_attempts as _count_prior_attempts,
@@ -77,7 +77,7 @@ def _build_group_run_id(meta_conn, meta_db: str, rule_group: str, run_key: str,
     """
     The run_id run_rule_group() actually mints -- richer than the plain
     generate_run_id(rule_group, run_key) above, folding in three more
-    things a human scanning gre_log/gre_audit wants without a join:
+    things a human scanning gre_log/gre_rule_audit wants without a join:
 
         {project_name}.{rule_group}::{run_key}::attempt-{N}::{triggered_by}::{timestamp}::{hex}
 
@@ -94,8 +94,8 @@ def _build_group_run_id(meta_conn, meta_db: str, rule_group: str, run_key: str,
         hex suffix still is).
       - triggered_by -- who/what kicked this off (a login, a scheduler
         name, "SYSTEM"), already collected as a parameter here and
-        recorded on gre_audit -- folding it into the id too means it's
-        visible on gre_log/gre_exceptions/gre_results rows as well,
+        recorded on gre_rule_audit -- folding it into the id too means
+        it's visible on gre_log/gre_exceptions/gre_results rows as well,
         which don't otherwise carry it.
 
     Underlying shape/collision-safety is entirely generate_run_id()'s --
@@ -107,12 +107,11 @@ def _build_group_run_id(meta_conn, meta_db: str, rule_group: str, run_key: str,
 
 
 # ---------------------------------------------------------------------------
-# gre_rule_audit -- rules_engine's OWN run-tracking table, split out of the
-# old combined gre_audit (see shared/schema.sql's module header). sampling/
-# never reads or writes this table; its equivalent is
-# sampling/sampling.py::_write_audit() against gre_sampling_audit. Anything
-# still reading the old combined shape can query the gre_audit VIEW (also
-# defined in shared/schema.sql) instead -- this code never touches it.
+# gre_rule_audit -- rules_engine's OWN run-tracking table (rules_engine/
+# schema.sql). sampling/ never reads or writes this table; its equivalent
+# is sampling/sampling.py::_write_audit() against gre_sampling_audit,
+# defined in sampling/schema.sql -- the two packages share no tables at
+# all, see README.md's "Package separation".
 # ---------------------------------------------------------------------------
 
 def _start_audit(meta_conn, meta_db: str, run_id: str, rule_group: str, run_key: str,
@@ -638,11 +637,11 @@ def run_by_process_name(
                    year+month pair, a specific date, or any combination).
     cf           : a loaded db.connection_factory.ConnectionFactory.
     meta_conn    : metadata connection to run against; defaults to
-                   cf.get(shared.config.get_meta_connection_name()) if not
+                   cf.get(rules_engine.config.get_meta_connection_name()) if not
                    supplied, so callers with a plain ConnectionFactory don't
                    need to resolve this themselves.
     meta_db      : metadata schema/database name; defaults to
-                   shared.config.get_meta_db() if not supplied.
+                   rules_engine.config.get_meta_db() if not supplied.
     project_name : optional further narrowing to one project within this
                    process_name; omit to run every project under it.
     run_params   : free-form dict for rule_syntax {key} substitution -- see

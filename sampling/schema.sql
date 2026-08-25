@@ -12,14 +12,17 @@
 -- Schema : CMSUNIV_FILELAND_DEV_T  (DEV)  -- same metadata store as dq_*
 -- DB     : Teradata  (metadata store)
 -- ============================================================
--- Deploy AFTER shared/schema.sql -- gre_audit (written to via
--- sampling/sampling.py::_write_audit) and gre_errors (written to via
--- shared/db_ops.py::log_error) are both defined there, not here.
+-- This package is fully standalone -- no other schema.sql needs to run
+-- first (see README.md's "Package separation": rules_engine/ and
+-- sampling/ no longer share ANY code or tables; each has its own
+-- db_ops.py/config.py and its own run-tracking (gre_sampling_audit) and
+-- error-log (gre_sampling_errors) tables, both created below alongside
+-- the 5 gre_sampling_*/gre_sample_* tables).
 --
--- Standalone from ddl.sql and rules_engine/schema.sql on purpose: this
--- file creates ONLY gre_sampling_*/gre_sample_*-prefixed objects. It
--- never touches, renames, or alters a single dq_* or rules_engine table,
--- index, or column.
+-- Standalone from ddl.sql and rules_engine/schema.sql on purpose too:
+-- this file creates ONLY gre_sampling_*/gre_sample_*/gre_errors-successor
+-- objects. It never touches, renames, or alters a single dq_* or
+-- rules_engine table, index, or column.
 -- ============================================================
 
 -- ── 1. gre_sampling_config -- one row per sampling definition ─────────────
@@ -38,7 +41,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_config (
                                                     -- "{key}" tokens (e.g. {run_date}, {year}),
                                                     -- substituted from run_params the same way
                                                     -- rules_engine's rule_syntax is -- see
-                                                    -- shared/db_ops.py::_substitute_params().
+                                                    -- sampling/db_ops.py::_substitute_params().
                                                     -- Defaults to '1=1' (whole table) if unset.
                                                     -- Kept as an explicit, hand-authored WHERE-
                                                     -- fragment (unlike rules_engine/schema.sql's
@@ -118,8 +121,8 @@ ON CMSUNIV_FILELAND_DEV_T.gre_sampling_mix;
 -- the table for history/audit (soft-deactivate, never deleted -- same
 -- convention as rules_engine/schema.sql's gre_exceptions.etl_is_curr_ind).
 -- See sampling/sampling.py::_deactivate_prior_sampling_runs() -- prior
--- sample_run_id's are found via gre_audit (run_type='SAMPLING',
--- sample_config_id, run_key), since run_key isn't stored directly here.
+-- sample_run_id's are found via gre_sampling_audit (sample_config_id,
+-- run_key), since run_key isn't stored directly here.
 CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selections (
     sample_run_id         VARCHAR(200) NOT NULL,
     config_id             INTEGER,
@@ -192,3 +195,80 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selection_attrs (
                                                     -- repo root (drop + recreate, not ALTER TABLE).
 )
 PRIMARY INDEX (sample_run_id, case_key);
+
+
+-- ── 6. gre_sampling_audit -- durable, one row per sampling run ────────────
+-- Written by sampling/sampling.py::_write_audit() ONLY. Used to live in
+-- shared/schema.sql, alongside rules_engine/'s equivalent gre_rule_audit
+-- table (both were kept together there because they once shared a
+-- combined gre_audit table -- see the git history around the 2026-08
+-- gre_audit split). Now that rules_engine/ and sampling/ share no code or
+-- tables at all (see README.md's "Package separation"), this table lives
+-- here, where it's actually used.
+CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_audit (
+    run_id                 VARCHAR(200) NOT NULL,
+    run_key                   VARCHAR(100),        -- caller-supplied tracking/idempotency key
+    sample_config_id          INTEGER,             -- -> gre_sampling_config
+    sampling_method            VARCHAR(20),        -- 'RANKED'|'RANDOM'|'SYSTEMATIC'
+    random_seed                 BIGINT,             -- RANDOM/SYSTEMATIC only: the ONE seed used for
+                                                     -- this whole run -- see sampling/sampling.py's
+                                                     -- module docstring for how a single seed plus
+                                                     -- deterministic (sorted) bucket processing order
+                                                     -- reproduces every per-bucket offset/draw without
+                                                     -- storing them separately
+    target_volume                INTEGER,
+    total_candidates              INTEGER,
+    total_selected                 INTEGER,
+    started_at                TIMESTAMP,
+    ended_at                   TIMESTAMP,
+    status                      VARCHAR(20),        -- 'RUNNING' | 'COMPLETED' | 'ERROR'
+    triggered_by                 VARCHAR(100),
+    load_datetime                 TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+PRIMARY INDEX (run_id);
+
+-- count_prior_attempts() and _deactivate_prior_sampling_runs() (both in
+-- sampling/db_ops.py / sampling/sampling.py) both look this pair up every call.
+CREATE INDEX gre_sampling_audit_config_run_key_ix (sample_config_id, run_key)
+ON CMSUNIV_FILELAND_DEV_T.gre_sampling_audit;
+
+CREATE INDEX gre_sampling_audit_status_ix (status)
+ON CMSUNIV_FILELAND_DEV_T.gre_sampling_audit;
+
+
+-- ── 7. gre_sampling_errors -- this package's own SQL/execution failure log
+-- Used to be gre_errors, one table shared with rules_engine/ (a sampling
+-- error had rule_id=NULL and its process_name overloaded into that
+-- table's rule_group column, purely for triage). Now this package's own
+-- -- an honest process_name column, no rule_id/rule_group at all (a
+-- sampling run never had either). See README.md's "Package separation".
+--
+-- Append-only across reruns of the same run_key under a NEW run_id --
+-- active_ind marks which error(s) belong to the CURRENT run_id for a
+-- given run_key -- see sampling/db_ops.py::_deactivate_prior_errors(),
+-- called from log_error() immediately before each new error row is
+-- inserted, mirroring gre_sample_selections' etl_is_curr_ind
+-- reconciliation. Never deletes -- full error history stays on file;
+-- only active_ind flips.
+CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_errors (
+    error_id         BIGINT GENERATED ALWAYS AS IDENTITY,
+    run_id           VARCHAR(200),
+    process_name     VARCHAR(100),         -- config's process_name, for triage -- see
+                                            -- sampling/sampling.py::_log_sampling_error()
+    run_key          VARCHAR(100),
+    error_type       VARCHAR(50),          -- e.g. PULL_FAILURE | SELECT_PERSIST_FAILURE | STRATIFY_FAILURE
+    error_message    VARCHAR(2000),
+    error_detail     CLOB,
+    active_ind           CHAR(1) DEFAULT 'Y',  -- 'Y' = belongs to the current run_id for this
+                                                -- run_key; 'N' = superseded by a later rerun of
+                                                -- the same run_key. See comment above.
+    occurred_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_updated_datetime TIMESTAMP             -- set only when active_ind flips to 'N'
+)
+PRIMARY INDEX (run_id);
+
+-- Reporting/dashboard lookup: "what errors are current right now for this
+-- run_key" -- filters straight to active_ind='Y' instead of every
+-- historical error across every past run_id.
+CREATE INDEX gre_sampling_errors_run_key_active_ix (run_key, active_ind)
+ON CMSUNIV_FILELAND_DEV_T.gre_sampling_errors;

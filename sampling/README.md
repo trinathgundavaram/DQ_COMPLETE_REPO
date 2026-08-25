@@ -17,27 +17,27 @@ This package is deliberately independent of
 valid?" (pass/fail against a whole universe); sampling asks "which N
 cases are the highest-value ones for a reviewer this cycle?" (a
 ranking/quota problem). It can run standalone with zero `gre_rules` rows
-defined. The two share only what's in
-[`shared/`](../shared/README.md) (DB helpers, credential/config loading,
-and the `gre_sampling_audit`/`gre_errors` tables).
+defined. The two share no code or tables at all (see the repo root
+README's "Package separation"). `sampling/` owns its own `db_ops.py`,
+`config.py`, and the `gre_sampling_audit`/`gre_sampling_errors` tables.
 
 ## Files
 
 | File | What |
 |---|---|
 | `sampling.py` | `run_sampling()` -- the whole pipeline: load config, pull candidates (DB-side `ROW_NUMBER()` for `_priority_rank`), recursively stratify (`_stratify`), select per bucket (`_select`), shortfall top-up, persist, audit. |
-| `schema.sql` | `gre_sampling_config`, `gre_sampling_strata`, `gre_sampling_mix`, `gre_sample_selections`, `gre_sample_selection_attrs`. Deploy after `shared/schema.sql`. |
-| `schema_drop.sql` | Drops the 5 tables above, for the drop-and-recreate redeploy policy (see the repo root README). |
+| `schema.sql` | `gre_sampling_config`, `gre_sampling_strata`, `gre_sampling_mix`, `gre_sample_selections`, `gre_sample_selection_attrs`, `gre_sampling_audit`, `gre_sampling_errors`. Fully standalone -- no other package's `schema.sql` needs to run first. |
+| `schema_drop.sql` | Drops the 7 tables above, for the drop-and-recreate redeploy policy (see the repo root README). |
 | `seed/um_sample.sql` | The original COMO weekly UM sample (`dq_sampling_config.config_id=1`) re-expressed in this schema -- also the regression fixture `tests/test_sampling.py` checks against. |
 
 ## Tracking a run: `run_key`
 
 `run_key` is an opaque, caller-supplied string -- the ONE tracking
-identifier `gre_sampling_audit` and `gre_errors` key off, and it's one of the parts
+identifier `gre_sampling_audit` and `gre_sampling_errors` key off, and it's one of the parts
 `sample_run_id` is built from (see "Identifying an attempt: `sample_run_id`"
 below). There's no fixed shape to it: a plain batch id, a year+month combo,
 a specific date, a region, or any combination all work equally well.
-`shared/db_ops.py`'s `build_run_key(*parts, delimiter="_")` is a
+`sampling/db_ops.py`'s `build_run_key(*parts, delimiter="_")` is a
 convenience formatter (`build_run_key(2026, 8) -> "2026_8"`), or just pass
 your own string.
 
@@ -46,7 +46,7 @@ your own string.
 `run_key` (above) says WHICH logical run this is; `sample_run_id` says
 WHICH SPECIFIC ATTEMPT at it this is -- `run_sampling()` mints a brand new
 `sample_run_id` every call, even for a repeated `run_key`. It's built on
-`shared/db_ops.py::generate_run_id()` (the same helper
+`sampling/db_ops.py::generate_run_id()` (an identical copy of the helper
 `rules_engine/runner.py` uses for its own `run_id` -- see that package's
 README, "Identifying an attempt: `run_id`", for the full shape/rationale,
 which this mirrors exactly), from the config's `project_name` and
@@ -59,7 +59,7 @@ e.g. HEALTHSPRING_UM.weekly_review_sample::2026-08-01::attempt-2::jsmith::202608
 ```
 
 (`project_name` is omitted, along with its trailing `.`, when the config has
-no `project_name` set.) `N` = `shared/db_ops.py::count_prior_attempts()` + 1,
+no `project_name` set.) `N` = `sampling/db_ops.py::count_prior_attempts()` + 1,
 counted from `gre_sampling_audit` for this exact `(config_id, run_key)` pair -- makes
 a rerun visibly "attempt 2" without comparing two ids' timestamps.
 `triggered_by` defaults to `"SYSTEM"` and is also recorded on `gre_sampling_audit`;
@@ -153,7 +153,7 @@ Mirrors `rules_engine/runner.py`'s `run_by_process_name()`: discovers
 every active `gre_sampling_config` scoped to one `process_name`
 (optionally narrowed further by `project_name`) and runs each against the
 same `run_key`/`run_params`/`seed`, resolving `meta_conn`/`meta_db` from
-`cf`/`shared.config` itself if you don't pass them:
+`cf`/`sampling.config` itself if you don't pass them:
 
 ```python
 from sampling.sampling import run_sampling_for_process_name

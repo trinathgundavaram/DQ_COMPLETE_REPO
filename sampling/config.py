@@ -1,33 +1,24 @@
 """
-shared/config.py
-------------------
-Small, env-driven config surface used by BOTH rules_engine/ and sampling/
--- credential loading and metadata-store resolution neither package
-duplicates on its own.
+sampling/config.py
+--------------------
+Small, env-driven config surface for sampling/ -- credential loading and
+metadata-store resolution. This used to live in shared/config.py, shared
+verbatim with rules_engine/ (which has its own identical copy of this
+file, rules_engine/config.py) -- the two packages are now fully
+independent, so each keeps its own copy rather than importing a common
+shared/ module. See README.md's "Package separation" for why.
 
 Connector
 ----------
 Connections are opened via db.connection_factory.ConnectionFactory,
-imported directly. Callers (rules_engine/runner.py, sampling/sampling.py,
-tests) own a ConnectionFactory instance and pass adapters into
-rules_engine/executor.py / sampling/sampling.py.
+imported directly. Callers (sampling/sampling.py, tests) own a
+ConnectionFactory instance and pass adapters into sampling/sampling.py.
 
 Metadata connection
 --------------------
 GRE_META_CONNECTION picks which source_type ('teradata', 'postgres', 's3',
 'file' -- see db/connection_factory.py) holds the gre_ tables. Defaults to
 "teradata". No separate connection setup is required out of the box.
-
-Run-readiness precondition (deferred for v1)
--------------------------------------------------
-The original prompt calls for a "don't evaluate rules until the source
-data for this run is complete" precondition, expressed as config rather
-than hardcoded per rule. For v1 this ships as a no-op extension point:
-check_run_ready() always returns True unless a check has been registered
-for that rule_group via register_readiness_check(). Wiring up a real
-check (e.g. a status-table SELECT keyed off the run's run_key) is then a
-one-line addition here, not an engine code change. (Sampling has no
-equivalent readiness gate -- it runs on demand.)
 
 Local dev credentials (.env)
 -------------------------------
@@ -50,9 +41,18 @@ it's a silent no-op -- required-credential validation already happens
 downstream, in each adapter's own _require() checks, so nothing here
 duplicates that. GRE_ENV_FILE overrides the filename (default
 "dev.env"). Pivoting to Secrets Manager later replaces ONLY
-_load_env_file() below -- nothing else in either package needs to
-change, since every other file only ever sees already-populated env
-vars either way.
+_load_env_file() below -- nothing else in this package needs to change,
+since every other file only ever sees already-populated env vars either
+way. rules_engine/config.py's identical _load_env_file() would need the
+same edit made twice -- accepted cost of full separation over a shared
+module.
+
+get_max_parallel_rules()/get_max_parallel_for_connection() below are kept
+for parity with rules_engine/config.py (both packages' config.py started
+as the same shared/config.py file) but are currently UNUSED here --
+sampling/sampling.py runs one sampling config at a time, single-threaded;
+there is no sampling/parallel.py. Harmless to leave in place should
+concurrent sampling runs ever be added.
 """
 
 import logging
@@ -107,72 +107,27 @@ def get_meta_db() -> str:
     return META_DB
 
 
-# ── Parallel rule execution (opt-in; see rules_engine/parallel.py) ────────
-# runner.py's default is, and has always been, a single-threaded loop over
-# rules_engine/executor.py::execute_rule() -- see run_rule_group()'s own
-# docstring. These two settings are the ONLY way that changes, and only
-# for sequencing_mode='independent' groups (a 'sequential' group's ordering
-# and on_failure=halt_group semantics are incompatible with running rules
-# out of order, so it never parallelizes regardless of these values).
-#
-# GRE_MAX_PARALLEL_RULES caps how many rules in one group may execute
-# concurrently at all. GRE_<TYPE>_MAX_PARALLEL further caps how many of
-# those concurrent rules may simultaneously hold an open session against
-# one specific source_type (e.g. Postgres can't tolerate as much
-# concurrent load as the Teradata warehouse) -- the two caps compose: a
-# rule_group with GRE_MAX_PARALLEL_RULES=8 where 6 of its rules target
-# Postgres, capped at GRE_POSTGRES_MAX_PARALLEL=2, still only ever has 2
-# of those 6 running against Postgres at once, even though up to 8 rules
-# total may be in flight across every source.
-#
-# Both default to 1 -- i.e. off, matching today's behavior exactly with no
-# config changes required. A source_type needs an explicit opt-in
-# (GRE_<TYPE>_MAX_PARALLEL > 1) before the engine will ever open more than
-# one concurrent session against it, specifically so raising the group-wide
-# cap alone can never silently increase load on a source that wasn't sized
-# for it.
+# ── Parallel execution settings -- see module docstring: currently unused
+# here, kept only for parity with rules_engine/config.py. ─────────────────
 def get_max_parallel_rules() -> int:
-    """
-    GRE_MAX_PARALLEL_RULES -- max rules that may execute concurrently
-    within one run_rule_group() call. Default 1 (no parallelism).
-    """
     return max(1, int(os.getenv("GRE_MAX_PARALLEL_RULES", "1")))
 
 
 def get_max_parallel_for_connection(source_type: str) -> int:
-    """
-    GRE_<TYPE>_MAX_PARALLEL -- how many concurrent sessions `source_type`
-    ('teradata', 'postgres', 's3', 'file') may serve during a parallel run.
-    Default 1 (never more than one concurrent session, even if
-    GRE_MAX_PARALLEL_RULES is raised).
-    """
     return max(1, int(os.getenv(f"GRE_{source_type.upper()}_MAX_PARALLEL", "1")))
 
 
-# ── Run-readiness precondition (deferred; see module docstring) ───────────
+# ── Run-readiness precondition (parity with rules_engine/config.py; not
+# currently called anywhere in sampling/ -- sampling runs on demand, with
+# no equivalent readiness gate). ───────────────────────────────────────────
 _READINESS_CHECKS: Dict[str, Callable[[str, object], bool]] = {}
 
 
 def register_readiness_check(rule_group: str, fn: Callable[[str, object], bool]) -> None:
-    """
-    Register a readiness check for a rule_group.
-
-    fn receives (run_key, meta_conn) and returns True when that run is
-    ready to be evaluated. Not called anywhere in v1 unless registered --
-    see check_run_ready() below.
-    """
     _READINESS_CHECKS[rule_group] = fn
 
 
 def check_run_ready(rule_group: str, run_key: str, meta_conn=None) -> bool:
-    """
-    Return True when `rule_group` is clear to run against `run_key`.
-
-    v1 default: always True (no-op) unless a check was registered for this
-    rule_group via register_readiness_check(). This keeps the precondition
-    a config decision, not an engine code change, once a real check is
-    needed.
-    """
     fn = _READINESS_CHECKS.get(rule_group)
     if fn is None:
         return True

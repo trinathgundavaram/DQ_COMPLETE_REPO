@@ -108,7 +108,7 @@ def main():
     if args.rule_id is not None and (args.project_name or args.rule_nm):
         parser.error("--project-name/--rule-nm only apply with --process-name, not --rule-id.")
 
-    from shared import config as gre_config
+    from rules_engine import config as gre_config
     from rules_engine.reporting import get_source_records_for_rule, get_source_records_for_process
 
     cf = build_and_load_connection_factory()
