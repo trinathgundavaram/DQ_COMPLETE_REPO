@@ -18,6 +18,11 @@ Two fully independent, config-driven engines:
   Postgres, S3, file) plus `ConnectionFactory`, in one file. Exactly ONE
   connection per source_type -- no named/multi-connection setup. This is
   the ONLY code either package depends on outside its own folder.
+- **`migrations/`** -- one-time DDL/data migration and validation scripts
+  for deployments that already hold real data (drop-and-recreate is fine
+  for a fresh/disposable environment, but not once real rows exist). Not
+  imported by either package -- run by hand against Teradata as needed;
+  see each script's own header.
 
 ## Package separation
 
@@ -49,9 +54,9 @@ infrastructure with no rules/sampling-specific logic, and duplicating it
 would double the number of real live connections opened per source_type
 whenever both packages run in the same process.
 
-`migrate_split_gre_audit.sql` and `migrate_split_gre_errors.sql` at the
-repo root carry existing deployments through both splits without data
-loss (see their own headers) -- `migrate_split_gre_audit.sql` still
+`migrations/migrate_split_gre_audit.sql` and `migrations/migrate_split_gre_errors.sql`
+carry existing deployments through both splits without data
+loss (see their own headers) -- `migrations/migrate_split_gre_audit.sql` still
 offers an optional, transitional `gre_audit` view for external readers,
 but that view is not part of the application's own contract and should
 be dropped once those readers have moved over.
@@ -67,9 +72,9 @@ Each package is independently testable and has its own DDL -- see
    `sampling/schema.sql` -- in either order, or just the one package you
    need; neither depends on the other. See "Redeploying / changing the
    schema" below for how to make DDL changes later, and
-   `migrate_split_gre_audit.sql`/`migrate_split_gre_errors.sql` at the
-   repo root instead if you already have real history in an existing
-   combined `gre_audit`/`gre_errors` table.
+   `migrations/migrate_split_gre_audit.sql`/`migrations/migrate_split_gre_errors.sql`
+   instead if you already have real history in an existing combined
+   `gre_audit`/`gre_errors` table.
 
 2. **Local credentials**: copy `dev.env.example` to `dev.env` (repo
    root) and fill in real values. Each package's own `config.py` loads it
