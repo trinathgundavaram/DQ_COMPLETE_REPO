@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 def generate_run_id(rule_group: str, run_key: str) -> str:
     """
-    Plain 2-part run_id -- delegates to shared/db_ops.py::generate_run_id()
+    Plain 2-part run_id -- delegates to rules_engine/db_ops.py::generate_run_id()
     with just (rule_group, run_key) as label parts, e.g.
     "claims_dq::BATCH_2026_08_19::20260819T143022.183045::a1b2c3". Kept as
     a public, stable-signature function so any caller already importing
@@ -210,7 +210,7 @@ def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, run_key, reso
     # connection SIMULTANEOUSLY for its whole execution (see
     # _run_one_pending_rule() above), so when a rule's sql_dialect and the
     # metadata connection are the SAME named connection (e.g. both
-    # "teradata" -- shared/config.py's META_CONNECTION default), that one
+    # "teradata" -- rules_engine/config.py's META_CONNECTION default), that one
     # source needs a genuinely separate pool object for each role: sharing
     # one pool between both acquire() calls would make a single worker
     # thread try to acquire two slots from its own pool and deadlock the
@@ -328,7 +328,7 @@ def run_rule_group(
                    (gre_exceptions_uix, gre_log, gre_results, gre_rule_audit
                    key off this value) -- a batch id, a year+month pair, a
                    specific date, or any other column/combination the
-                   caller wants; build one via shared/db_ops.py::
+                   caller wants; build one via rules_engine/db_ops.py::
                    build_run_key() or pass your own string. Deliberately
                    NOT merged into run_params: run_params doubles as the
                    equality filters for the auto-generated total-record
@@ -355,7 +355,7 @@ def run_rule_group(
                    each project scope its data however it needs
                    (month/year, run_type, a date range, a region column,
                    ...) without the engine having to know about any of
-                   those column names. See shared/db_ops.py::
+                   those column names. See rules_engine/db_ops.py::
                    _substitute_params()'s docstring.
     rule_variant : optional extra selection level on top of rule_group/
                    table -- passed straight to rules_engine.rules.load_rules()
@@ -373,6 +373,18 @@ def run_rule_group(
         raise RuntimeError(
             f"Metadata connection '{gre_config.get_meta_connection_name()}' unavailable."
         )
+
+    # Logged at INFO (not DEBUG) precisely because it's exactly what's
+    # needed to catch a run silently pointed at the wrong Teradata
+    # environment or meta schema -- e.g. the same schema NAME existing on
+    # two different Teradata hosts, one with a column the other doesn't
+    # have yet. meta_conn.host is None for file/S3 adapters (no remote
+    # host) -- never the case for a real meta connection, but harmless
+    # either way.
+    logger.info(
+        "run_rule_group starting: rule_group=%s run_key=%s meta_db=%s meta_host=%s",
+        rule_group, run_key, meta_db, getattr(meta_conn, "host", None),
+    )
 
     if not gre_config.check_run_ready(rule_group, run_key, meta_conn):
         logger.info("rule_group=%s run_key=%s not ready -- skipping this run.", rule_group, run_key)
@@ -633,7 +645,7 @@ def run_by_process_name(
                    running them).
     run_key      : opaque tracking/idempotency identifier for this run --
                    see run_rule_group()'s docstring. build_run_key() in
-                   shared/db_ops.py can build one from parts (a batch id, a
+                   rules_engine/db_ops.py can build one from parts (a batch id, a
                    year+month pair, a specific date, or any combination).
     cf           : a loaded db.connection_factory.ConnectionFactory.
     meta_conn    : metadata connection to run against; defaults to

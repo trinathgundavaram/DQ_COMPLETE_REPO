@@ -374,7 +374,7 @@ def _case_key(row: dict, key_cols: list) -> str:
     analog of rules_engine/executor.py::build_src_key()/_format_src_key(),
     same fix applied for the same reason (see that function's docstring).
 
-    `row`'s keys are always lowercased (see shared/db_ops.py::execute_query()/
+    `row`'s keys are always lowercased (see sampling/db_ops.py::execute_query()/
     _run_source_query()), but `key_cols` comes straight from
     gre_sampling_config.key_columns as authored -- look up case-
     insensitively so casing in that column never silently breaks this.
@@ -573,7 +573,7 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
                    (embedded into sample_run_id, and recorded on gre_sampling_audit) --
                    a batch id, a year+month pair, a specific date, or any
                    other column/combination the caller wants; build one via
-                   shared/db_ops.py::build_run_key() or pass your own
+                   sampling/db_ops.py::build_run_key() or pass your own
                    string. Deliberately NOT merged into run_params -- see
                    run_params below -- if scope_sql/exclusion_sql need to
                    reference the run's tracking value, pass it explicitly
@@ -607,6 +607,15 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
     if meta_conn is None:
         raise RuntimeError(f"Metadata connection '{gre_config.get_meta_connection_name()}' unavailable.")
 
+    # Logged at INFO (not DEBUG) for the same reason rules_engine/runner.py's
+    # "run_rule_group starting" line is -- this is exactly what's needed to
+    # catch a run silently pointed at the wrong Teradata environment or meta
+    # schema. meta_conn.host is None for file/S3 adapters (no remote host).
+    logger.info(
+        "run_sampling starting: config_id=%s run_key=%s meta_db=%s meta_host=%s",
+        config_id, run_key, meta_db, getattr(meta_conn, "host", None),
+    )
+
     resolved_params = dict(run_params or {})
 
     started_at = datetime.now()
@@ -621,7 +630,7 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
     key_cols = _key_columns(config)
 
     # Same shape/rationale as rules_engine/runner.py::_build_group_run_id()
-    # -- see that function's docstring and shared/db_ops.py::
+    # -- see that function's docstring and sampling/db_ops.py::
     # generate_run_id()'s. Folds in project_name (if set on this config),
     # an "attempt-N" label (N = count_prior_attempts() + 1, keyed on
     # (run_key, config_id)), and triggered_by, on top of the plain

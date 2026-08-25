@@ -104,6 +104,17 @@ class SourceAdapter(ABC):
 
     source_type: str = "unknown"
 
+    # Best-effort "where is this actually pointed at" for logging only --
+    # host[:port]/database, NEVER credentials. None for adapters with no
+    # remote host (file/S3). Set by each adapter's build(); lets a caller
+    # log exactly which environment a connection resolved to (see
+    # rules_engine/runner.py's/sampling/sampling.py's "run starting" log
+    # lines) -- the kind of detail that catches a run silently pointed at
+    # the wrong Teradata/Postgres system, which otherwise surfaces as a
+    # confusing "column not present" error against a schema that looks
+    # identical by name.
+    host: str = None
+
     @abstractmethod
     def cursor(self):
         ...
@@ -152,8 +163,9 @@ except ImportError:
 class TeradataAdapter(SourceAdapter):
     source_type = "teradata"
 
-    def __init__(self, conn):
+    def __init__(self, conn, host: str = None):
         self._conn = conn
+        self.host = host
 
     def cursor(self):
         return self._conn.cursor()
@@ -168,12 +180,21 @@ class TeradataAdapter(SourceAdapter):
     def build(cls) -> "TeradataAdapter":
         if not _TERADATA_AVAILABLE:
             raise ImportError("teradatasql is required. Install with: pip install teradatasql")
+        host = _require("TERADATA_HOST")
+        user = _require("TERADATA_USER")
+        logmech = os.getenv("TERADATA_LOGMECH", "LDAP")
+        # host/user/logmech only -- never the password. This is exactly the
+        # detail needed to catch "app is pointed at the wrong Teradata
+        # system" (dev vs. test vs. prod, or a typo'd host) -- the kind of
+        # mismatch that otherwise surfaces as a confusing "column not
+        # present" error against a schema that looks identical by name.
+        logger.info("Connecting to Teradata: host=%s user=%s logmech=%s", host, user, logmech)
         return cls(teradatasql.connect(
-            host=_require("TERADATA_HOST"),
-            user=_require("TERADATA_USER"),
+            host=host,
+            user=user,
             password=_require("TERADATA_PASSWORD"),
-            logmech=os.getenv("TERADATA_LOGMECH", "LDAP"),
-        ))
+            logmech=logmech,
+        ), host=host)
 
 
 # =============================================================================
@@ -191,9 +212,10 @@ except ImportError:
 class PostgresAdapter(SourceAdapter):
     source_type = "postgres"
 
-    def __init__(self, conn):
+    def __init__(self, conn, host: str = None):
         self._conn = conn
         self._conn.autocommit = True   # read-only source queries; avoid open txns
+        self.host = host
 
     def cursor(self):
         return self._conn.cursor()
@@ -208,14 +230,21 @@ class PostgresAdapter(SourceAdapter):
     def build(cls) -> "PostgresAdapter":
         if not _POSTGRES_AVAILABLE:
             raise ImportError("psycopg2-binary is required. Install with: pip install psycopg2-binary")
+        host = _require("POSTGRES_HOST")
+        port = int(os.getenv("POSTGRES_PORT", "5432"))
+        dbname = _require("POSTGRES_DATABASE")
+        user = _require("POSTGRES_USER")
+        # host/port/dbname/user only -- never the password. Same rationale
+        # as TeradataAdapter.build() above.
+        logger.info("Connecting to Postgres: host=%s port=%d dbname=%s user=%s", host, port, dbname, user)
         return cls(psycopg2.connect(
-            host=_require("POSTGRES_HOST"),
-            port=int(os.getenv("POSTGRES_PORT", "5432")),
-            dbname=_require("POSTGRES_DATABASE"),
-            user=_require("POSTGRES_USER"),
+            host=host,
+            port=port,
+            dbname=dbname,
+            user=user,
             password=_require("POSTGRES_PASSWORD"),
             sslmode=os.getenv("POSTGRES_SSLMODE", "prefer"),
-        ))
+        ), host=f"{host}:{port}/{dbname}")
 
 
 # =============================================================================

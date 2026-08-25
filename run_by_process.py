@@ -23,6 +23,12 @@ Usage
     # Same idea for sampling (gre_sampling_config.process_name):
     python run_by_process.py sampling --process-name WEEKLY_REVIEW_SAMPLE
 
+    # Detailed debug logging (SQL text + row counts, never data/params --
+    # see rules_engine/db_ops.py's or sampling/db_ops.py's module docstring
+    # for exactly what's logged) to troubleshoot a run:
+    python run_by_process.py rules --process-name UNIVERSE_VALIDATION \
+        --log-level DEBUG
+
 Exit code is 0 if every group/config completed successfully, 1 otherwise
 (a rule_group/config that errored, or an unresolved process_name).
 
@@ -49,8 +55,10 @@ def _default_run_key():
 
 
 def _run_rules(args):
+    from rules_engine.config import configure_logging
     from rules_engine.runner import run_by_process_name
 
+    configure_logging(args.log_level)
     cf = build_and_load_connection_factory()
     run_key = args.run_key or _default_run_key()
     print(f"Running rules_engine for process_name={args.process_name!r} "
@@ -75,8 +83,10 @@ def _run_rules(args):
 
 
 def _run_sampling(args):
+    from sampling.config import configure_logging
     from sampling.sampling import run_sampling_for_process_name
 
+    configure_logging(args.log_level)
     cf = build_and_load_connection_factory()
     run_key = args.run_key or _default_run_key()
     print(f"Running sampling for process_name={args.process_name!r} "
@@ -104,6 +114,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run the GRE rules engine or sampling engine, scoped to one process_name.",
     )
+    parser.add_argument("--log-level", default=None,
+                        help="Enable detailed logging at this level (e.g. DEBUG, INFO) for "
+                             "troubleshooting -- SQL statement text and row counts only, never "
+                             "result data or bind parameter values. Defaults to the GRE_LOG_LEVEL "
+                             "env var, or INFO, if omitted.")
     subparsers = parser.add_subparsers(dest="engine", required=True)
 
     rules_parser = subparsers.add_parser(

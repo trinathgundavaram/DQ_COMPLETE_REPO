@@ -31,6 +31,18 @@ a specific date, or any other combination).
 `run_key` (which logical run this is) and `run_id` (which specific
 attempt at it this is) are different things -- see generate_run_id()'s
 docstring below for the full distinction and the shape `run_id` takes.
+
+Debug logging
+-------------
+execute_query()/execute_dml()/_chunked_executemany()/bulk_insert_or_skip()/
+_run_source_query() below all log at DEBUG: the SQL statement TEXT (one-
+lined via _one_line() below, truncated) and row COUNTS (rows returned,
+rows affected, chunk sizes). They NEVER log bind parameter VALUES or any
+fetched/written row DATA -- this package runs rule_syntax/scope_sql
+against source tables that can carry real case/member/claim identifiers,
+so only shape-level facts (what ran, how many rows) go to the log, never
+content. Nothing here calls logging.basicConfig() -- that's an opt-in
+caller decision, see rules_engine/config.py::configure_logging().
 """
 
 import logging
@@ -40,6 +52,20 @@ import secrets
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+def _one_line(sql: str, max_len: int = 500) -> str:
+    """Collapse a multi-line SQL string to one line for a single debug-log
+    record, truncated so one giant generated statement (e.g. a long IN
+    list) doesn't blow out log size. SQL TEXT ONLY -- never call this on
+    anything that might contain fetched row data or bind param values."""
+    if not sql:
+        return ""
+    one_line = " ".join(sql.split())
+    if len(one_line) > max_len:
+        return one_line[:max_len] + f"... [truncated, {len(one_line)} chars total]"
+    return one_line
+
 
 # ── Tunable constants ───────────────────────────────────────────────────────
 MAX_RETRIES = int(os.getenv("GRE_QUERY_MAX_RETRIES", "3"))
@@ -78,6 +104,7 @@ except ImportError:
 
 def execute_query(conn, query: str, params=None) -> list:
     """Run a SELECT and return rows as list-of-dicts (column names lowercased)."""
+    logger.debug("execute_query: %s | params=%d", _one_line(query), len(params) if params else 0)
     cursor = conn.cursor()
     try:
         if params is not None:
@@ -85,15 +112,19 @@ def execute_query(conn, query: str, params=None) -> list:
         else:
             cursor.execute(query)
         if cursor.description is None:
+            logger.debug("execute_query: no result set (not a SELECT)")
             return []
         columns = [c[0].lower() for c in cursor.description]
-        return [dict(zip(columns, r)) for r in cursor.fetchall()]
+        rows = [dict(zip(columns, r)) for r in cursor.fetchall()]
+        logger.debug("execute_query: %d row(s) returned", len(rows))
+        return rows
     finally:
         cursor.close()
 
 
 def execute_dml(conn, query: str, params=None):
     """Execute one DML statement and commit immediately -- every call is its own transaction."""
+    logger.debug("execute_dml: %s | params=%d", _one_line(query), len(params) if params else 0)
     cursor = conn.cursor()
     try:
         if params is not None:
@@ -101,6 +132,7 @@ def execute_dml(conn, query: str, params=None):
         else:
             cursor.execute(query)
         conn.commit()
+        logger.debug("execute_dml: %s row(s) affected", getattr(cursor, "rowcount", "?"))
     finally:
         cursor.close()
 
@@ -164,6 +196,7 @@ def _chunked_executemany(conn, sql: str, rows: list, chunk_size: int = None) -> 
     if not rows:
         return 0
     size = chunk_size or EXCEPTION_CHUNK
+    logger.debug("_chunked_executemany: %s | %d row(s), chunk_size=%d", _one_line(sql), len(rows), size)
     cursor = conn.cursor()
     try:
         for i in range(0, len(rows), size):
@@ -217,6 +250,7 @@ def bulk_insert_or_skip(conn, sql: str, rows: list, chunk_size: int = None) -> i
     if not rows:
         return 0
     size = chunk_size or EXCEPTION_CHUNK
+    logger.debug("bulk_insert_or_skip: %s | %d row(s), chunk_size=%d", _one_line(sql), len(rows), size)
     inserted = 0
     for i in range(0, len(rows), size):
         chunk = rows[i:i + size]
@@ -241,6 +275,10 @@ def bulk_insert_or_skip(conn, sql: str, rows: list, chunk_size: int = None) -> i
                     inserted += 1
         finally:
             cursor.close()
+    logger.debug(
+        "bulk_insert_or_skip: %d of %d row(s) actually inserted (rest were duplicates)",
+        inserted, len(rows),
+    )
     return inserted
 
 
@@ -480,6 +518,10 @@ def count_prior_attempts(meta_conn, meta_db: str, run_key, rule_group: str) -> i
 
 @_source_retry
 def _run_source_query(db_conn, sql: str) -> list:
+    # source_type here identifies which adapter (teradata/postgres/file/s3)
+    # this query is running against -- execute_query() below logs the SQL
+    # text/rowcount itself, this just adds that dialect context.
+    logger.debug("_run_source_query against source_type=%s", getattr(db_conn, "source_type", "?"))
     return execute_query(db_conn, sql)
 
 

@@ -69,6 +69,46 @@ except ImportError:
     _DOTENV_AVAILABLE = False
 
 
+def configure_logging(level=None) -> None:
+    """
+    Opt-in DEBUG/INFO logging setup for sampling/ -- NEVER called
+    automatically at import time (a library configuring global logging
+    state would clobber a host application's own setup). Call this
+    explicitly from a standalone entrypoint (a CLI script, a debug REPL,
+    an ad-hoc troubleshooting session) when you want to see this
+    package's log output.
+
+    What gets logged at DEBUG (see sampling/db_ops.py's module docstring
+    for the full contract): SQL statement TEXT (one-lined, truncated) and
+    row COUNTS only -- never fetched row data or bind parameter values.
+    At INFO: which Teradata/Postgres host/db a connection actually points
+    at (db/connection_factory.py), and a "run_sampling starting" line per
+    attempt (sampling/sampling.py) -- both aimed squarely at catching a
+    run pointed at the wrong environment, which otherwise surfaces as a
+    confusing "column not present" error against a schema that looks
+    identical by name.
+
+    Parameters
+    ----------
+    level : explicit level (e.g. logging.DEBUG, or the string "DEBUG") --
+            defaults to the GRE_LOG_LEVEL env var if set, else INFO.
+
+    This sets the level on sampling's own logger namespace plus
+    db.connection_factory's (the one intentionally-shared dependency --
+    see README.md's "Package separation"), and calls logging.basicConfig()
+    ONLY if the root logger has no handlers yet, so it won't clobber a
+    caller's existing logging setup if one is already in place.
+    """
+    resolved = level or os.getenv("GRE_LOG_LEVEL", "INFO")
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=resolved,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+    logging.getLogger("sampling").setLevel(resolved)
+    logging.getLogger("db.connection_factory").setLevel(resolved)
+
+
 def _load_env_file() -> None:
     """
     Load local dev credentials from a .env file into the process

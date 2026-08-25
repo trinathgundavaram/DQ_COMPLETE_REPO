@@ -237,6 +237,52 @@ Manager instead of a file -- `db/connection_factory.py`, `rules_engine/`,
 and `sampling/` all only ever see already-populated env vars either way,
 so none of them need to change.
 
+## Debug logging
+
+Both packages log through the standard `logging` module (`logger =
+logging.getLogger(__name__)` in every file) -- neither ever calls
+`logging.basicConfig()` itself, so importing them never clobbers a host
+application's own logging setup.
+
+To turn on detailed logging for troubleshooting, call the opt-in helper
+before running anything:
+
+```python
+from rules_engine.config import configure_logging   # or: from sampling.config import configure_logging
+configure_logging("DEBUG")   # or configure_logging() to use GRE_LOG_LEVEL / default INFO
+```
+
+`run_by_process.py` (the CLI wrapper) exposes this as a flag instead:
+
+```
+python run_by_process.py rules --process-name UNIVERSE_VALIDATION --log-level DEBUG
+```
+
+What gets logged, by level:
+
+- **INFO** -- which Teradata/Postgres host/db/user a connection actually
+  resolved to (`db/connection_factory.py`, password never included), and
+  one "run starting" line per attempt (`rules_engine/runner.py`'s
+  `run_rule_group starting: ... meta_host=...`, `sampling/sampling.py`'s
+  `run_sampling starting: ... meta_host=...`). This is aimed squarely at
+  catching a run silently pointed at the wrong environment -- the same
+  schema NAME can exist on two different hosts, one missing a column the
+  other has, which otherwise surfaces as a confusing "column not present"
+  error against a schema that looks identical by name.
+- **DEBUG** -- every SQL statement's TEXT (collapsed to one line,
+  truncated at 500 characters) and row COUNTS (rows returned by a SELECT,
+  rows affected by a DML, chunk sizes on bulk writes), from
+  `rules_engine/db_ops.py` / `sampling/db_ops.py`'s `execute_query()`,
+  `execute_dml()`, `_chunked_executemany()`, `bulk_insert_or_skip()`, and
+  `_run_source_query()`.
+
+What never gets logged, at any level: bind parameter VALUES, or any
+fetched/written row DATA. Only param/row COUNTS are logged. `rule_syntax`/
+`scope_sql`/`exclusion_sql` run against source tables that can carry real
+case, member, or claim identifiers -- logging shape (what ran, how many
+rows) instead of content keeps a debug log safe to share for
+troubleshooting without it becoming its own PHI-adjacent data spill.
+
 ## Running the tests
 
 ```

@@ -9,11 +9,11 @@ Everything here commits independently, per row and per rule -- there is no
 shared transaction spanning rules, or even spanning the exception rows of
 one rule. See execute_rule() for why that's safe under a crash/resume.
 
-Built on shared/db_ops.py
+Built on rules_engine/db_ops.py
 ---------------------------
 The low-level DB helpers (execute_query/execute_dml/bulk_insert*), {key}
 run_params substitution (_substitute_params), and the retry-wrapped
-source query all live in shared/db_ops.py -- used identically
+source query all live in rules_engine/db_ops.py -- used identically
 by sampling/sampling.py. Everything in THIS file is specific to rule
 evaluation: the single-scan optimization, natural-key building, threshold
 evaluation, and the gre_exceptions/gre_results/gre_log writers.
@@ -26,7 +26,7 @@ proven fix #1 fixes the equivalent problem for the dq_* engine:
 
   1. Writing violating rows one INSERT-plus-commit at a time
      (_insert_or_skip per row) means one network round trip per row.
-     shared/db_ops.py's bulk_insert_or_skip() batches this into
+     rules_engine/db_ops.py's bulk_insert_or_skip() batches this into
      GRE_EXCEPTION_CHUNK-sized executemany() calls -- see _write_exceptions().
   2. Fetching every violating row with one unbounded fetchall(), then
      deriving failed_records from a COUNT(*) against the *destination*
@@ -82,7 +82,7 @@ _SOFT_SEVERITIES = {"WARN", "WARNING", "INFO", "NOTICE"}
 
 def _log_error(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str,
                 error_type: str, message: str, detail: str = None) -> None:
-    """Rule-dict convenience wrapper around shared/db_ops.py::log_error(), for gre_rules-keyed callers."""
+    """Rule-dict convenience wrapper around rules_engine/db_ops.py::log_error(), for gre_rules-keyed callers."""
     log_error(meta_conn, meta_db, run_id, rule.get("rule_id"), rule.get("rule_group"),
               run_key, error_type, message, detail)
 
@@ -91,7 +91,7 @@ def _log_error(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str,
 # Single-scan rule evaluation
 # ---------------------------------------------------------------------------
 
-# Reuses shared/db_ops.py's retry decorator indirectly via _run_source_query
+# Reuses rules_engine/db_ops.py's retry decorator indirectly via _run_source_query
 # for the total-record count path; _scan_violations runs its own cursor
 # loop directly (streaming fetchmany(), not a single fetchall()) so it is
 # NOT wrapped in _source_retry -- a retry here would re-run a
@@ -167,7 +167,7 @@ def _format_src_key(cols: list, row: dict) -> str:
     dict), to match it back to the gre_exceptions row it came from.
 
     `row`'s keys are always lowercased (see _scan_violations()/
-    shared/db_ops.py::execute_query()), but `cols` may not be -- it comes
+    rules_engine/db_ops.py::execute_query()), but `cols` may not be -- it comes
     straight from gre_rules.src_key_cols (build_src_key()) or from a
     previously-stored src_key_value's original casing
     (rules_engine/reporting.py::get_source_records_for_rule()). Look up
@@ -819,10 +819,10 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
                   gre_results_uix). Not required to appear in run_params --
                   build it however fits your data (a batch id, a
                   year+month pair, a specific date, or any other
-                  column/combination) via shared/db_ops.py::build_run_key(),
+                  column/combination) via rules_engine/db_ops.py::build_run_key(),
                   or pass your own string directly.
     run_params  : dict of named values substituted into rule_syntax's "{key}"
-                  tokens (see shared/db_ops.py::_substitute_params()) AND
+                  tokens (see rules_engine/db_ops.py::_substitute_params()) AND
                   used, key-for-key, as the equality filters for the
                   auto-generated total-record count (see
                   _compute_total()/_build_total_query()). Has no
