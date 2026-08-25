@@ -244,18 +244,30 @@ logging.getLogger(__name__)` in every file) -- neither ever calls
 `logging.basicConfig()` itself, so importing them never clobbers a host
 application's own logging setup.
 
-To turn on detailed logging for troubleshooting, call the opt-in helper
-before running anything:
+Detailed (DEBUG) logging is ON BY DEFAULT -- `configure_logging()`'s
+default level, and `run_by_process.py`'s `--log-level` flag, both resolve
+to `DEBUG` unless told otherwise, so nothing extra needs to be passed to
+see it.
+
+To use the library functions directly (not through `run_by_process.py`),
+call the opt-in helper once before running anything -- it's still opt-in
+at the "does it run at all" level (nothing calls `logging.basicConfig()`
+automatically at import time, so importing these packages never clobbers
+a host application's own logging setup), just not opt-in at the "what
+level" question anymore:
 
 ```python
 from rules_engine.config import configure_logging   # or: from sampling.config import configure_logging
-configure_logging("DEBUG")   # or configure_logging() to use GRE_LOG_LEVEL / default INFO
+configure_logging()          # DEBUG by default now
+configure_logging("INFO")    # or set GRE_LOG_LEVEL=INFO to quiet it down
 ```
 
-`run_by_process.py` (the CLI wrapper) exposes this as a flag instead:
+`run_by_process.py` (the CLI wrapper) already calls this for you on every
+run -- no flag needed:
 
 ```
-python run_by_process.py rules --process-name UNIVERSE_VALIDATION --log-level DEBUG
+python run_by_process.py rules --process-name UNIVERSE_VALIDATION
+python run_by_process.py rules --process-name UNIVERSE_VALIDATION --log-level INFO   # quieter
 ```
 
 What gets logged, by level:

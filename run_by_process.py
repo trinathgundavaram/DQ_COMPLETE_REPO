@@ -25,9 +25,10 @@ Usage
 
     # Detailed debug logging (SQL text + row counts, never data/params --
     # see rules_engine/db_ops.py's or sampling/db_ops.py's module docstring
-    # for exactly what's logged) to troubleshoot a run:
+    # for exactly what's logged) is ON BY DEFAULT -- nothing to pass. To
+    # quiet it down instead:
     python run_by_process.py rules --process-name UNIVERSE_VALIDATION \
-        --log-level DEBUG
+        --log-level INFO
 
 Exit code is 0 if every group/config completed successfully, 1 otherwise
 (a rule_group/config that errored, or an unresolved process_name).

@@ -93,7 +93,10 @@ def configure_logging(level=None) -> None:
     Parameters
     ----------
     level : explicit level (e.g. logging.DEBUG, or the string "DEBUG") --
-            defaults to the GRE_LOG_LEVEL env var if set, else INFO.
+            defaults to the GRE_LOG_LEVEL env var if set, else DEBUG --
+            detailed logging is the default so nothing extra has to be passed
+            to see it; set GRE_LOG_LEVEL=INFO (or pass level="INFO") to quiet
+            it down to just the connection/run-starting lines.
 
     This sets the level on rules_engine's own logger namespace plus
     db.connection_factory's (the one intentionally-shared dependency --
@@ -101,7 +104,7 @@ def configure_logging(level=None) -> None:
     ONLY if the root logger has no handlers yet, so it won't clobber a
     caller's existing logging setup if one is already in place.
     """
-    resolved = level or os.getenv("GRE_LOG_LEVEL", "INFO")
+    resolved = level or os.getenv("GRE_LOG_LEVEL", "DEBUG")
     if not logging.getLogger().handlers:
         logging.basicConfig(
             level=resolved,
