@@ -175,7 +175,7 @@ GRE_SAMPLE_SELECTIONS = {
     # without bumping load_datetime -- watermark on whichever timestamp
     # actually moved, same COALESCE pattern gre_exceptions/gre_log use.
     # NOTE: etl_is_curr_ind/last_updated_datetime were already live columns
-    # on this table (added by alter_sampling_tables.sql) but were missing
+    # on this table (added by migrate_gre_sampling_reconciliation.sql) but were missing
     # from this sync spec entirely -- the Postgres mirror was silently
     # never receiving the "is this the current sample run" flag or its
     # flip timestamp. Fixed here alongside the gre_log/gre_errors/

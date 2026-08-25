@@ -136,8 +136,10 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selections (
                                                         -- current/active one for its
                                                         -- (config_id, run_key); 'N' = superseded
                                                         -- by a later rerun of the same run_key.
-                                                        -- ALTER TABLE ... ADD COLUMN on the real
-                                                        -- Teradata instance for existing deploys.
+                                                        -- Existing deploy with real data: see
+                                                        -- migrate_gre_sampling_reconciliation.sql at
+                                                        -- the repo root (drop + recreate, not ALTER
+                                                        -- TABLE).
     load_datetime                          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_updated_datetime                     TIMESTAMP  -- bumped only by the
                                                         -- etl_is_curr_ind deactivate UPDATE (NULL
@@ -146,9 +148,11 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selections (
                                                         -- lets metadata_sync's incremental watermark
                                                         -- (COALESCE(last_updated_datetime,
                                                         -- load_datetime)) pick up a flip that
-                                                        -- doesn't touch load_datetime. ALTER TABLE
-                                                        -- ... ADD COLUMN on the real Teradata
-                                                        -- instance for existing deploys.
+                                                        -- doesn't touch load_datetime. Existing
+                                                        -- deploy with real data: see
+                                                        -- migrate_gre_sampling_reconciliation.sql at
+                                                        -- the repo root (drop + recreate, not ALTER
+                                                        -- TABLE).
 )
 PRIMARY INDEX (sample_run_id);
 
@@ -176,13 +180,15 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selection_attrs (
                                                     -- -- kept in lockstep by
                                                     -- _deactivate_prior_sampling_runs() so a
                                                     -- consumer can filter either table
-                                                    -- independently. ALTER TABLE ... ADD COLUMN
-                                                    -- on the real Teradata instance for existing
-                                                    -- deploys.
+                                                    -- independently. Existing deploy with real
+                                                    -- data: see migrate_gre_sampling_reconciliation.sql
+                                                    -- at the repo root (drop + recreate, not ALTER
+                                                    -- TABLE).
     load_datetime                TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_updated_datetime           TIMESTAMP  -- mirrors gre_sample_selections.
                                                     -- last_updated_datetime -- see that column's
-                                                    -- comment. ALTER TABLE ... ADD COLUMN on the
-                                                    -- real Teradata instance for existing deploys.
+                                                    -- comment. Existing deploy with real data: see
+                                                    -- migrate_gre_sampling_reconciliation.sql at the
+                                                    -- repo root (drop + recreate, not ALTER TABLE).
 )
 PRIMARY INDEX (sample_run_id, case_key);
