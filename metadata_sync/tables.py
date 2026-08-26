@@ -1,4 +1,4 @@
-"""Declarative registry of the 13 gre_* tables this tool mirrors.
+"""Declarative registry of the 12 gre_* tables this tool mirrors.
 sync_from_teradata.py and create_postgres_tables.py just loop over
 TABLE_SPECS -- add a table here (+ its CREATE TABLE in ddl_postgres.sql)
 and nothing else needs to change.
@@ -22,6 +22,13 @@ rules_engine/ and sampling/ are now fully independent packages that share
 no tables at all (see README.md's "Package separation"). Anything still
 querying gre_audit or gre_errors directly needs to move to the
 package-specific tables below.
+
+Note: gre_log (the old per-attempt execution log) was folded into
+gre_results, which now carries one row per rule per execution attempt
+(not just per rule_id+run_key) -- see rules_engine/schema.sql's "gre_results"
+section and rules_engine/executor.py::_write_result()'s docstring for the
+full rationale. Anything still querying gre_log directly needs to move to
+gre_results, filtering active_ind/status as needed.
 """
 
 GRE_RULES = {
@@ -36,21 +43,6 @@ GRE_RULES = {
         "universe_version", "universe_year", "dgr_nbr", "issue_category_name",
         "business_rule", "rule_description", "created_by", "last_updated_by",
         "load_datetime", "last_updated_datetime",
-    ],
-}
-
-GRE_LOG = {
-    "name": "gre_log",
-    "primary_key": ("log_id",),
-    "mode": "incremental",
-    # active_ind flips (superseded by a later rerun of the same run_key)
-    # without bumping load_datetime -- watermark on whichever timestamp
-    # actually moved, same COALESCE pattern gre_exceptions below uses.
-    "watermark_col": "COALESCE(last_updated_datetime, load_datetime)",
-    "columns": [
-        "log_id", "run_id", "rule_id", "rule_group", "project_name", "process_name",
-        "run_key", "seq_no", "start_time", "end_time", "status", "rowcount",
-        "error_message", "active_ind", "load_datetime", "last_updated_datetime",
     ],
 }
 
@@ -71,16 +63,24 @@ GRE_EXCEPTIONS = {
     ],
 }
 
+# Consolidated with the old gre_log (see this file's module docstring) --
+# one row per rule PER EXECUTION ATTEMPT now, not per rule_id+run_key,
+# with active_ind marking the current attempt for a given (rule_id,
+# run_key) exactly the way gre_log used to. watermark on whichever
+# timestamp actually moved, same COALESCE pattern gre_exceptions uses,
+# since a rerun deactivating an OLDER row (last_updated_datetime) is just
+# as real a change as a brand new row's load_datetime.
 GRE_RESULTS = {
     "name": "gre_results",
     "primary_key": ("result_id",),
     "mode": "incremental",
-    "watermark_col": "evaluated_at",
+    "watermark_col": "COALESCE(last_updated_datetime, load_datetime)",
     "columns": [
-        "result_id", "rule_id", "run_key", "run_id", "project_name", "process_name",
-        "total_records", "failed_records", "failure_pct", "threshold_pct_used",
-        "threshold_count_used", "threshold_operator_used", "severity", "status",
-        "source_tieback_sql", "active_ind", "evaluated_at",
+        "result_id", "run_id", "rule_id", "rule_group", "project_name", "process_name",
+        "run_key", "seq_no", "start_time", "end_time", "total_records", "failed_records",
+        "failure_pct", "threshold_pct_used", "threshold_count_used", "threshold_operator_used",
+        "severity", "status", "error_message", "source_tieback_sql", "active_ind",
+        "load_datetime", "last_updated_datetime",
     ],
 }
 
@@ -214,7 +214,7 @@ GRE_SAMPLE_SELECTION_ATTRS = {
 }
 
 TABLE_SPECS = [
-    GRE_RULES, GRE_LOG, GRE_EXCEPTIONS, GRE_RESULTS, GRE_RULE_AUDIT, GRE_RULE_ERRORS,
+    GRE_RULES, GRE_EXCEPTIONS, GRE_RESULTS, GRE_RULE_AUDIT, GRE_RULE_ERRORS,
     GRE_SAMPLING_CONFIG, GRE_SAMPLING_STRATA, GRE_SAMPLING_MIX,
     GRE_SAMPLE_SELECTIONS, GRE_SAMPLE_SELECTION_ATTRS, GRE_SAMPLING_AUDIT,
     GRE_SAMPLING_ERRORS,

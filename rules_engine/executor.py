@@ -16,7 +16,9 @@ run_params substitution (_substitute_params), and the retry-wrapped
 source query all live in rules_engine/db_ops.py -- used identically
 by sampling/sampling.py. Everything in THIS file is specific to rule
 evaluation: the single-scan optimization, natural-key building, threshold
-evaluation, and the gre_exceptions/gre_results/gre_log writers.
+evaluation, and the gre_exceptions/gre_results writers (gre_results is
+both the per-attempt log and the rule-level verdict -- see _write_result()'s
+docstring for why those merged into one table).
 
 Big-dataset path (single-scan evaluation + bulk writes)
 ----------------------------------------------------------
@@ -178,7 +180,7 @@ def _format_src_key(cols: list, row: dict) -> str:
     doesn't actually SELECT -- not a real NULL value, and is NOT written
     as "NULL": that used to collapse into the same literal string as a
     genuinely NULL column and was indistinguishable afterward. This now
-    raises instead, so callers fail loudly (logged to gre_log/gre_errors
+    raises instead, so callers fail loudly (logged to gre_results/gre_rule_errors
     via execute_rule()'s STEP 3) rather than writing/matching on a
     corrupted key.
     """
@@ -596,93 +598,33 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
     return {"inserted": inserted, "reactivated": reactivated, "deactivated": deactivated}
 
 
-def _upsert_result(meta_conn, meta_db: str, row: dict) -> None:
+def _deactivate_prior_results(meta_conn, meta_db: str, rule_id, run_key: str, current_run_id: str) -> None:
     """
-    Upsert one gre_results row for (rule_id, run_key): INSERT, and on the
-    unique-index duplicate-key error, UPDATE in place instead -- unlike
-    gre_exceptions, this table is a summary row, not row-level history, so
-    a rerun should overwrite it rather than accumulate duplicates.
-
-    active_ind is always written as 'Y' here (insert AND update): the
-    unique index (rule_id, run_key) already guarantees there is never more
-    than one gre_results row for a given rule+run_key, so there is never
-    a "stale" gre_results row left behind by a rerun to deactivate --
-    unlike gre_log/gre_errors below, which are append-only across reruns
-    of the same run_key under a NEW run_id and so genuinely need one. The
-    column is still carried here (see rules_engine/schema.sql) so every
-    gre_ table this feature touches exposes the same active_ind
-    vocabulary a downstream report can filter on uniformly, and so a
-    future move away from upsert-in-place (e.g. keeping gre_results
-    history too) wouldn't need a new column added.
-    """
-    insert_sql = f"""
-        INSERT INTO {meta_db}.gre_results (
-            rule_id, run_key, run_id, project_name, process_name, total_records, failed_records,
-            failure_pct, threshold_pct_used, threshold_count_used,
-            threshold_operator_used, severity, status, source_tieback_sql, active_ind
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Y')
-    """
-    params = [
-        row["rule_id"], row["run_key"], row["run_id"], row.get("project_name"), row.get("process_name"),
-        row["total_records"], row["failed_records"], row["failure_pct"], row["threshold_pct_used"],
-        row["threshold_count_used"], row["threshold_operator_used"],
-        row["severity"], row["status"], row.get("source_tieback_sql"),
-    ]
-    try:
-        execute_dml(meta_conn, insert_sql, params)
-        return
-    except Exception as exc:
-        try:
-            meta_conn.commit()   # release the aborted INSERT so the connection stays usable for the UPDATE below
-        except Exception:
-            pass
-        if not _is_duplicate_key_error(exc):
-            raise
-
-    update_sql = f"""
-        UPDATE {meta_db}.gre_results
-        SET run_id = ?, project_name = ?, process_name = ?, total_records = ?, failed_records = ?,
-            failure_pct = ?, threshold_pct_used = ?, threshold_count_used = ?,
-            threshold_operator_used = ?, severity = ?, status = ?, source_tieback_sql = ?,
-            active_ind = 'Y', evaluated_at = CURRENT_TIMESTAMP
-        WHERE rule_id = ? AND run_key = ?
-    """
-    execute_dml(meta_conn, update_sql, [
-        row["run_id"], row.get("project_name"), row.get("process_name"), row["total_records"],
-        row["failed_records"], row["failure_pct"],
-        row["threshold_pct_used"], row["threshold_count_used"], row["threshold_operator_used"],
-        row["severity"], row["status"], row.get("source_tieback_sql"), row["rule_id"], row["run_key"],
-    ])
-
-
-def _deactivate_prior_log_attempts(meta_conn, meta_db: str, rule_id, run_key: str, current_run_id: str) -> None:
-    """
-    Soft-deactivate every gre_log row for (rule_id, run_key) left over from
-    an EARLIER run_id -- i.e. a previous, separate run of this same
+    Soft-deactivate every gre_results row for (rule_id, run_key) left over
+    from an EARLIER run_id -- i.e. a previous, separate run of this same
     run_key (rules_engine/runner.py::generate_run_id() mints a brand new
     run_id every call, even for a repeated run_key). Mirrors
     sampling/sampling.py::_deactivate_prior_sampling_runs()'s "always
-    re-execute, deactivate stale, activate new" pattern, applied here to
-    gre_log instead of gre_sample_selections.
+    re-execute, deactivate stale, activate new" pattern.
 
     Deliberately scoped to run_id <> current_run_id, NOT status: an ERROR
-    attempt from an earlier run_id is exactly as stale as a SUCCESS one
-    once this run_key has been re-run -- the LATEST run_id's own attempt
+    attempt from an earlier run_id is exactly as stale as a PASS/FAIL/WARN
+    one once this run_key has been re-run -- the LATEST run_id's own row
     (whatever its status) is what should read as "active" for this
-    rule_id/run_key, not a mix of whichever old rows happened to say
-    SUCCESS. Never deletes -- gre_log keeps full history for audit; only
-    active_ind flips.
+    rule_id/run_key, not a mix of whichever old rows happened to verdict
+    PASS. Never deletes -- gre_results keeps full attempt history for
+    audit; only active_ind flips.
 
-    Called once per rule per attempt, immediately before _log_attempt()
+    Called once per rule per attempt, immediately before _write_result()
     inserts this attempt's own row -- see execute_rule()'s call sites
     below. Never raises: a failure here must not mask the real attempt
-    outcome, same contract as _log_attempt() itself.
+    outcome, same contract as _write_result()'s own bookkeeping calls.
     """
     try:
         execute_dml(
             meta_conn,
             f"""
-            UPDATE {meta_db}.gre_log
+            UPDATE {meta_db}.gre_results
             SET active_ind = 'N', last_updated_datetime = CURRENT_TIMESTAMP
             WHERE rule_id = ? AND run_key = ? AND run_id <> ? AND active_ind = 'Y'
             """,
@@ -690,38 +632,83 @@ def _deactivate_prior_log_attempts(meta_conn, meta_db: str, rule_id, run_key: st
         )
     except Exception as exc:
         logger.error(
-            "Failed to deactivate prior gre_log attempts for rule_id=%s run_key=%s: %s",
+            "Failed to deactivate prior gre_results attempts for rule_id=%s run_key=%s: %s",
             rule_id, run_key, exc,
         )
 
 
-def _log_attempt(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str,
-                  status: str, rowcount: int, start_time: float, error_message: str = None) -> None:
+def _write_result(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str, start_time: float,
+                   status: str, total_records=None, failed_records: int = 0, failure_pct=None,
+                   threshold_pct_used=None, threshold_count_used=None, threshold_operator_used=None,
+                   source_tieback_sql: str = None, error_message: str = None) -> None:
     """
-    Insert one gre_log row for this execution attempt, after deactivating
-    any gre_log row(s) left active for this (rule_id, run_key) from an
-    earlier run_id -- see _deactivate_prior_log_attempts()'s docstring.
-    This attempt's own row is always inserted with active_ind='Y': it is,
-    by definition, the newest attempt for this rule_id/run_key the moment
-    it's written. Never raises.
+    Insert ONE gre_results row for this execution attempt -- the single
+    consolidated replacement for what used to be a gre_log row (one per
+    attempt: execution status, rowcount, start/end timing) PLUS a
+    separately-upserted gre_results row (one per rule_id+run_key: the
+    PASS/FAIL/WARN data verdict). The two tables carried the exact same
+    grain in practice and nearly the same columns, and gre_log's status
+    ('SUCCESS'/'ERROR') was easy to misread as the data verdict when it
+    only ever meant "the attempt ran to completion without raising" -- a
+    rule that legitimately FAILED its threshold still logged
+    status='SUCCESS' in gre_log every time, while the real verdict lived
+    only in gre_results.status. This function writes ONE row using
+    gre_results' verdict semantics (PASS | FAIL | WARN for a completed
+    evaluation, ERROR when the attempt itself couldn't produce a verdict
+    at all -- see the STEP 0/0b/1/2 failure paths in execute_rule()), so
+    there's exactly one place to look for "did this rule pass, fail, or
+    blow up," and exactly one column meaning "status."
+
+    Deactivates any earlier run_id's row for this (rule_id, run_key) first
+    -- see _deactivate_prior_results()'s docstring -- then always INSERTs
+    (never UPDATEs): unlike the old gre_results upsert-in-place, this
+    keeps full attempt history the way gre_log used to, with active_ind
+    marking which row is current for this (rule_id, run_key). A rerun of
+    the same run_key -- the same kind of run, just re-executed -- never
+    deletes a prior attempt's row; it deactivates it and adds a new one.
+
+    Raises on a genuine write failure (does NOT swallow it) -- unlike the
+    old _log_attempt()'s "never raises" contract, because this is now the
+    ONLY place an attempt's outcome is recorded at all; a caller that
+    needs this call to be best-effort should go through the
+    _write_result_safe() wrapper below instead of catching here.
     """
     rule_id = rule.get("rule_id")
-    _deactivate_prior_log_attempts(meta_conn, meta_db, rule_id, run_key, run_id)
+    _deactivate_prior_results(meta_conn, meta_db, rule_id, run_key, run_id)
 
     sql = f"""
-        INSERT INTO {meta_db}.gre_log (
+        INSERT INTO {meta_db}.gre_results (
             run_id, rule_id, rule_group, project_name, process_name, run_key, seq_no,
-            start_time, end_time, status, rowcount, error_message, active_ind
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Y')
+            start_time, end_time, total_records, failed_records, failure_pct,
+            threshold_pct_used, threshold_count_used, threshold_operator_used,
+            severity, status, error_message, source_tieback_sql, active_ind
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Y')
+    """
+    execute_dml(meta_conn, sql, [
+        run_id, rule_id, rule.get("rule_group"), rule.get("project_name"), rule.get("process_name"),
+        run_key, rule.get("seq_no"), datetime.fromtimestamp(start_time), datetime.now(),
+        total_records, failed_records, failure_pct, threshold_pct_used, threshold_count_used,
+        threshold_operator_used, rule.get("severity"), status, error_message, source_tieback_sql,
+    ])
+
+
+def _write_result_safe(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str, start_time: float,
+                        status: str, **kwargs) -> None:
+    """
+    Best-effort wrapper around _write_result() -- logs and swallows any
+    failure instead of raising. Used for the STEP 0/0b/1/2 early-failure
+    paths (the attempt's own tracking row must never crash execute_rule()
+    on top of the real error that already happened) and for the trivial/
+    no-write-required verdict branch. The main verdict-path call in
+    execute_rule() calls _write_result() directly instead, specifically so
+    a write failure THERE can be caught, turned into its own
+    RESULTS_WRITE_FAILURE gre_rule_errors row, and reported as this
+    attempt's real outcome.
     """
     try:
-        execute_dml(meta_conn, sql, [
-            run_id, rule_id, rule.get("rule_group"), rule.get("project_name"),
-            rule.get("process_name"), run_key, rule.get("seq_no"),
-            datetime.fromtimestamp(start_time), datetime.now(), status, rowcount, error_message,
-        ])
+        _write_result(meta_conn, meta_db, run_id, rule, run_key, start_time, status, **kwargs)
     except Exception as exc:
-        logger.error("Failed to write gre_log row for rule_id=%s: %s", rule.get("rule_id"), exc)
+        logger.error("Failed to write gre_results row for rule_id=%s: %s", rule.get("rule_id"), exc)
 
 
 # ---------------------------------------------------------------------------
@@ -814,9 +801,9 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     meta_conn   : SourceAdapter for the gre_ metadata store -- all writes go here
     run_id      : id for this run (assigned by rules_engine/runner.py)
     run_key     : opaque tracking/idempotency identifier for this run --
-                  gre_exceptions/gre_log/gre_results key off this value
-                  (see rules_engine/schema.sql's gre_exceptions_uix /
-                  gre_results_uix). Not required to appear in run_params --
+                  gre_exceptions/gre_results key off this value
+                  (see rules_engine/schema.sql's gre_exceptions_uix). Not
+                  required to appear in run_params --
                   build it however fits your data (a batch id, a
                   year+month pair, a specific date, or any other
                   column/combination) via rules_engine/db_ops.py::build_run_key(),
@@ -851,8 +838,8 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     Commit model
     ------------
     Every violating row commits independently, in GRE_EXCEPTION_CHUNK-sized
-    batches (bulk_insert_or_skip). The gre_results upsert and the gre_log
-    attempt row are their own separate commits too. Nothing here is
+    batches (bulk_insert_or_skip). The gre_results attempt row is its own
+    separate commit too. Nothing here is
     wrapped in one transaction, by design -- a crash mid-write leaves
     whatever chunks already committed in place, and a rerun of this same
     rule/run_key picks up exactly where it left off because of the
@@ -885,7 +872,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     except Exception as exc:
         logger.error("Rule %s: source prepare failed: %s", rule.get("rule_id"), exc, exc_info=True)
         _log_error(meta_conn, meta_db, run_id, rule, run_key, "SOURCE_PREPARE_ERROR", str(exc))
-        _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, start, str(exc))
+        _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc))
         return "ERROR"
 
     # ── STEP 0b: run_params substitution -- fail fast, never mid-run ─────────
@@ -894,7 +881,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     except ValueError as exc:
         logger.error("Rule %s: run_params substitution failed: %s", rule.get("rule_id"), exc)
         _log_error(meta_conn, meta_db, run_id, rule, run_key, "PARAM_SUBSTITUTION_ERROR", str(exc))
-        _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, start, str(exc))
+        _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc))
         return "ERROR"
 
     # ── STEP 1: ONE scan of rule_syntax -- TRUE failed count + all rows ──────
@@ -903,7 +890,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     except Exception as exc:
         logger.error("Rule %s: rule_syntax scan failed: %s", rule.get("rule_id"), exc, exc_info=True)
         _log_error(meta_conn, meta_db, run_id, rule, run_key, "SQL_RUNTIME", str(exc))
-        _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, start, str(exc))
+        _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc))
         return "ERROR"
 
     # ── STEP 2: total in-scope record count (memoized across the run_group) ──
@@ -912,7 +899,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     except Exception as exc:
         logger.error("Rule %s: scope/count query failed: %s", rule.get("rule_id"), exc, exc_info=True)
         _log_error(meta_conn, meta_db, run_id, rule, run_key, "SCOPE_QUERY_FAILURE", str(exc))
-        _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, start, str(exc))
+        _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc))
         return "ERROR"
 
     # ── STEP 3: reconcile gre_exceptions against this attempt -- best effort ─
@@ -946,16 +933,17 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
         severity=rule.get("severity"),
     )
 
-    if verdict["write_result"]:
-        failure_pct = round((failed / total * 100), 6) if total else 0.0
+    failure_pct = round((failed / total * 100), 6) if total else 0.0
 
-        # Build (never execute) the STRTOK/split_part join text that ties
-        # this rule's gre_exceptions rows back to their live source
-        # records -- see build_source_tieback_sql()'s docstring. Best-
-        # effort: a failure here must never take down an otherwise-
-        # successful rule attempt, so it's logged and the result row is
-        # still written with source_tieback_sql=NULL rather than erroring
-        # the whole rule out.
+    # Build (never execute) the STRTOK/split_part join text that ties this
+    # rule's gre_exceptions rows back to their live source records -- see
+    # build_source_tieback_sql()'s docstring. Only meaningful when there's
+    # actually something to tie back to (failed > 0); best-effort even
+    # then -- a failure here must never take down an otherwise-successful
+    # rule attempt, so it's logged and the result row is still written
+    # with source_tieback_sql=NULL rather than erroring the whole rule out.
+    source_tieback_sql = None
+    if failed > 0:
         try:
             source_tieback_sql = build_source_tieback_sql(rule, run_key, meta_db)
         except Exception as exc:
@@ -965,28 +953,36 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
             )
             source_tieback_sql = None
 
+    if verdict["write_result"]:
         try:
-            _upsert_result(meta_conn, meta_db, {
-                "rule_id": rule.get("rule_id"),
-                "run_key": run_key,
-                "run_id": run_id,
-                "project_name": rule.get("project_name"),
-                "process_name": rule.get("process_name"),
-                "total_records": total,
-                "failed_records": failed,
-                "failure_pct": failure_pct,
-                "threshold_pct_used": verdict["threshold_pct_used"],
-                "threshold_count_used": verdict["threshold_count_used"],
-                "threshold_operator_used": verdict["threshold_operator_used"],
-                "severity": rule.get("severity"),
-                "status": verdict["status"],
-                "source_tieback_sql": source_tieback_sql,
-            })
+            _write_result(
+                meta_conn, meta_db, run_id, rule, run_key, start, verdict["status"],
+                total_records=total, failed_records=failed, failure_pct=failure_pct,
+                threshold_pct_used=verdict["threshold_pct_used"],
+                threshold_count_used=verdict["threshold_count_used"],
+                threshold_operator_used=verdict["threshold_operator_used"],
+                source_tieback_sql=source_tieback_sql,
+            )
         except Exception as exc:
-            logger.error("Rule %s: gre_results upsert failed: %s", rule.get("rule_id"), exc, exc_info=True)
+            logger.error("Rule %s: gre_results write failed: %s", rule.get("rule_id"), exc, exc_info=True)
             _log_error(meta_conn, meta_db, run_id, rule, run_key, "RESULTS_WRITE_FAILURE", str(exc))
-            _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", failed, start, str(exc))
+            _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR",
+                                failed_records=failed, error_message=str(exc))
             return "ERROR"
+    else:
+        # verdict["write_result"] is False for the "nothing to score"
+        # (total==0) and "no threshold, no full-universe breach" cases --
+        # still worth ONE row per attempt for history (this used to be
+        # unconditionally covered by gre_log's own always-write behavior;
+        # see this function's docstring on why the two tables merged).
+        # _write_result_safe(), not _write_result(): a write failure here
+        # is bookkeeping-only noise for an attempt that had nothing to
+        # report in the first place, not worth escalating to ERROR.
+        _write_result_safe(
+            meta_conn, meta_db, run_id, rule, run_key, start, verdict["status"],
+            total_records=total, failed_records=failed, failure_pct=failure_pct,
+            source_tieback_sql=source_tieback_sql,
+        )
 
     logger.info(
         "rule_id=%s | total=%d failed=%d inserted=%d reactivated=%d deactivated=%d | "
@@ -994,24 +990,4 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
         rule.get("rule_id"), total, failed, reconcile["inserted"], reconcile["reactivated"],
         reconcile["deactivated"], verdict["status"], verdict["write_result"], time.time() - start,
     )
-    # gre_log.rowcount = `failed` -- the TRUE, exact count of violating rows
-    # from THIS attempt's own scan (rules_engine/schema.sql's comment:
-    # "violating rows written to gre_exceptions this attempt"), identical
-    # to what gets written as gre_results.failed_records for the same
-    # attempt. This used to log `written` (= reconcile["inserted"] +
-    # reconcile["reactivated"]) instead -- the count of rows that CHANGED
-    # to active THIS attempt, not the count of rows active as of this
-    # attempt. Those agree only on a rule's very first run: on any rerun
-    # where the violation set is unchanged (nothing newly broke, nothing
-    # got fixed), inserted=reactivated=0, so the old logic reported
-    # rowcount=0 for an attempt that still had `failed` genuine, currently-
-    # active violations on file -- a real rule with open violations reading
-    # as "0 rows" in gre_log every stable rerun, silently disagreeing with
-    # gre_results.failed_records and with a COUNT(*) against gre_exceptions
-    # itself. `failed` cannot "double-count" anything (the concern the old
-    # comment raised): it is a fresh COUNT from this attempt's own scan,
-    # not an accumulator across attempts. See
-    # tests/test_rules_engine_executor.py::
-    # test_execute_rule_gre_log_rowcount_matches_failed_records_on_unchanged_rerun.
-    _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "SUCCESS", failed, start)
     return "SUCCESS"

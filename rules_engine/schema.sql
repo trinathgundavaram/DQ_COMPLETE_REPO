@@ -1,10 +1,17 @@
 -- ============================================================
 -- Generic Rules Engine (GRE) DDL
--- Schema : CMSUNIV_FILELAND_DEV_T  (DEV)  -- same metadata store as dq_*,
---          reached at runtime via the same "teradata" connection name and
---          rules_engine/config.py's get_meta_db() resolution (GRE_META_DB
---          overrides it independently if these tables ever need to move to
---          their own schema without a code change).
+-- Schema : {{META_DB}}  -- a PLACEHOLDER, not a literal schema name. This
+--          file is a template: rules_engine/deploy_schema.py substitutes
+--          {{META_DB}} with rules_engine/config.py's get_meta_db()
+--          resolution (GRE_META_DB env var, defaulting to
+--          {{META_DB}} for local/dev) before ever sending this
+--          to Teradata -- the SAME database name every query this engine
+--          runs already resolves at runtime, so the deployed DDL and the
+--          queries against it can never point at two different schemas.
+--          Promoting this file DEV -> QA -> INT -> UAT -> PROD is then
+--          just re-running deploy_schema.py with GRE_META_DB set to that
+--          environment's value -- never a hand-edit of this file. See
+--          README.md's "Environments" section.
 -- DB     : Teradata  (metadata store)
 -- ============================================================
 -- This package is fully standalone -- no other schema.sql needs to run
@@ -12,7 +19,7 @@
 -- sampling/ no longer share ANY code or tables; each has its own
 -- db_ops.py/config.py and its own run-tracking (gre_rule_audit) and
 -- error-log (gre_rule_errors) tables, both created below alongside
--- gre_rules/gre_log/gre_exceptions/gre_results).
+-- gre_rules/gre_exceptions/gre_results).
 --
 -- Standalone from ddl.sql on purpose too: this file creates ONLY
 -- gre_*-prefixed objects specific to rule evaluation. It never touches,
@@ -41,7 +48,7 @@
 --     see rules_engine/db_ops.py::_substitute_params(). run_params has NO
 --     reserved/required key -- entirely up to the rule author what it
 --     contains. The one value the tracking/idempotency schema
---     (gre_exceptions_uix, gre_log, gre_results, gre_rule_audit) keys off is
+--     (gre_exceptions_uix, gre_results, gre_rule_audit) keys off is
 --     `run_key`, a SEPARATE explicit parameter passed alongside
 --     run_params to rules_engine/runner.py's entry points -- see
 --     rules_engine/db_ops.py::build_run_key() for a convenience way to build one
@@ -59,7 +66,12 @@
 --     duplication (and a real drift risk -- the two could silently
 --     disagree). Every key present in run_params is applied as an equality
 --     filter against database_name.src_tbl_nm, AND'd together -- see
---     rules_engine/executor.py::_build_total_query(). A project whose
+--     rules_engine/executor.py::_build_total_query(). database_name is
+--     stored here AS AUTHORED (almost always in DEV) and resolved to
+--     whichever physical database this process's environment actually
+--     has that data in at LOAD time, not stored per-environment -- see
+--     rules_engine/config.py::resolve_database_name() and
+--     rules_engine/rules.py::load_rules()'s call site. A project whose
 --     table doesn't carry a column for one of its run_params keys should
 --     not pass that key for rules on this table.
 --   * There is no separate named-connection column. sql_dialect ('teradata'
@@ -99,7 +111,7 @@
 
 
 -- ── 1. gre_rules -- one row per rule ──────────────────────────────────────
-CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_rules (
+CREATE MULTISET TABLE {{META_DB}}.gre_rules (
     rule_id              INTEGER NOT NULL,
     rule_nm              VARCHAR(500) NOT NULL,
     database_name        VARCHAR(200) NOT NULL,    -- teradata/postgres: schema the table lives in.
@@ -164,77 +176,17 @@ PRIMARY INDEX (rule_id);
 -- rules_engine/rules.py::load_rules() always filters on exactly these
 -- three columns -- covers that lookup without a full-table scan.
 CREATE INDEX gre_rules_group_variant_ix (rule_group, act_ind, rule_variant)
-ON CMSUNIV_FILELAND_DEV_T.gre_rules;
+ON {{META_DB}}.gre_rules;
 
 -- Reporting/orchestration lookup by project/process (e.g. "which
 -- rule_groups exist for project X" -- see
 -- rules_engine/runner.py::discover_rule_groups()), never load_rules()'s
 -- own lookup -- that one stays on gre_rules_group_variant_ix above.
 CREATE INDEX gre_rules_project_process_ix (project_name, process_name, act_ind)
-ON CMSUNIV_FILELAND_DEV_T.gre_rules;
+ON {{META_DB}}.gre_rules;
 
 
--- ── 2. gre_log -- one row per rule execution attempt ──────────────────────
--- run_id is a new value every time rules_engine/runner.py::run_rule_group()
--- is called (see generate_run_id()), even for a REPEATED run_key -- so a
--- deliberate rerun of the same run_key accumulates one gre_log row per
--- rule per run_id, not one row that gets overwritten. active_ind is how
--- "which of these is the CURRENT attempt for this rule_id/run_key" is
--- answered without every reader having to re-derive MAX(load_datetime)
--- (or worse, MAX(run_id), which sorts wrong once a run_id's timestamp
--- suffix rolls past a lexicographic boundary) themselves: the newest
--- run_id's row is 'Y', every earlier run_id's row for the same
--- (rule_id, run_key) is deactivated to 'N' -- see
--- rules_engine/executor.py::_deactivate_prior_log_attempts(), called from
--- _log_attempt() immediately before this attempt's own row is inserted.
--- Never deletes -- full attempt history (including superseded ERROR rows)
--- stays on file for audit; only active_ind flips.
-CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_log (
-    log_id           BIGINT GENERATED ALWAYS AS IDENTITY,
-    run_id           VARCHAR(200) NOT NULL,
-    rule_id          INTEGER NOT NULL,
-    rule_group       VARCHAR(100),
-    project_name     VARCHAR(100),         -- copied from gre_rules.project_name (reporting dimension)
-    process_name     VARCHAR(100),         -- copied from gre_rules.process_name
-    run_key          VARCHAR(100) NOT NULL,
-    seq_no           INTEGER,
-    start_time       TIMESTAMP,
-    end_time         TIMESTAMP,
-    status           VARCHAR(20),          -- 'SUCCESS' | 'ERROR' -- attempt-level, not the verdict
-    rowcount         BIGINT,               -- TRUE count of violating rows from this attempt's own
-                                            -- scan -- always equal to gre_results.failed_records for
-                                            -- the same rule_id/run_id, even when the violation set was
-                                            -- unchanged from the prior attempt (0 new/reactivated rows
-                                            -- still means a nonzero rowcount if violations remain open).
-                                            -- gre_exceptions detail capture is uncapped -- every
-                                            -- violating row gets a row there every attempt, see
-                                            -- rules_engine/executor.py::_scan_violations()'s docstring.
-                                            -- rowcount is NOT a count of gre_exceptions rows inserted/
-                                            -- reactivated this attempt -- see
-                                            -- rules_engine/executor.py::execute_rule()'s comment above
-                                            -- its final _log_attempt() call for why that would be wrong.
-    error_message    VARCHAR(2000),
-    active_ind           CHAR(1) DEFAULT 'Y',  -- 'Y' = this run_id is the CURRENT attempt for this
-                                                -- (rule_id, run_key); 'N' = superseded by a later
-                                                -- run_id's rerun of the same run_key. See comment above.
-    load_datetime    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_updated_datetime TIMESTAMP             -- set only when active_ind flips to 'N'
-)
-PRIMARY INDEX (run_id, rule_id);
-
--- Reporting/dashboard lookup: "what's the current status of every rule
--- for this run_key" -- filters straight to active_ind='Y' instead of
--- scanning every historical attempt across every past run_id.
-CREATE INDEX gre_log_rule_run_key_active_ix (rule_id, run_key, active_ind)
-ON CMSUNIV_FILELAND_DEV_T.gre_log;
-
--- Historical/ops lookup by (rule_group, run_key, status) -- e.g. "how many
--- ERROR attempts has this run_key ever had, across every rerun".
-CREATE INDEX gre_log_group_run_key_ix (rule_group, run_key, status)
-ON CMSUNIV_FILELAND_DEV_T.gre_log;
-
-
--- ── 3. gre_exceptions -- data findings, engine-populated only ─────────────
+-- ── 2. gre_exceptions -- data findings, engine-populated only ─────────────
 -- Column shape is the legacy INSERT list verbatim (record_id, rule_id,
 -- src_tbl_nm, element_name, source_name, issue_desc, exception_flag,
 -- exception_approver, run_key, etl_is_curr_ind, etl_load_dt,
@@ -255,7 +207,7 @@ ON CMSUNIV_FILELAND_DEV_T.gre_log;
 -- write time and reflects the record as it stands right now (see that
 -- function's docstring for the trade-off this makes vs. a point-in-time
 -- snapshot).
-CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_exceptions (
+CREATE MULTISET TABLE {{META_DB}}.gre_exceptions (
     record_id            BIGINT GENERATED ALWAYS AS IDENTITY,
     run_id                VARCHAR(200),
     rule_id               INTEGER NOT NULL,
@@ -294,31 +246,85 @@ PRIMARY INDEX (record_id);
 -- error on rerun and skip that row rather than delete-then-insert (same
 -- pattern as dq_metrics_summary_uix).
 CREATE UNIQUE INDEX gre_exceptions_uix (rule_id, run_key, src_key_value)
-ON CMSUNIV_FILELAND_DEV_T.gre_exceptions;
+ON {{META_DB}}.gre_exceptions;
 
 -- v1: fast lookup by rule_id/run_key -- this is exactly how gre_results
 -- rows are joined back to their underlying records (see
 -- rules_engine/reporting.py), mirroring dq_exceptions_run_rule_ix.
 CREATE INDEX gre_exceptions_rule_run_key_ix (rule_id, run_key)
-ON CMSUNIV_FILELAND_DEV_T.gre_exceptions;
+ON {{META_DB}}.gre_exceptions;
 
 
--- ── 4. gre_results -- one row per (rule_id, run_key): rule-LEVEL verdict ──
-CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_results (
+-- ── 3. gre_results -- one row per rule PER EXECUTION ATTEMPT ─────────────
+-- Consolidates what used to be two separate tables at the exact same
+-- grain: gre_log (one row per rule per attempt, tracking execution
+-- status/rowcount/start-end timing) and gre_results (one row per
+-- rule_id+run_key, upserted in place, tracking the PASS/FAIL/WARN data
+-- verdict). In practice they differed only in start_time/end_time and in
+-- which status value was authoritative -- and gre_log's status
+-- ('SUCCESS'/'ERROR') was routinely misread as the data verdict when it
+-- only ever meant "the attempt ran to completion without raising": a
+-- rule that legitimately FAILED its threshold still logged
+-- status='SUCCESS' in gre_log every time, while the real verdict lived
+-- only in gre_results.status. This table uses gre_results' verdict
+-- semantics for its ONE status column -- 'PASS' | 'FAIL' | 'WARN' for a
+-- completed evaluation, 'ERROR' when the attempt itself couldn't produce
+-- a verdict at all (source prepare failed, run_params substitution
+-- failed, the rule_syntax scan failed, the scope/count query failed, or
+-- the write of this very row failed) -- see rules_engine/executor.py::
+-- _write_result()'s docstring for the full history and
+-- execute_rule()'s STEP 0/0b/1/2 failure paths for where ERROR comes
+-- from.
+--
+-- run_id is a new value every time rules_engine/runner.py::run_rule_group()
+-- is called (see generate_run_id()), even for a REPEATED run_key -- so a
+-- deliberate rerun of the same run_key accumulates one gre_results row
+-- per rule per run_id, not one row that gets overwritten (this used to
+-- be true only of gre_log; now gre_results keeps that same full attempt
+-- history too, never upserted-in-place). active_ind is how "which of
+-- these is the CURRENT attempt for this rule_id/run_key" is answered
+-- without every reader having to re-derive MAX(load_datetime) (or worse,
+-- MAX(run_id), which sorts wrong once a run_id's timestamp suffix rolls
+-- past a lexicographic boundary) themselves: the newest run_id's row is
+-- 'Y', every earlier run_id's row for the same (rule_id, run_key) is
+-- deactivated to 'N' -- see rules_engine/executor.py::
+-- _deactivate_prior_results(), called from _write_result() immediately
+-- before this attempt's own row is inserted. Never deletes -- full
+-- attempt history (including superseded ERROR rows) stays on file for
+-- audit; only active_ind flips. This is also how the "same kind of run"
+-- rerun policy applies here exactly as it already did for
+-- gre_exceptions/gre_rule_errors: nothing from a prior attempt at the
+-- same run_key is ever deleted, only marked inactive, with the new
+-- attempt's rows added alongside it.
+CREATE MULTISET TABLE {{META_DB}}.gre_results (
     result_id                 BIGINT GENERATED ALWAYS AS IDENTITY,
-    rule_id                    INTEGER NOT NULL,
-    run_key                    VARCHAR(100) NOT NULL,
     run_id                     VARCHAR(200) NOT NULL,
+    rule_id                    INTEGER NOT NULL,
+    rule_group                 VARCHAR(100),
     project_name                VARCHAR(100),         -- copied from gre_rules.project_name
     process_name                VARCHAR(100),         -- copied from gre_rules.process_name
+    run_key                    VARCHAR(100) NOT NULL,
+    seq_no                      INTEGER,
+    start_time                  TIMESTAMP,
+    end_time                    TIMESTAMP,
     total_records               BIGINT,
-    failed_records              BIGINT,
+    failed_records              BIGINT,               -- TRUE count of violating rows from this
+                                                        -- attempt's own scan -- see
+                                                        -- rules_engine/executor.py::execute_rule()'s
+                                                        -- comment above its _write_result() calls for
+                                                        -- why this is a fresh COUNT every attempt, not
+                                                        -- an accumulator, and always agrees with a
+                                                        -- COUNT(*) against gre_exceptions itself.
     failure_pct                 FLOAT,
     threshold_pct_used          FLOAT,      -- effective value actually applied (even if defaulted)
     threshold_count_used        INTEGER,
     threshold_operator_used     CHAR(3),
     severity                    VARCHAR(50),
-    status                      VARCHAR(10),  -- 'PASS' | 'FAIL' | 'WARN'
+    status                      VARCHAR(10),  -- 'PASS' | 'FAIL' | 'WARN' | 'ERROR' -- see this
+                                               -- section's header comment for why ERROR lives in
+                                               -- the SAME column as the data verdict now, not a
+                                               -- separate gre_log.status.
+    error_message                VARCHAR(2000),  -- populated only when status = 'ERROR'
     source_tieback_sql          CLOB,         -- generated (never executed) SQL TEXT that joins
                                                -- this rule's source table straight to its
                                                -- gre_exceptions rows for run_key, parsing
@@ -327,31 +333,33 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_results (
                                                -- (postgres) -- see rules_engine/executor.py::
                                                -- build_source_tieback_sql()'s docstring. NULL for
                                                -- a 'file'/'s3' rule (no durable table for a stored
-                                               -- SQL string to reference) or a rule with no
-                                               -- src_key_cols. Pull this straight out of
+                                               -- SQL string to reference), a rule with no
+                                               -- src_key_cols, or an attempt with zero failed_records
+                                               -- (nothing to tie back to). Pull this straight out of
                                                -- gre_results and run it in Toad/whatever SQL
                                                -- client instead of hand-deriving the join.
-    active_ind                  CHAR(1) DEFAULT 'Y',  -- always 'Y' in practice -- gre_results_uix
-                                               -- below already guarantees exactly one row per
-                                               -- (rule_id, run_key), upserted in place on rerun
-                                               -- (rules_engine/executor.py::_upsert_result()), so
-                                               -- there is never a stale row here to deactivate.
-                                               -- Carried for the same active_ind vocabulary
-                                               -- gre_log/gre_rule_errors use, so a downstream report
-                                               -- can filter active_ind='Y' uniformly across all three
-                                               -- without needing to know gre_results is a special case.
-    evaluated_at                TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    active_ind                  CHAR(1) DEFAULT 'Y',  -- 'Y' = this run_id is the CURRENT attempt for
+                                               -- this (rule_id, run_key); 'N' = superseded by a
+                                               -- later run_id's rerun of the same run_key. See this
+                                               -- section's header comment.
+    load_datetime                TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_updated_datetime        TIMESTAMP    -- set only when active_ind flips to 'N'
 )
-PRIMARY INDEX (rule_id, run_key);
+PRIMARY INDEX (run_id, rule_id);
 
--- v1: UNIQUE INDEX so a rerun of the same run_key UPDATEs this summary row
--- in place (upsert) instead of expire-and-insert-new -- modeled directly
--- on dq_metrics_summary_uix.
-CREATE UNIQUE INDEX gre_results_uix (rule_id, run_key)
-ON CMSUNIV_FILELAND_DEV_T.gre_results;
+-- Reporting/dashboard lookup: "what's the current status of every rule
+-- for this run_key" -- filters straight to active_ind='Y' instead of
+-- scanning every historical attempt across every past run_id.
+CREATE INDEX gre_results_rule_run_key_active_ix (rule_id, run_key, active_ind)
+ON {{META_DB}}.gre_results;
+
+-- Historical/ops lookup by (rule_group, run_key, status) -- e.g. "how many
+-- ERROR attempts has this run_key ever had, across every rerun".
+CREATE INDEX gre_results_group_run_key_ix (rule_group, run_key, status)
+ON {{META_DB}}.gre_results;
 
 
--- ── 5. gre_rule_audit -- durable, one row per rules_engine run ────────────
+-- ── 4. gre_rule_audit -- durable, one row per rules_engine run ────────────
 -- Written by rules_engine/runner.py::_start_audit()/_finish_audit() ONLY.
 -- Used to live in shared/schema.sql, alongside sampling/'s equivalent
 -- gre_sampling_audit table (both were kept together there because they
@@ -359,7 +367,7 @@ ON CMSUNIV_FILELAND_DEV_T.gre_results;
 -- the 2026-08 gre_audit split). Now that rules_engine/ and sampling/
 -- share no code or tables at all (see README.md's "Package separation"),
 -- this table lives here, where it's actually used.
-CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_rule_audit (
+CREATE MULTISET TABLE {{META_DB}}.gre_rule_audit (
     run_id                 VARCHAR(200) NOT NULL,
     rule_group              VARCHAR(100),
     project_name              VARCHAR(100),      -- copied from gre_rules.project_name
@@ -382,13 +390,13 @@ PRIMARY INDEX (run_id);
 -- run_id's attempt-N segment -- see rules_engine/README.md's "Identifying
 -- an attempt: run_id".
 CREATE INDEX gre_rule_audit_group_run_key_ix (rule_group, run_key)
-ON CMSUNIV_FILELAND_DEV_T.gre_rule_audit;
+ON {{META_DB}}.gre_rule_audit;
 
 CREATE INDEX gre_rule_audit_status_ix (status)
-ON CMSUNIV_FILELAND_DEV_T.gre_rule_audit;
+ON {{META_DB}}.gre_rule_audit;
 
 
--- ── 6. gre_rule_errors -- this package's own SQL/execution failure log ───
+-- ── 5. gre_rule_errors -- this package's own SQL/execution failure log ───
 -- Used to be gre_errors, one table shared with sampling/ (rule_id NULL
 -- for a sampling-run error row). Now this package's own -- rule_id is
 -- always populated here (every row is tied to a specific rule), and
@@ -401,10 +409,10 @@ ON CMSUNIV_FILELAND_DEV_T.gre_rule_audit;
 -- active_ind marks which error(s) belong to the CURRENT run_id for a
 -- given (rule_id, run_key) -- see rules_engine/db_ops.py::
 -- _deactivate_prior_errors(), called from log_error() immediately before
--- each new error row is inserted, mirroring gre_log's active_ind
+-- each new error row is inserted, mirroring gre_results' active_ind
 -- reconciliation exactly. Never deletes -- full error history stays on
 -- file; only active_ind flips.
-CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_rule_errors (
+CREATE MULTISET TABLE {{META_DB}}.gre_rule_errors (
     error_id         BIGINT GENERATED ALWAYS AS IDENTITY,
     run_id           VARCHAR(200),
     rule_id          INTEGER NOT NULL,
@@ -425,4 +433,4 @@ PRIMARY INDEX (run_id, rule_id);
 -- run_key" -- filters straight to active_ind='Y' instead of every
 -- historical error across every past run_id.
 CREATE INDEX gre_rule_errors_rule_run_key_active_ix (rule_id, run_key, active_ind)
-ON CMSUNIV_FILELAND_DEV_T.gre_rule_errors;
+ON {{META_DB}}.gre_rule_errors;

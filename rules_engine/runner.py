@@ -48,9 +48,10 @@ from rules_engine.db_ops import (
     execute_query, execute_dml,
     generate_run_id as _generate_run_id,
     count_prior_attempts as _count_prior_attempts,
+    default_run_key as _default_run_key,
 )
 from rules_engine.rules import load_rules
-from rules_engine.executor import execute_rule, _log_error, _log_attempt
+from rules_engine.executor import execute_rule, _log_error, _write_result_safe
 from rules_engine.parallel import build_pools, close_pools
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,7 @@ def _build_group_run_id(meta_conn, meta_db: str, rule_group: str, run_key: str,
     """
     The run_id run_rule_group() actually mints -- richer than the plain
     generate_run_id(rule_group, run_key) above, folding in three more
-    things a human scanning gre_log/gre_rule_audit wants without a join:
+    things a human scanning gre_results/gre_rule_audit wants without a join:
 
         {project_name}.{rule_group}::{run_key}::attempt-{N}::{triggered_by}::{timestamp}::{hex}
 
@@ -95,7 +96,7 @@ def _build_group_run_id(meta_conn, meta_db: str, rule_group: str, run_key: str,
       - triggered_by -- who/what kicked this off (a login, a scheduler
         name, "SYSTEM"), already collected as a parameter here and
         recorded on gre_rule_audit -- folding it into the id too means
-        it's visible on gre_log/gre_exceptions/gre_results rows as well,
+        it's visible on gre_exceptions/gre_results rows as well,
         which don't otherwise carry it.
 
     Underlying shape/collision-safety is entirely generate_run_id()'s --
@@ -249,8 +250,8 @@ def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, run_key, reso
                 _log_error(meta_conn, meta_db, run_id, rule, run_key,
                            "CONNECTION_UNAVAILABLE",
                            f"No pooled connection '{gre_config.get_meta_connection_name()}' for parallel execution")
-                _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, time.time(),
-                            f"No pooled connection '{gre_config.get_meta_connection_name()}' for parallel execution")
+                _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, time.time(), "ERROR",
+                            error_message=f"No pooled connection '{gre_config.get_meta_connection_name()}' for parallel execution")
                 results[rule["rule_id"]] = "ERROR"
                 errored += 1
             return results, succeeded, errored
@@ -268,8 +269,8 @@ def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, run_key, reso
             )
             _log_error(meta_conn, meta_db, run_id, rule, run_key,
                        "CONNECTION_UNAVAILABLE", f"No connection '{rule['sql_dialect']}'")
-            _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, time.time(),
-                        f"No connection '{rule['sql_dialect']}'")
+            _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, time.time(), "ERROR",
+                        error_message=f"No connection '{rule['sql_dialect']}'")
             results[rule["rule_id"]] = "ERROR"
             errored += 1
 
@@ -310,8 +311,8 @@ def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, run_key, reso
 
 def run_rule_group(
     rule_group: str,
-    run_key: str,
-    cf,
+    run_key: str = None,
+    cf=None,
     meta_conn=None,
     meta_db: str = None,
     triggered_by: str = "SYSTEM",
@@ -325,7 +326,7 @@ def run_rule_group(
     ----------
     rule_group   : which group of gre_rules to run
     run_key      : opaque tracking/idempotency identifier for this run
-                   (gre_exceptions_uix, gre_log, gre_results, gre_rule_audit
+                   (gre_exceptions_uix, gre_results, gre_rule_audit
                    key off this value) -- a batch id, a year+month pair, a
                    specific date, or any other column/combination the
                    caller wants; build one via rules_engine/db_ops.py::
@@ -367,6 +368,13 @@ def run_rule_group(
     -------
     dict summary: run_id, status, total_rules, succeeded, errored, skipped_ready
     """
+    if cf is None:
+        raise RuntimeError("run_rule_group() needs a loaded ConnectionFactory (cf=...).")
+
+    if not run_key:
+        run_key = _default_run_key()
+        logger.info("run_rule_group: no run_key passed -- defaulting to today's date, run_key=%s.", run_key)
+
     meta_db = meta_db or gre_config.get_meta_db()
     meta_conn = meta_conn or cf.get(gre_config.get_meta_connection_name())
     if meta_conn is None:
@@ -483,8 +491,8 @@ def run_rule_group(
                 )
                 _log_error(meta_conn, meta_db, run_id, rule, run_key,
                            "CONNECTION_UNAVAILABLE", f"No connection '{rule['sql_dialect']}'")
-                _log_attempt(meta_conn, meta_db, run_id, rule, run_key, "ERROR", 0, time.time(),
-                            f"No connection '{rule['sql_dialect']}'")
+                _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, time.time(), "ERROR",
+                            error_message=f"No connection '{rule['sql_dialect']}'")
                 status = "ERROR"
             else:
                 status = execute_rule(rule, db_conn, meta_conn, run_id, run_key, resolved_params, meta_db,
@@ -571,8 +579,8 @@ def discover_rule_groups(meta_conn, meta_db: str, project_name: str = None,
 def run_all_active_groups(
     meta_conn,
     meta_db: str,
-    run_key: str,
-    cf,
+    run_key: str = None,
+    cf=None,
     project_name: str = None,
     process_name: str = None,
     triggered_by: str = "SYSTEM",
@@ -586,10 +594,20 @@ def run_all_active_groups(
     its own run_id and its own gre_rule_audit row -- this is a thin fan-out,
     not a merged run.
 
+    run_key defaults to today's date (see db_ops.py::default_run_key())
+    if not passed -- resolved ONCE here so every group in this fan-out
+    shares the exact same run_key, rather than each group's own
+    run_rule_group() call independently defaulting (which risks two
+    different dates if this call happens to straddle midnight).
+
     Returns {"rule_groups": {rule_group: run_rule_group()'s own summary dict, ...}}
     so a caller can inspect or aggregate per-group outcomes; a group that
     errors doesn't stop the remaining groups from running.
     """
+    if not run_key:
+        run_key = _default_run_key()
+        logger.info("run_all_active_groups: no run_key passed -- defaulting to today's date, run_key=%s.", run_key)
+
     rule_groups = discover_rule_groups(meta_conn, meta_db, project_name=project_name,
                                         process_name=process_name)
     logger.info(
@@ -623,8 +641,8 @@ def _run_rule_groups(rule_groups, meta_conn, meta_db: str, run_key: str, cf,
 
 def run_by_process_name(
     process_name: str,
-    run_key: str,
-    cf,
+    run_key: str = None,
+    cf=None,
     meta_conn=None,
     meta_db: str = None,
     project_name: str = None,
@@ -647,6 +665,10 @@ def run_by_process_name(
                    see run_rule_group()'s docstring. build_run_key() in
                    rules_engine/db_ops.py can build one from parts (a batch id, a
                    year+month pair, a specific date, or any combination).
+                   Optional -- defaults to today's date
+                   (rules_engine/db_ops.py::default_run_key()) if omitted,
+                   so an unattended/scheduled caller with no explicit
+                   batch id still gets a sensible, idempotent run_key.
     cf           : a loaded db.connection_factory.ConnectionFactory.
     meta_conn    : metadata connection to run against; defaults to
                    cf.get(rules_engine.config.get_meta_connection_name()) if not
@@ -666,6 +688,13 @@ def run_by_process_name(
     rather than a legitimately empty run, so this fails loudly instead of
     silently returning an empty result.
     """
+    if cf is None:
+        raise RuntimeError("run_by_process_name() needs a loaded ConnectionFactory (cf=...).")
+
+    if not run_key:
+        run_key = _default_run_key()
+        logger.info("run_by_process_name: no run_key passed -- defaulting to today's date, run_key=%s.", run_key)
+
     meta_conn = meta_conn or cf.get(gre_config.get_meta_connection_name())
     meta_db = meta_db or gre_config.get_meta_db()
 

@@ -82,6 +82,7 @@ from datetime import datetime
 from sampling.db_ops import (
     execute_query, execute_dml, bulk_insert, log_error,
     _run_source_query, _substitute_params, generate_run_id, count_prior_attempts,
+    default_run_key as _default_run_key,
 )
 
 # gre_sampling_audit -- sampling's OWN run-tracking table (sampling/
@@ -557,8 +558,8 @@ def _log_sampling_error(meta_conn, meta_db: str, sample_run_id: str, run_key: st
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = None, seed: int = None,
-                 run_params: dict = None, triggered_by: str = "SYSTEM") -> dict:
+def run_sampling(config_id, run_key: str = None, cf=None, meta_conn=None, meta_db: str = None,
+                 seed: int = None, run_params: dict = None, triggered_by: str = "SYSTEM") -> dict:
     """
     Execute one stratified sampling pass for `config_id`, scoped to
     `run_key` and whatever else `run_params` supplies (substituted into
@@ -574,10 +575,14 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
                    a batch id, a year+month pair, a specific date, or any
                    other column/combination the caller wants; build one via
                    sampling/db_ops.py::build_run_key() or pass your own
-                   string. Deliberately NOT merged into run_params -- see
-                   run_params below -- if scope_sql/exclusion_sql need to
-                   reference the run's tracking value, pass it explicitly
-                   via run_params under whatever key they choose.
+                   string. Optional -- defaults to today's date
+                   (sampling/db_ops.py::default_run_key()) if omitted, so
+                   an unattended/scheduled caller with no explicit batch id
+                   still gets a sensible, idempotent run_key. Deliberately
+                   NOT merged into run_params -- see run_params below -- if
+                   scope_sql/exclusion_sql need to reference the run's
+                   tracking value, pass it explicitly via run_params under
+                   whatever key they choose.
     cf           : ConnectionFactory, already loaded
     meta_conn    : adapter for the gre_ metadata store; defaults to
                    cf.get(gre_config.get_meta_connection_name())
@@ -601,6 +606,13 @@ def run_sampling(config_id, run_key: str, cf, meta_conn=None, meta_db: str = Non
     by_stratum, seed (None for RANKED)
     """
     from sampling import config as gre_config
+
+    if cf is None:
+        raise RuntimeError("run_sampling() needs a loaded ConnectionFactory (cf=...).")
+
+    if not run_key:
+        run_key = _default_run_key()
+        logger.info("run_sampling: no run_key passed -- defaulting to today's date, run_key=%s.", run_key)
 
     meta_db = meta_db or gre_config.get_meta_db()
     meta_conn = meta_conn or cf.get(gre_config.get_meta_connection_name())
@@ -798,8 +810,8 @@ def discover_sampling_configs(meta_conn, meta_db: str, project_name: str = None,
 
 def run_sampling_for_process_name(
     process_name: str,
-    run_key: str,
-    cf,
+    run_key: str = None,
+    cf=None,
     meta_conn=None,
     meta_db: str = None,
     project_name: str = None,
@@ -824,7 +836,11 @@ def run_sampling_for_process_name(
     run_key      : opaque tracking/idempotency identifier for this run --
                    see run_sampling()'s docstring. The SAME run_key is used
                    for every config found, so all of a process's samples
-                   this cycle share one tracking value.
+                   this cycle share one tracking value. Optional --
+                   defaults to today's date if omitted, resolved ONCE here
+                   (not independently per config) so every config in this
+                   fan-out shares the exact same run_key even if this call
+                   happens to straddle midnight.
     cf           : a loaded db.connection_factory.ConnectionFactory.
     meta_conn    : metadata connection; defaults to
                    cf.get(sampling.config.get_meta_connection_name()).
@@ -850,6 +866,16 @@ def run_sampling_for_process_name(
     than a legitimately empty run.
     """
     from sampling import config as gre_config
+
+    if cf is None:
+        raise RuntimeError("run_sampling_for_process_name() needs a loaded ConnectionFactory (cf=...).")
+
+    if not run_key:
+        run_key = _default_run_key()
+        logger.info(
+            "run_sampling_for_process_name: no run_key passed -- defaulting to today's date, run_key=%s.",
+            run_key,
+        )
 
     meta_conn = meta_conn or cf.get(gre_config.get_meta_connection_name())
     meta_db = meta_db or gre_config.get_meta_db()

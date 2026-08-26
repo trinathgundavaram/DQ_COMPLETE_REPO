@@ -203,7 +203,7 @@ rather than writing `ALTER TABLE` migrations. Each package has its own
 `schema_drop.sql` for this:
 
 ```
-rules_engine/schema_drop.sql    -- drop gre_rules, gre_log, gre_exceptions, gre_results, gre_rule_audit, gre_rule_errors
+rules_engine/schema_drop.sql    -- drop gre_rules, gre_exceptions, gre_results, gre_rule_audit, gre_rule_errors
 sampling/schema_drop.sql        -- drop the 7 gre_sampling_*/gre_sample_* tables (incl. gre_sampling_audit, gre_sampling_errors)
 
 -- then redeploy -- independently; neither package needs the other's

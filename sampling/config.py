@@ -57,6 +57,7 @@ concurrent sampling runs ever be added.
 
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable, Dict
 
@@ -96,18 +97,31 @@ def configure_logging(level=None) -> None:
             to see it; set GRE_LOG_LEVEL=INFO (or pass level="INFO") to quiet
             it down to just the connection/run-starting lines.
 
-    This sets the level on sampling's own logger namespace plus
-    db.connection_factory's (the one intentionally-shared dependency --
-    see README.md's "Package separation"), and calls logging.basicConfig()
-    ONLY if the root logger has no handlers yet, so it won't clobber a
-    caller's existing logging setup if one is already in place.
+    Writes to a FILE, not the console -- GRE_LOG_DIR (default "logs" at
+    the repo root, created if missing) / GRE_LOG_FILE (default
+    "sampling.log"). A rotating file handler caps any one file at 10MB
+    with 5 backups kept (sampling.log, sampling.log.1, ..., sampling.log.5),
+    so a long-running or frequently-scheduled process can never silently
+    fill the disk with log text -- the oldest backup is dropped as new
+    ones roll in. This sets the level on sampling's own logger namespace
+    plus db.connection_factory's (the one intentionally-shared dependency
+    -- see README.md's "Package separation"), and calls
+    logging.basicConfig() ONLY if the root logger has no handlers yet, so
+    it won't clobber a caller's existing logging setup (file, console, or
+    otherwise) if one is already in place -- including a caller that has
+    already called rules_engine.config.configure_logging() first in the
+    same process, so the two packages' calls compose rather than one
+    silently overriding the other's handler.
     """
     resolved = level or os.getenv("GRE_LOG_LEVEL", "DEBUG")
     if not logging.getLogger().handlers:
-        logging.basicConfig(
-            level=resolved,
-            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        )
+        log_dir = Path(os.getenv("GRE_LOG_DIR") or (Path(__file__).resolve().parent.parent / "logs"))
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / os.getenv("GRE_LOG_FILE", "sampling.log")
+        handler = RotatingFileHandler(log_path, maxBytes=10 * 1024 * 1024, backupCount=5)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logging.basicConfig(level=resolved, handlers=[handler])
+        logging.getLogger(__name__).info("sampling logging to %s (level=%s).", log_path, resolved)
     logging.getLogger("sampling").setLevel(resolved)
     logging.getLogger("db.connection_factory").setLevel(resolved)
 

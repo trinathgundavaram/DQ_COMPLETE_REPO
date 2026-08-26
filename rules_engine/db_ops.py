@@ -20,7 +20,7 @@ package uses to let a project scope its data however it needs to -- a
 month/year pair, a specific date, a region/contract column, or nothing at
 all -- without the engine hardcoding any one project's notion of "scope"
 as a schema column. `run_params` has zero reserved keys of its own; the
-one identifier the tracking/idempotency schema (gre_log, gre_exceptions,
+one identifier the tracking/idempotency schema (gre_exceptions,
 gre_results, gre_rule_audit) keys off -- `run_key` -- is a separate,
 explicit parameter passed alongside run_params, not a required member of
 it. See _substitute_params()'s docstring below for the substitution
@@ -313,7 +313,7 @@ def bulk_execute(conn, sql: str, rows: list, chunk_size: int = None) -> int:
 # values: a rule author embeds whichever "{key}" tokens their SQL needs,
 # and the caller supplies a matching dict at run time. There is no
 # reserved/required key -- run_params is entirely up to the rule author.
-# The one value the idempotency/checkpoint schema (gre_exceptions, gre_log,
+# The one value the idempotency/checkpoint schema (gre_exceptions,
 # gre_results, gre_rule_audit) keys off is `run_key`, a separate explicit
 # parameter callers pass to rules_engine/runner.py's entry points -- see
 # build_run_key() below for a convenience way to build one out of a batch
@@ -379,7 +379,7 @@ def _substitute_params(sql: str, params: dict) -> str:
 def build_run_key(*parts, delimiter: str = "_") -> str:
     """
     Join one or more values into a single opaque tracking/idempotency key
-    -- gre_log, gre_exceptions, gre_results, and gre_rule_audit all key off
+    -- gre_exceptions, gre_results, and gre_rule_audit all key off
     this ONE value, however the caller chooses to construct it. There is
     no fixed shape: a plain batch id, a year+month pair, a specific date,
     a region, or any combination all work equally well.
@@ -400,9 +400,26 @@ def build_run_key(*parts, delimiter: str = "_") -> str:
     return delimiter.join(str(p) for p in parts)
 
 
+def default_run_key() -> str:
+    """
+    Today's date (YYYY-MM-DD, local time) as a run_key -- what
+    run_rule_group()/run_all_active_groups()/run_by_process_name() below
+    fall back to when a caller doesn't pass one at all. Every batch id,
+    year+month pair, or any other run_key shape a caller explicitly
+    builds (build_run_key() above, or a plain string) always wins; this
+    is purely the "nothing was passed" default, so an unattended/scheduled
+    caller that runs once a day gets a sensible, idempotent run_key for
+    free -- reruns on the SAME calendar day naturally land on the same
+    run_key and get treated as reruns of the same run (see
+    rules_engine/executor.py::_write_result()'s active_ind reconciliation),
+    while the next day's run gets a fresh one automatically.
+    """
+    return datetime.now().date().isoformat()
+
+
 def generate_run_id(*label_parts, timestamp: datetime = None) -> str:
     """
-    Build one `run_id` -- the identifier `gre_log`, `gre_exceptions`,
+    Build one `run_id` -- the identifier `gre_exceptions`,
     `gre_results`, `gre_rule_errors`, and `gre_rule_audit` all stamp on
     every row written by ONE execution
     (rules_engine/runner.py::run_rule_group()), as opposed to `run_key`,
@@ -419,7 +436,7 @@ def generate_run_id(*label_parts, timestamp: datetime = None) -> str:
 
     Why this shape, piece by piece:
       - Label parts (e.g. rule_group + run_key) come first so a human
-        scanning `gre_log`/`gre_rule_audit`/a log line can immediately
+        scanning `gre_results`/`gre_rule_audit`/a log line can immediately
         tell WHAT ran and for WHICH run_key without decoding anything --
         no separate lookup needed for the common case of "which
         rule_group/run_key does this row belong to."
@@ -444,7 +461,7 @@ def generate_run_id(*label_parts, timestamp: datetime = None) -> str:
         land in the same microsecond. A run_id collision is a real
         correctness risk, not just a cosmetic one: every reconciliation
         query in this package (gre_exceptions' etl_is_curr_ind flip,
-        gre_log/gre_rule_errors' active_ind flip) filters on "run_id <>
+        gre_results/gre_rule_errors' active_ind flip) filters on "run_id <>
         this_run_id" to tell "this attempt" from "an earlier one" -- two
         attempts sharing a run_id would each treat the other's rows as
         its own, silently corrupting that logic.
@@ -492,7 +509,7 @@ def count_prior_attempts(meta_conn, meta_db: str, run_key, rule_group: str) -> i
     human-readable "attempt-N" label folded into `run_id` (see
     rules_engine/runner.py::run_rule_group()), so a rerun of the same
     run_key is visibly attempt 2, 3, ... at a glance in
-    `gre_log`/`gre_rule_audit` instead of requiring a human to compare two
+    `gre_results`/`gre_rule_audit` instead of requiring a human to compare two
     run_ids' timestamps to tell which came first.
 
     Queries gre_rule_audit_group_run_key_ix's own indexed columns
@@ -540,7 +557,7 @@ def _deactivate_prior_errors(meta_conn, meta_db: str, rule_id, run_key, current_
     """
     Soft-deactivate every gre_rule_errors row for (rule_id, run_key) left
     active from an EARLIER run_id, mirroring rules_engine/executor.py::
-    _deactivate_prior_log_attempts() for gre_log -- the same "always
+    _deactivate_prior_results() for gre_results -- the same "always
     re-execute, deactivate stale, activate new" pattern applied here to
     gre_rule_errors. Never deletes -- gre_rule_errors keeps full history
     for audit; only active_ind flips. Never raises: a failure here must

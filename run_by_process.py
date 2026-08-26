@@ -41,27 +41,22 @@ run (custom run_params, catching exceptions your own way, etc.).
 """
 import argparse
 import sys
-from datetime import date
 
 from db.connection_factory import build_and_load_connection_factory
 
 
-def _default_run_key():
-    # A plain ISO date is already a valid run_key on its own -- no need to
-    # pull in either package's build_run_key() (a one-value join is just
-    # str(value)) just for this. See rules_engine/db_ops.py's or
-    # sampling/db_ops.py's build_run_key() docstring if a caller needs to
-    # join multiple parts into a run_key instead.
-    return date.today().isoformat()
-
-
 def _run_rules(args):
     from rules_engine.config import configure_logging
+    from rules_engine.db_ops import default_run_key
     from rules_engine.runner import run_by_process_name
 
     configure_logging(args.log_level)
     cf = build_and_load_connection_factory()
-    run_key = args.run_key or _default_run_key()
+    # run_by_process_name() itself defaults run_key to today's date (and
+    # logs that it did) when None is passed -- default_run_key() here is
+    # ONLY so this print line can show the actual value about to be used,
+    # not a second, independent default computation.
+    run_key = args.run_key or default_run_key()
     print(f"Running rules_engine for process_name={args.process_name!r} "
           f"project_name={args.project_name!r} run_key={run_key!r} ...")
 
@@ -85,11 +80,12 @@ def _run_rules(args):
 
 def _run_sampling(args):
     from sampling.config import configure_logging
+    from sampling.db_ops import default_run_key
     from sampling.sampling import run_sampling_for_process_name
 
     configure_logging(args.log_level)
     cf = build_and_load_connection_factory()
-    run_key = args.run_key or _default_run_key()
+    run_key = args.run_key or default_run_key()
     print(f"Running sampling for process_name={args.process_name!r} "
           f"project_name={args.project_name!r} run_key={run_key!r} ...")
 
@@ -116,10 +112,11 @@ def main():
         description="Run the GRE rules engine or sampling engine, scoped to one process_name.",
     )
     parser.add_argument("--log-level", default=None,
-                        help="Enable detailed logging at this level (e.g. DEBUG, INFO) for "
-                             "troubleshooting -- SQL statement text and row counts only, never "
-                             "result data or bind parameter values. Defaults to the GRE_LOG_LEVEL "
-                             "env var, or INFO, if omitted.")
+                        help="Logging level (e.g. DEBUG, INFO, WARNING) -- SQL statement text and "
+                             "row counts only, never result data or bind parameter values, written "
+                             "to a file under logs/ (GRE_LOG_DIR), not the console. Defaults to the "
+                             "GRE_LOG_LEVEL env var, or DEBUG, if omitted -- detailed logging is ON "
+                             "by default; use --log-level INFO (or WARNING) to quiet it down.")
     subparsers = parser.add_subparsers(dest="engine", required=True)
 
     rules_parser = subparsers.add_parser(

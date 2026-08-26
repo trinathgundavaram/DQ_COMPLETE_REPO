@@ -18,6 +18,7 @@ duplicating it.
 
 import logging
 
+from rules_engine.config import resolve_database_name
 from rules_engine.db_ops import execute_query
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,7 @@ def load_rules(meta_conn, meta_db: str, rule_group: str, rule_variant: str = Non
     project_name/process_name straight through from gre_rules (SELECT *) --
     they're descriptive/reporting dimensions, not part of this lookup's own
     filter (see rules_engine/schema.sql's design notes); rules_engine/
-    runner.py reads them off these dicts to stamp gre_rule_audit/gre_log/
+    runner.py reads them off these dicts to stamp gre_rule_audit/
     gre_exceptions/gre_results for the run.
     """
     if rule_variant:
@@ -79,6 +80,20 @@ def load_rules(meta_conn, meta_db: str, rule_group: str, rule_variant: str = Non
         params = [rule_group]
 
     rows = execute_query(meta_conn, sql, params)
+
+    # Resolve each rule's AUTHORED database_name to whatever this process's
+    # environment (GRE_ENVIRONMENT) actually has that source data in -- see
+    # rules_engine/config.py::resolve_database_name()'s docstring. A no-op
+    # for any rule whose database_name has no GRE_DB_MAP_* configured, so
+    # this is safe to run unconditionally for every row. Every downstream
+    # consumer of these dicts (db/connection_factory.py's qualified_name(),
+    # rules_engine/executor.py's total-count query and
+    # build_source_tieback_sql()) reads database_name off THESE already-
+    # resolved dicts, so nothing else in the engine needs to know this
+    # resolution happened.
+    for row in rows:
+        row["database_name"] = resolve_database_name(row.get("database_name"))
+
     logger.info(
         "Loaded %d active rule(s) for rule_group=%s%s.",
         len(rows), rule_group, f" rule_variant={rule_variant}" if rule_variant else "",

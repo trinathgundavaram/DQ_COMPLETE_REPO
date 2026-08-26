@@ -132,18 +132,6 @@ def _conn():
     conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, run_key, src_key_value)")
 
     conn.execute("""
-        CREATE TABLE gre_log (
-            log_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
-            project_name VARCHAR, process_name VARCHAR,
-            run_key VARCHAR, seq_no INTEGER, start_time TIMESTAMP, end_time TIMESTAMP,
-            status VARCHAR, rowcount BIGINT, error_message VARCHAR,
-            active_ind VARCHAR DEFAULT 'Y',
-            load_datetime TIMESTAMP DEFAULT current_timestamp,
-            last_updated_datetime TIMESTAMP
-        )
-    """)
-
-    conn.execute("""
         CREATE TABLE gre_rule_errors (
             error_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
             run_key VARCHAR, error_type VARCHAR, error_message VARCHAR,
@@ -153,18 +141,28 @@ def _conn():
         )
     """)
 
+    # Consolidated gre_log + gre_results -- one row per rule PER EXECUTION
+    # ATTEMPT (run_id), not per rule_id+run_key. See rules_engine/schema.sql's
+    # "gre_results" section / rules_engine/executor.py::_write_result()'s
+    # docstring for the full rationale.
     conn.execute("""
         CREATE TABLE gre_results (
-            result_id BIGINT, rule_id INTEGER, run_key VARCHAR, run_id VARCHAR,
-            project_name VARCHAR, process_name VARCHAR,
+            result_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
+            project_name VARCHAR, process_name VARCHAR, run_key VARCHAR, seq_no INTEGER,
+            start_time TIMESTAMP, end_time TIMESTAMP,
             total_records BIGINT, failed_records BIGINT, failure_pct DOUBLE,
             threshold_pct_used DOUBLE, threshold_count_used INTEGER,
             threshold_operator_used VARCHAR, severity VARCHAR, status VARCHAR,
-            source_tieback_sql VARCHAR, active_ind VARCHAR DEFAULT 'Y',
-            evaluated_at TIMESTAMP DEFAULT current_timestamp
+            error_message VARCHAR, source_tieback_sql VARCHAR, active_ind VARCHAR DEFAULT 'Y',
+            load_datetime TIMESTAMP DEFAULT current_timestamp,
+            last_updated_datetime TIMESTAMP
         )
     """)
-    conn.execute("CREATE UNIQUE INDEX gre_results_uix ON gre_results(rule_id, run_key)")
+    # NOT unique on (rule_id, run_key) -- a rerun keeps history, so multiple
+    # rows (one per run_id attempt) can legitimately share a rule_id+run_key,
+    # distinguished by active_ind. Mirrors schema.sql's non-unique
+    # gre_results_rule_run_key_active_ix.
+    conn.execute("CREATE INDEX gre_results_rule_run_key_active_ix ON gre_results(rule_id, run_key, active_ind)")
 
     conn.execute("""
         CREATE TABLE gre_rule_audit (
@@ -299,10 +297,11 @@ def test_rerun_always_re_executes_already_succeeded_rules():
     _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10)
     _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20)
 
-    # Pre-seed gre_log as if rule 1 already succeeded in a prior run.
+    # Pre-seed gre_results as if rule 1 already had a PASS verdict in a
+    # prior run (active_ind='Y' -- this attempt's write will deactivate it).
     conn.execute("""
-        INSERT INTO gre_log (run_id, rule_id, rule_group, run_key, status, rowcount)
-        VALUES ('PRIOR_RUN', 1, 'claims_dq', 'B1', 'SUCCESS', 2)
+        INSERT INTO gre_results (run_id, rule_id, rule_group, run_key, status, failed_records, active_ind)
+        VALUES ('PRIOR_RUN', 1, 'claims_dq', 'B1', 'PASS', 2, 'Y')
     """)
 
     summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
@@ -311,10 +310,11 @@ def test_rerun_always_re_executes_already_succeeded_rules():
     assert summary["results"][1] == "SUCCESS"   # rule 1 re-ran, not skipped
     assert summary["results"][2] == "SUCCESS"
 
-    # Rule 1 now has the pre-seeded row PLUS this attempt's new one.
-    logs_r1 = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1")
+    # Rule 1 now has the pre-seeded row (deactivated) PLUS this attempt's new one.
+    logs_r1 = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1")
     assert len(logs_r1) == 2
-    logs_r2 = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 2")
+    assert {r["active_ind"] for r in logs_r1} == {"Y", "N"}
+    logs_r2 = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 2")
     assert len(logs_r2) == 1
 
 
@@ -330,7 +330,7 @@ def test_sequential_halt_group_stops_before_next_rule():
     assert summary["results"][1] == "ERROR"
     assert 2 not in summary["results"]          # rule 2 was never started
 
-    logs_r2 = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 2")
+    logs_r2 = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 2")
     assert len(logs_r2) == 0
 
 
@@ -469,7 +469,7 @@ def test_run_params_batch_id_key_is_an_ordinary_key_not_reserved():
     # run_params["batch_id"] that differs from run_key doesn't collide with
     # anything, because run_key is never auto-merged into run_params (see
     # rules_engine/runner.py::run_rule_group()'s docstring). Tracking
-    # (gre_exceptions/gre_log/gre_results) is keyed by run_key ("TRACKING_KEY"
+    # (gre_exceptions/gre_results) is keyed by run_key ("TRACKING_KEY"
     # here); the business filter used by _MISSING_REASON_SQL's {batch_id}
     # token is driven independently by run_params["batch_id"] ("B1").
     conn = _conn()
@@ -483,8 +483,8 @@ def test_run_params_batch_id_key_is_an_ordinary_key_not_reserved():
     # Findings are recorded under run_key, NOT the business batch_id value.
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'TRACKING_KEY'")
     assert len(exceptions) == 2
-    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND run_key = 'TRACKING_KEY'")
-    assert len(logs) == 1 and logs[0]["status"] == "SUCCESS"
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'TRACKING_KEY'")
+    assert len(results) == 1 and results[0]["status"] in ("PASS", "FAIL", "WARN")
 
 
 # ── Parallel execution (opt-in via GRE_MAX_PARALLEL_RULES) ──────────────

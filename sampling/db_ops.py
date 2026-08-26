@@ -347,6 +347,17 @@ def build_run_key(*parts, delimiter: str = "_") -> str:
     return delimiter.join(str(p) for p in parts)
 
 
+def default_run_key() -> str:
+    """
+    Today's date (YYYY-MM-DD, local time) as a run_key -- what
+    run_sampling()/run_sampling_for_process_name() below fall back to
+    when a caller doesn't pass one at all. See rules_engine/db_ops.py's
+    identical helper for the full rationale (this mirrors it exactly,
+    same as generate_run_id()/build_run_key() above already do).
+    """
+    return datetime.now().date().isoformat()
+
+
 def generate_run_id(*label_parts, timestamp: datetime = None) -> str:
     """
     Build one `run_id` (`sample_run_id`) -- the identifier

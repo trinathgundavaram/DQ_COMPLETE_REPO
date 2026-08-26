@@ -24,19 +24,23 @@ def get_breaches(meta_conn, meta_db: str, run_id: str) -> list:
     """
     Every rule that breached its threshold (FAIL or WARN) for a given run.
 
-    active_ind='Y' is always true in practice for every gre_results row
-    (gre_results_uix guarantees exactly one row per rule_id/run_key,
-    upserted in place -- see rules_engine/executor.py::_upsert_result()),
-    so this filter is a no-op today. Included anyway so this query reads
-    the same active_ind vocabulary gre_log/gre_errors queries do, and
-    keeps working unchanged if gre_results ever stops being upsert-only.
+    Filtered by the exact run_id, not active_ind: gre_results now keeps
+    one row per rule per ATTEMPT (run_id), same grain as the retired
+    gre_log used to (see rules_engine/executor.py::_write_result()'s
+    docstring for why the two tables merged) -- active_ind only says
+    whether a rerun of the same run_key has since superseded this
+    particular attempt. A caller asking about a SPECIFIC run_id wants
+    that attempt's own rows regardless of whether a later rerun has since
+    deactivated them; get_records_for_result() below is the one that
+    reads active_ind, since it looks up by (rule_id, run_key) rather than
+    by an exact run_id.
     """
     return execute_query(
         meta_conn,
         f"""
         SELECT *
         FROM {meta_db}.gre_results
-        WHERE run_id = ? AND status IN ('FAIL', 'WARN') AND active_ind = 'Y'
+        WHERE run_id = ? AND status IN ('FAIL', 'WARN')
         ORDER BY status, rule_id
         """,
         [run_id],

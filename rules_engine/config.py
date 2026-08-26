@@ -59,6 +59,7 @@ edit made twice -- accepted cost of full separation over a shared module.
 
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable, Dict
 
@@ -98,18 +99,31 @@ def configure_logging(level=None) -> None:
             to see it; set GRE_LOG_LEVEL=INFO (or pass level="INFO") to quiet
             it down to just the connection/run-starting lines.
 
-    This sets the level on rules_engine's own logger namespace plus
-    db.connection_factory's (the one intentionally-shared dependency --
-    see README.md's "Package separation"), and calls logging.basicConfig()
-    ONLY if the root logger has no handlers yet, so it won't clobber a
-    caller's existing logging setup if one is already in place.
+    Writes to a FILE, not the console -- GRE_LOG_DIR (default "logs" at
+    the repo root, created if missing) / GRE_LOG_FILE (default
+    "rules_engine.log"). A rotating file handler caps any one file at 10MB
+    with 5 backups kept (rules_engine.log, rules_engine.log.1, ...,
+    rules_engine.log.5), so a long-running or frequently-scheduled process
+    can never silently fill the disk with log text -- the oldest backup is
+    dropped as new ones roll in. This sets the level on rules_engine's own
+    logger namespace plus db.connection_factory's (the one intentionally-
+    shared dependency -- see README.md's "Package separation"), and
+    calls logging.basicConfig() ONLY if the root logger has no handlers
+    yet, so it won't clobber a caller's existing logging setup (file,
+    console, or otherwise) if one is already in place -- including a
+    caller that has already called sampling.config.configure_logging()
+    first in the same process, so the two packages' calls compose rather
+    than one silently overriding the other's handler.
     """
     resolved = level or os.getenv("GRE_LOG_LEVEL", "DEBUG")
     if not logging.getLogger().handlers:
-        logging.basicConfig(
-            level=resolved,
-            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        )
+        log_dir = Path(os.getenv("GRE_LOG_DIR") or (Path(__file__).resolve().parent.parent / "logs"))
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / os.getenv("GRE_LOG_FILE", "rules_engine.log")
+        handler = RotatingFileHandler(log_path, maxBytes=10 * 1024 * 1024, backupCount=5)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logging.basicConfig(level=resolved, handlers=[handler])
+        logging.getLogger(__name__).info("rules_engine logging to %s (level=%s).", log_path, resolved)
     logging.getLogger("rules_engine").setLevel(resolved)
     logging.getLogger("db.connection_factory").setLevel(resolved)
 
@@ -150,6 +164,90 @@ def get_meta_connection_name() -> str:
 def get_meta_db() -> str:
     """Schema/database name the gre_ tables live in."""
     return META_DB
+
+
+# ── Environment-aware source database name resolution ─────────────────────
+# gre_rules.database_name is authored once -- almost always against
+# whatever environment a rule was first written in (DEV) -- e.g.
+# "CMSUNIV_FILELAND_DEV_T". Promoting those SAME gre_rules rows to
+# QA/INT/UAT/PROD should never mean hand-editing every row's
+# database_name for that environment's physical schema name (a real drift
+# risk across dozens/hundreds of rules, and it defeats the point of
+# gre_rules being one shared catalog). GRE_ENVIRONMENT says which
+# environment THIS PROCESS is running as; resolve_database_name() below
+# is the hook rules.py::load_rules() runs every rule's database_name
+# through right after loading -- see that function for the call site.
+GRE_ENVIRONMENT = os.getenv("GRE_ENVIRONMENT", "DEV").upper()
+
+
+def get_environment() -> str:
+    """This process's environment -- DEV (default) | QA | INT | UAT | PROD,
+    or any other value a deployment wants to use, from GRE_ENVIRONMENT.
+    Purely a lookup key for resolve_database_name() below; nothing else
+    in this engine branches on it."""
+    return GRE_ENVIRONMENT
+
+
+def resolve_database_name(authored_name: str) -> str:
+    """
+    Resolve gre_rules.database_name (as AUTHORED, almost always in DEV) to
+    the PHYSICAL database this environment (get_environment(): DEV | QA |
+    INT | UAT | PROD) actually has that data in.
+
+    Configured per authored name via a GRE_DB_MAP_<AUTHORED_NAME> env var
+    -- a comma-separated ENV=name list. For a rule authored with
+    database_name="CMSUNIV_FILELAND_DEV_T", following the exact
+    DEV/QA/INT/UAT/PROD naming this project uses today:
+
+        GRE_DB_MAP_CMSUNIV_FILELAND_DEV_T=DEV=CMSUNIV_FILELAND_DEV_T,QA=CMSUNIV_FILELAND_QA_T,INT=CMSUNIV_FILELAND_INT_T,UAT=CMSUNIV_FILELAND_T,PROD=CMSUNIV_FILELAND_T
+
+    With GRE_ENVIRONMENT=QA, that rule's database_name resolves to
+    CMSUNIV_FILELAND_QA_T at load time -- the SAME gre_rules row, promoted
+    completely unchanged, always finds its data in whichever environment
+    this process is running as. See dev.env.example for a filled-in
+    example and README.md's "Environments" section for the full
+    promotion workflow. Every rule authored against the same source
+    system shares one mapping -- this is set once per (source system,
+    deployment) pair, not per rule.
+
+    No mapping configured for this authored_name -- the common case for a
+    project that hasn't set this up yet, or a table whose name genuinely
+    never varies by environment -- returns authored_name UNCHANGED, so a
+    rule with no mapping configured behaves exactly as it always has. This
+    never touches gre_rules itself: the underlying table keeps whatever
+    name was originally authored; re-pointing an environment is purely an
+    env var change, never a data migration.
+
+    Applies equally to build_source_tieback_sql()'s generated SQL (see
+    rules_engine/executor.py) -- that function reads database_name off
+    the SAME already-resolved rule dict load_rules() returns, so the
+    tieback SQL it hands an analyst always references the correct
+    environment's table without any change needed in executor.py itself.
+    """
+    if not authored_name:
+        return authored_name
+    env_var = f"GRE_DB_MAP_{authored_name.upper()}"
+    mapping_str = os.getenv(env_var)
+    if not mapping_str:
+        return authored_name
+
+    mapping = {}
+    for pair in mapping_str.split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        env_key, db_name = pair.split("=", 1)
+        mapping[env_key.strip().upper()] = db_name.strip()
+
+    resolved = mapping.get(GRE_ENVIRONMENT)
+    if resolved:
+        return resolved
+    logger.warning(
+        "resolve_database_name: %s has no entry for GRE_ENVIRONMENT=%s -- "
+        "using authored value %r unchanged.",
+        env_var, GRE_ENVIRONMENT, authored_name,
+    )
+    return authored_name
 
 
 # ── Parallel rule execution (opt-in; see rules_engine/parallel.py) ────────

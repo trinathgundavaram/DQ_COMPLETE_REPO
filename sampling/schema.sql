@@ -9,7 +9,15 @@
 -- dq_sampling_config config_id=1 (COMO weekly UM sample) re-expressed in
 -- this shape, proving the redesign reproduces it.
 --
--- Schema : CMSUNIV_FILELAND_DEV_T  (DEV)  -- same metadata store as dq_*
+-- Schema : {{META_DB}}  -- a PLACEHOLDER, not a literal schema name. This
+--          file is a template: sampling/deploy_schema.py substitutes
+--          {{META_DB}} with sampling/config.py's get_meta_db() resolution
+--          (GRE_META_DB env var, defaulting to {{META_DB}} for
+--          local/dev) before ever sending this to Teradata. Promoting
+--          this file DEV -> QA -> INT -> UAT -> PROD is just re-running
+--          deploy_schema.py with GRE_META_DB set to that environment's
+--          value -- never a hand-edit of this file. See README.md's
+--          "Environments" section.
 -- DB     : Teradata  (metadata store)
 -- ============================================================
 -- This package is fully standalone -- no other schema.sql needs to run
@@ -26,7 +34,7 @@
 -- ============================================================
 
 -- ── 1. gre_sampling_config -- one row per sampling definition ─────────────
-CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_config (
+CREATE MULTISET TABLE {{META_DB}}.gre_sampling_config (
     config_id            INTEGER NOT NULL,
     project_name         VARCHAR(100) NOT NULL,
     process_name         VARCHAR(100) NOT NULL,
@@ -77,7 +85,7 @@ PRIMARY INDEX (config_id);
 -- functional_area_column) with however many levels a project needs. Zero
 -- rows for a config = no stratification -- straight to select() on the
 -- whole candidate pool.
-CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_strata (
+CREATE MULTISET TABLE {{META_DB}}.gre_sampling_strata (
     strata_id            INTEGER NOT NULL,
     config_id            INTEGER NOT NULL,
     level_order           INTEGER NOT NULL,        -- recursion order, 0-based
@@ -89,7 +97,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_strata (
 PRIMARY INDEX (strata_id);
 
 CREATE INDEX gre_sampling_strata_config_ix (config_id, level_order)
-ON CMSUNIV_FILELAND_DEV_T.gre_sampling_strata;
+ON {{META_DB}}.gre_sampling_strata;
 
 
 -- ── 3. gre_sampling_mix -- one row per named bucket value, per level ─────
@@ -97,7 +105,7 @@ ON CMSUNIV_FILELAND_DEV_T.gre_sampling_strata;
 -- the data but NOT listed here for that level absorbs the remainder
 -- fraction (1 - sum(named fractions)) -- same rule as the proven dq_*
 -- pattern (core/stratified_sampling.py::_target_for_bucket), just as rows.
-CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_mix (
+CREATE MULTISET TABLE {{META_DB}}.gre_sampling_mix (
     mix_id               INTEGER NOT NULL,
     strata_id            INTEGER NOT NULL,
     bucket_value          VARCHAR(200) NOT NULL,
@@ -106,7 +114,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_mix (
 PRIMARY INDEX (mix_id);
 
 CREATE INDEX gre_sampling_mix_strata_ix (strata_id)
-ON CMSUNIV_FILELAND_DEV_T.gre_sampling_mix;
+ON {{META_DB}}.gre_sampling_mix;
 
 
 -- ── 4. gre_sample_selections -- one row per candidate CONSIDERED ─────────
@@ -123,7 +131,7 @@ ON CMSUNIV_FILELAND_DEV_T.gre_sampling_mix;
 -- See sampling/sampling.py::_deactivate_prior_sampling_runs() -- prior
 -- sample_run_id's are found via gre_sampling_audit (sample_config_id,
 -- run_key), since run_key isn't stored directly here.
-CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selections (
+CREATE MULTISET TABLE {{META_DB}}.gre_sample_selections (
     sample_run_id         VARCHAR(200) NOT NULL,
     config_id             INTEGER,
     project_name          VARCHAR(100),
@@ -152,7 +160,7 @@ CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selections (
 PRIMARY INDEX (sample_run_id);
 
 CREATE INDEX gre_sample_selections_lookup_ix (project_name, process_name, sample_cycle, selected_flag)
-ON CMSUNIV_FILELAND_DEV_T.gre_sample_selections;
+ON {{META_DB}}.gre_sample_selections;
 
 
 -- ── 5. gre_sample_selection_attrs -- which bucket, at each level ─────────
@@ -164,7 +172,7 @@ ON CMSUNIV_FILELAND_DEV_T.gre_sample_selections;
 -- is already unique within one sample_run_id, so this composite is just as
 -- precise a join key. Replaces a JSON snapshot column with plain rows,
 -- same no-JSON rule as everywhere else in this schema.
-CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selection_attrs (
+CREATE MULTISET TABLE {{META_DB}}.gre_sample_selection_attrs (
     sample_run_id         VARCHAR(200) NOT NULL,
     case_key              VARCHAR(500) NOT NULL,
     strata_id             INTEGER NOT NULL,
@@ -192,7 +200,7 @@ PRIMARY INDEX (sample_run_id, case_key);
 -- gre_audit split). Now that rules_engine/ and sampling/ share no code or
 -- tables at all (see README.md's "Package separation"), this table lives
 -- here, where it's actually used.
-CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_audit (
+CREATE MULTISET TABLE {{META_DB}}.gre_sampling_audit (
     run_id                 VARCHAR(200) NOT NULL,
     run_key                   VARCHAR(100),        -- caller-supplied tracking/idempotency key
     sample_config_id          INTEGER,             -- -> gre_sampling_config
@@ -217,10 +225,10 @@ PRIMARY INDEX (run_id);
 -- count_prior_attempts() and _deactivate_prior_sampling_runs() (both in
 -- sampling/db_ops.py / sampling/sampling.py) both look this pair up every call.
 CREATE INDEX gre_sampling_audit_config_run_key_ix (sample_config_id, run_key)
-ON CMSUNIV_FILELAND_DEV_T.gre_sampling_audit;
+ON {{META_DB}}.gre_sampling_audit;
 
 CREATE INDEX gre_sampling_audit_status_ix (status)
-ON CMSUNIV_FILELAND_DEV_T.gre_sampling_audit;
+ON {{META_DB}}.gre_sampling_audit;
 
 
 -- ── 7. gre_sampling_errors -- this package's own SQL/execution failure log
@@ -237,7 +245,7 @@ ON CMSUNIV_FILELAND_DEV_T.gre_sampling_audit;
 -- inserted, mirroring gre_sample_selections' etl_is_curr_ind
 -- reconciliation. Never deletes -- full error history stays on file;
 -- only active_ind flips.
-CREATE MULTISET TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_errors (
+CREATE MULTISET TABLE {{META_DB}}.gre_sampling_errors (
     error_id         BIGINT GENERATED ALWAYS AS IDENTITY,
     run_id           VARCHAR(200),
     process_name     VARCHAR(100),         -- config's process_name, for triage -- see
@@ -258,4 +266,4 @@ PRIMARY INDEX (run_id);
 -- run_key" -- filters straight to active_ind='Y' instead of every
 -- historical error across every past run_id.
 CREATE INDEX gre_sampling_errors_run_key_active_ix (run_key, active_ind)
-ON CMSUNIV_FILELAND_DEV_T.gre_sampling_errors;
+ON {{META_DB}}.gre_sampling_errors;

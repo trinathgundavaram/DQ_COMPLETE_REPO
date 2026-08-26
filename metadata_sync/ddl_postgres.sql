@@ -53,31 +53,6 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_rules (
 CREATE INDEX IF NOT EXISTS gre_rules_group_variant_ix
     ON {{SCHEMA}}.gre_rules (rule_group, act_ind, rule_variant);
 
-CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_log (
-    log_id          BIGINT PRIMARY KEY,
-    run_id          VARCHAR(200) NOT NULL,
-    rule_id         INTEGER NOT NULL,
-    rule_group      VARCHAR(100),
-    project_name    VARCHAR(100),
-    process_name    VARCHAR(100),
-    run_key         VARCHAR(100) NOT NULL,
-    seq_no          INTEGER,
-    start_time      TIMESTAMP,
-    end_time        TIMESTAMP,
-    status          VARCHAR(20),
-    rowcount        BIGINT,
-    error_message   VARCHAR(2000),
-    active_ind      CHAR(1),
-    load_datetime   TIMESTAMP,
-    last_updated_datetime TIMESTAMP
-);
-ALTER TABLE {{SCHEMA}}.gre_log ADD COLUMN IF NOT EXISTS active_ind CHAR(1);
-ALTER TABLE {{SCHEMA}}.gre_log ADD COLUMN IF NOT EXISTS last_updated_datetime TIMESTAMP;
-CREATE INDEX IF NOT EXISTS gre_log_group_run_key_ix
-    ON {{SCHEMA}}.gre_log (rule_group, run_key, status);
-CREATE INDEX IF NOT EXISTS gre_log_rule_run_key_active_ix
-    ON {{SCHEMA}}.gre_log (rule_id, run_key, active_ind);
-
 CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_exceptions (
     record_id             BIGINT PRIMARY KEY,
     run_id                VARCHAR(200),
@@ -111,13 +86,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS gre_exceptions_uix
 CREATE INDEX IF NOT EXISTS gre_exceptions_src_key_value_ix
     ON {{SCHEMA}}.gre_exceptions (src_key_value);
 
+-- Consolidates the old gre_log (removed) -- one row per rule PER
+-- EXECUTION ATTEMPT (run_id), not per rule_id+run_key, with active_ind
+-- marking the current attempt for a given (rule_id, run_key). See
+-- rules_engine/schema.sql's "gre_results" section for the full
+-- rationale.
 CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_results (
     result_id                BIGINT PRIMARY KEY,
-    rule_id                  INTEGER NOT NULL,
-    run_key                  VARCHAR(100) NOT NULL,
     run_id                   VARCHAR(200) NOT NULL,
+    rule_id                  INTEGER NOT NULL,
+    rule_group               VARCHAR(100),
     project_name             VARCHAR(100),
     process_name             VARCHAR(100),
+    run_key                  VARCHAR(100) NOT NULL,
+    seq_no                   INTEGER,
+    start_time               TIMESTAMP,
+    end_time                 TIMESTAMP,
     total_records            BIGINT,
     failed_records           BIGINT,
     failure_pct              DOUBLE PRECISION,
@@ -126,14 +110,16 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_results (
     threshold_operator_used  CHAR(3),
     severity                 VARCHAR(50),
     status                   VARCHAR(10),
+    error_message            VARCHAR(2000),
     source_tieback_sql       TEXT,
     active_ind               CHAR(1),
-    evaluated_at             TIMESTAMP
+    load_datetime            TIMESTAMP,
+    last_updated_datetime    TIMESTAMP
 );
-ALTER TABLE {{SCHEMA}}.gre_results ADD COLUMN IF NOT EXISTS source_tieback_sql TEXT;
-ALTER TABLE {{SCHEMA}}.gre_results ADD COLUMN IF NOT EXISTS active_ind CHAR(1);
-CREATE UNIQUE INDEX IF NOT EXISTS gre_results_uix
-    ON {{SCHEMA}}.gre_results (rule_id, run_key);
+CREATE INDEX IF NOT EXISTS gre_results_group_run_key_ix
+    ON {{SCHEMA}}.gre_results (rule_group, run_key, status);
+CREATE INDEX IF NOT EXISTS gre_results_rule_run_key_active_ix
+    ON {{SCHEMA}}.gre_results (rule_id, run_key, active_ind);
 
 -- gre_audit split into gre_rule_audit / gre_sampling_audit (2026-08) --
 -- mirrors the same split on the Teradata side. rules_engine/ and

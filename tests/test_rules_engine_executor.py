@@ -112,18 +112,6 @@ def _conn():
     conn.execute("CREATE UNIQUE INDEX gre_exceptions_uix ON gre_exceptions(rule_id, run_key, src_key_value)")
 
     conn.execute("""
-        CREATE TABLE gre_log (
-            log_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
-            project_name VARCHAR, process_name VARCHAR,
-            run_key VARCHAR, seq_no INTEGER, start_time TIMESTAMP, end_time TIMESTAMP,
-            status VARCHAR, rowcount BIGINT, error_message VARCHAR,
-            active_ind VARCHAR DEFAULT 'Y',
-            created_at TIMESTAMP DEFAULT current_timestamp,
-            last_updated_datetime TIMESTAMP
-        )
-    """)
-
-    conn.execute("""
         CREATE TABLE gre_rule_errors (
             error_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
             run_key VARCHAR, error_type VARCHAR, error_message VARCHAR,
@@ -133,18 +121,28 @@ def _conn():
         )
     """)
 
+    # Consolidated gre_log + gre_results -- one row per rule PER EXECUTION
+    # ATTEMPT (run_id), not per rule_id+run_key. See
+    # rules_engine/schema.sql's "gre_results" section / executor.py::
+    # _write_result()'s docstring for the full rationale.
     conn.execute("""
         CREATE TABLE gre_results (
-            result_id BIGINT, rule_id INTEGER, run_key VARCHAR, run_id VARCHAR,
-            project_name VARCHAR, process_name VARCHAR,
+            result_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
+            project_name VARCHAR, process_name VARCHAR, run_key VARCHAR, seq_no INTEGER,
+            start_time TIMESTAMP, end_time TIMESTAMP,
             total_records BIGINT, failed_records BIGINT, failure_pct DOUBLE,
             threshold_pct_used DOUBLE, threshold_count_used INTEGER,
             threshold_operator_used VARCHAR, severity VARCHAR, status VARCHAR,
-            source_tieback_sql VARCHAR, active_ind VARCHAR DEFAULT 'Y',
-            evaluated_at TIMESTAMP DEFAULT current_timestamp
+            error_message VARCHAR, source_tieback_sql VARCHAR, active_ind VARCHAR DEFAULT 'Y',
+            load_datetime TIMESTAMP DEFAULT current_timestamp,
+            last_updated_datetime TIMESTAMP
         )
     """)
-    conn.execute("CREATE UNIQUE INDEX gre_results_uix ON gre_results(rule_id, run_key)")
+    # NOT unique on (rule_id, run_key) -- a rerun keeps history, so multiple
+    # rows (one per run_id attempt) can legitimately share a rule_id+run_key,
+    # distinguished by active_ind. Mirrors schema.sql's non-unique
+    # gre_results_rule_run_key_active_ix.
+    conn.execute("CREATE INDEX gre_results_rule_run_key_active_ix ON gre_results(rule_id, run_key, active_ind)")
 
     return conn
 
@@ -262,6 +260,10 @@ def test_execute_rule_writes_exceptions_and_result():
     assert all(r["project_name"] == "HEALTHSPRING_UM" and r["process_name"] == "UNIVERSE_VALIDATION"
                for r in exceptions)
 
+    # gre_results is now the consolidated table -- one row per rule per
+    # execution attempt, carrying both the PASS/FAIL/WARN verdict AND the
+    # attempt-level bookkeeping that used to live in a separate gre_log
+    # row (project_name/process_name/failed_records do double duty here).
     results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(results) == 1
     assert results[0]["status"] == "FAIL"
@@ -270,13 +272,6 @@ def test_execute_rule_writes_exceptions_and_result():
     assert results[0]["threshold_pct_used"] == 25
     assert results[0]["project_name"] == "HEALTHSPRING_UM"
     assert results[0]["process_name"] == "UNIVERSE_VALIDATION"
-
-    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND run_key = 'B1'")
-    assert len(logs) == 1
-    assert logs[0]["status"] == "SUCCESS"
-    assert logs[0]["rowcount"] == 2
-    assert logs[0]["project_name"] == "HEALTHSPRING_UM"
-    assert logs[0]["process_name"] == "UNIVERSE_VALIDATION"
 
 
 # ── build_source_tieback_sql: generated (never executed) join SQL ────────
@@ -361,7 +356,15 @@ def test_execute_rule_writes_source_tieback_sql_onto_gre_results():
     assert "s.claim_id = STRTOK(e.src_key_value, '=', 2)" in sql
 
 
-def test_execute_rule_is_idempotent_on_rerun():
+def test_execute_rule_keeps_attempt_history_on_rerun():
+    """
+    gre_results now keeps one row per rule PER EXECUTION ATTEMPT (like the
+    retired gre_log used to), not one upserted-in-place summary row --
+    see rules_engine/executor.py::_write_result()'s docstring. gre_exceptions
+    stays idempotent (no duplicate detail rows on a rerun); gre_results
+    instead accumulates one row per run_id, with active_ind marking which
+    attempt is current.
+    """
     conn = _conn()
     rule = _rule(threshold_pct=25)
 
@@ -372,27 +375,26 @@ def test_execute_rule_is_idempotent_on_rerun():
     assert len(exceptions) == 2   # not duplicated
 
     results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
-    assert len(results) == 1      # upserted in place, not a second row
-    assert results[0]["run_id"] == "RUN2"   # reflects the latest run
-
-    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND run_key = 'B1'")
-    assert len(logs) == 2         # both attempts are logged (attempt history, unlike results)
-    by_run = {r["run_id"]: r for r in logs}
+    assert len(results) == 2      # one row per attempt, not upserted in place
+    by_run = {r["run_id"]: r for r in results}
     assert by_run["RUN1"]["active_ind"] == "N"   # superseded by the rerun
     assert by_run["RUN2"]["active_ind"] == "Y"   # the latest run_id takes precedence
+    assert by_run["RUN2"]["status"] == "FAIL"    # both attempts still carry the real data verdict
+    assert by_run["RUN1"]["status"] == "FAIL"    # -- never deleted, so the FAIL history stays on file too
 
 
-def test_execute_rule_gre_log_rowcount_matches_failed_records_on_unchanged_rerun():
+def test_execute_rule_gre_results_failed_records_matches_active_exceptions_on_unchanged_rerun():
     """
-    Regression for the gre_log.rowcount inconsistency: rowcount used to be
-    reconcile["inserted"] + reconcile["reactivated"] (rows that CHANGED
-    state this attempt), not the true violating-row count. On a rerun
-    where nothing changed (no new violations, nothing fixed), that delta
-    is 0/0 -- so gre_log reported rowcount=0 for an attempt that still had
-    genuinely-open, currently-active violations, silently disagreeing with
-    gre_results.failed_records and with a COUNT(*) against gre_exceptions
-    itself. rowcount must always equal gre_results.failed_records for the
-    same rule_id/run_id.
+    Regression for the old gre_log.rowcount inconsistency (now
+    gre_results.failed_records, the only count that exists post-
+    consolidation): it used to be reconcile["inserted"] + reconcile["reactivated"]
+    (rows that CHANGED state this attempt), not the true violating-row
+    count. On a rerun where nothing changed (no new violations, nothing
+    fixed), that delta is 0/0 -- so the old gre_log reported rowcount=0
+    for an attempt that still had genuinely-open, currently-active
+    violations, silently disagreeing with a COUNT(*) against
+    gre_exceptions itself. failed_records must always equal the actual
+    currently-active gre_exceptions count for the same rule_id/run_id.
     """
     conn = _conn()
     rule = _rule(threshold_pct=10)   # any nonzero failure_pct breaches -> gre_results row written
@@ -400,47 +402,49 @@ def test_execute_rule_gre_log_rowcount_matches_failed_records_on_unchanged_rerun
     execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     execute_rule(rule, _Adapter(conn), conn, "RUN2", "B1", {"batch_id": "B1"}, META_DB)   # nothing changed
 
-    log_run2 = execute_query(conn, "SELECT rowcount FROM gre_log WHERE rule_id = 1 AND run_id = 'RUN2'")[0]
-    result_run2 = execute_query(conn, "SELECT failed_records FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")[0]
+    result_run2 = execute_query(conn, "SELECT failed_records FROM gre_results WHERE rule_id = 1 AND run_id = 'RUN2'")[0]
     active_count = execute_query(
         conn, "SELECT COUNT(*) AS c FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1' AND etl_is_curr_ind = 'Y'",
     )[0]["c"]
 
-    assert log_run2["rowcount"] == 2          # true violating count (C1, C3), not 0
-    assert log_run2["rowcount"] == result_run2["failed_records"]   # must always agree with gre_results
-    assert log_run2["rowcount"] == active_count   # and with the actual active gre_exceptions count
+    assert result_run2["failed_records"] == 2          # true violating count (C1, C3), not 0
+    assert result_run2["failed_records"] == active_count   # must always agree with the actual active gre_exceptions count
 
 
-def test_execute_rule_deactivates_prior_log_attempts_on_rerun():
+def test_execute_rule_deactivates_prior_result_attempts_on_rerun():
     """
-    active_ind reconciliation regression for gre_log: a rerun of the same
-    run_key under a new run_id must deactivate every earlier run_id's
-    gre_log row for this (rule_id, run_key) -- including an ERROR attempt,
-    not just a SUCCESS one -- so a reader filtering active_ind='Y' always
+    active_ind reconciliation regression for gre_results (the retired
+    gre_log's equivalent behavior): a rerun of the same run_key under a
+    new run_id must deactivate every earlier run_id's gre_results row for
+    this (rule_id, run_key) -- including an ERROR attempt, not just a
+    PASS/FAIL/WARN one -- so a reader filtering active_ind='Y' always
     sees exactly the latest attempt, never a stale one left behind.
     """
     conn = _conn()
     broken_rule = _rule(rule_syntax="SELECT * FROM no_such_table WHERE batch_id = '{batch_id}'")
 
-    # RUN1: errors out (bad SQL) -- logged as ERROR, active_ind='Y'.
+    # RUN1: errors out (bad SQL) -- logged as status=ERROR, active_ind='Y'.
     status1 = execute_rule(broken_rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     assert status1 == "ERROR"
 
-    # RUN2: same run_key, rule now fixed -- succeeds.
+    # RUN2: same run_key, rule now fixed -- succeeds (verdict PASS: no
+    # threshold configured on the default _rule(), and 2/4 failing isn't
+    # a full-universe breach -- see evaluate_threshold()'s no-threshold
+    # fallback).
     fixed_rule = _rule()
     status2 = execute_rule(fixed_rule, _Adapter(conn), conn, "RUN2", "B1", {"batch_id": "B1"}, META_DB)
     assert status2 == "SUCCESS"
 
-    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1 AND run_key = 'B1'")
-    assert len(logs) == 2   # both attempts kept for history
-    by_run = {r["run_id"]: r for r in logs}
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
+    assert len(results) == 2   # both attempts kept for history
+    by_run = {r["run_id"]: r for r in results}
     assert by_run["RUN1"]["status"] == "ERROR"
-    assert by_run["RUN1"]["active_ind"] == "N"    # deactivated even though it never succeeded
-    assert by_run["RUN2"]["status"] == "SUCCESS"
+    assert by_run["RUN1"]["active_ind"] == "N"    # deactivated even though it never produced a verdict
+    assert by_run["RUN2"]["status"] == "PASS"
     assert by_run["RUN2"]["active_ind"] == "Y"
 
     active = execute_query(
-        conn, "SELECT run_id FROM gre_log WHERE rule_id = 1 AND run_key = 'B1' AND active_ind = 'Y'",
+        conn, "SELECT run_id FROM gre_results WHERE rule_id = 1 AND run_key = 'B1' AND active_ind = 'Y'",
     )
     assert {r["run_id"] for r in active} == {"RUN2"}
 
@@ -605,7 +609,14 @@ def test_execute_rule_batches_are_isolated():
     assert len(b2) == 1   # only C5 is in B2
 
 
-def test_execute_rule_no_threshold_fallback_not_written_when_partial_failure():
+def test_execute_rule_no_threshold_fallback_writes_pass_when_partial_failure():
+    # evaluate_threshold()'s no-threshold fallback only BREACHES when
+    # failed == total; a 2/4 partial failure with no threshold configured
+    # is a non-breaching PASS (write_result=False from evaluate_threshold's
+    # point of view). But gre_results now writes ONE row per attempt
+    # regardless -- preserving gre_log's old always-write behavior so
+    # attempt history/trending is never silently missing a row -- so the
+    # row IS written, just with status="PASS" rather than FAIL/WARN.
     conn = _conn()
     rule = _rule(threshold_pct=None, threshold_count=None)  # 2/4 fail, no threshold
 
@@ -616,9 +627,12 @@ def test_execute_rule_no_threshold_fallback_not_written_when_partial_failure():
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(exceptions) == 2
 
-    # ...but gre_results gets no row, since not every in-scope record failed.
+    # ...and gre_results gets one attempt-history row, verdict PASS since
+    # the no-threshold fallback only breaches on failed == total.
     results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
-    assert len(results) == 0
+    assert len(results) == 1
+    assert results[0]["status"] == "PASS"
+    assert results[0]["failed_records"] == 2
 
 
 def test_execute_rule_sql_error_routes_to_errors_and_logs():
@@ -635,8 +649,8 @@ def test_execute_rule_sql_error_routes_to_errors_and_logs():
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1")
     assert len(exceptions) == 0   # a crash never writes partial findings
 
-    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1")
-    assert len(logs) == 1 and logs[0]["status"] == "ERROR"
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1")
+    assert len(results) == 1 and results[0]["status"] == "ERROR"
 
 
 # ── big-dataset path: dedup + uncapped detail capture ─────────────────────
@@ -672,9 +686,8 @@ def test_no_max_exceptions_cap_captures_every_violating_row():
     Regression for the removal of GRE_MAX_EXCEPTIONS: gre_exceptions
     detail capture is uncapped. This seeds a source table with far more
     violating rows than the OLD default cap (10000) to prove there is no
-    ceiling left anywhere in the path -- gre_exceptions,
-    gre_results.failed_records, and gre_log.rowcount must all agree on
-    the full, true count.
+    ceiling left anywhere in the path -- gre_exceptions and
+    gre_results.failed_records must agree on the full, true count.
     """
     conn = _conn()
     n = 12000   # comfortably past the old default GRE_MAX_EXCEPTIONS=10000
@@ -697,10 +710,7 @@ def test_no_max_exceptions_cap_captures_every_violating_row():
     assert exceptions[0]["c"] == n   # every row captured -- no cap
 
     results = execute_query(conn, "SELECT failed_records FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
-    assert results[0]["failed_records"] == n
-
-    logs = execute_query(conn, "SELECT rowcount FROM gre_log WHERE rule_id = 1 AND run_key = 'B1'")
-    assert logs[0]["rowcount"] == n   # gre_log agrees with gre_results and gre_exceptions, no cap anywhere
+    assert results[0]["failed_records"] == n   # gre_results agrees with gre_exceptions, no cap anywhere
 
     # confirm the cap-related knobs are actually gone, not just unused
     assert not hasattr(rules_engine_executor, "MAX_EXCEPTIONS")
@@ -726,12 +736,12 @@ def test_execute_rule_prepare_failure_routes_to_errors_before_any_query():
     assert len(errors) == 1
     assert errors[0]["error_type"] == "SOURCE_PREPARE_ERROR"
 
-    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1")
-    assert len(logs) == 1 and logs[0]["status"] == "ERROR"
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1")
+    assert len(results) == 1 and results[0]["status"] == "ERROR"
 
-    # Caught before ANY query ran -- nothing written to gre_exceptions/gre_results.
+    # Caught before ANY query ran -- nothing written to gre_exceptions, and
+    # the one gre_results row above is the ERROR attempt marker, not a verdict.
     assert execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1") == []
-    assert execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1") == []
 
 
 def test_execute_rule_calls_prepare_before_scanning():
@@ -913,11 +923,10 @@ def test_execute_rule_unresolved_token_fails_fast_before_any_query():
     assert errors[0]["error_type"] == "PARAM_SUBSTITUTION_ERROR"
     assert "run_type" in errors[0]["error_message"]
 
-    logs = execute_query(conn, "SELECT * FROM gre_log WHERE rule_id = 1")
-    assert len(logs) == 1 and logs[0]["status"] == "ERROR"
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1")
+    assert len(results) == 1 and results[0]["status"] == "ERROR"
 
     assert execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1") == []
-    assert execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1") == []
 
 
 # ── run_key genericity: no "batch_id" concept required ───────────────────
@@ -944,10 +953,7 @@ def test_execute_rule_with_year_month_run_key_not_batch_id():
     assert len(exceptions) == 3   # C1, C3, C5 -- no batch_id filter in rule_syntax this time
 
     results = execute_query(conn, f"SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = '{run_key}'")
-    assert len(results) == 1
-
-    logs = execute_query(conn, f"SELECT * FROM gre_log WHERE rule_id = 1 AND run_key = '{run_key}'")
-    assert len(logs) == 1 and logs[0]["status"] == "SUCCESS"
+    assert len(results) == 1 and results[0]["status"] in ("PASS", "FAIL", "WARN")
 
 
 # ── descriptive/reporting columns: rule_nm/dgr_nbr/universe_version, ───

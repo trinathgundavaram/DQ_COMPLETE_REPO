@@ -10,8 +10,8 @@ upserts a `gre_results` verdict row.
 ## Tracking a run: `run_key`
 
 `run_key` is an opaque, caller-supplied string -- the ONE tracking/
-idempotency identifier `gre_log`, `gre_exceptions` (`gre_exceptions_uix`),
-`gre_results` (`gre_results_uix`), and `gre_rule_audit` all key off. There's no
+idempotency identifier `gre_exceptions` (`gre_exceptions_uix`),
+`gre_results`, and `gre_rule_audit` all key off. There's no
 fixed shape to it: a plain batch id, a year+month combo, a specific date,
 a region, or any combination all work equally well. `rules_engine/db_ops.py`'s
 `build_run_key(*parts, delimiter="_")` is a convenience formatter
@@ -23,7 +23,7 @@ a region, or any combination all work equally well. `rules_engine/db_ops.py`'s
 date. `run_id` says WHICH SPECIFIC ATTEMPT at it this is: `run_rule_group()`
 mints a brand new `run_id` every time it's called, even when called again
 with the exact same `run_key` (a deliberate rerun, or a resumed run after a
-crash). Every row `gre_log`, `gre_exceptions`, `gre_results`, `gre_rule_errors`,
+crash). Every row `gre_exceptions`, `gre_results`, `gre_rule_errors`,
 and `gre_rule_audit` write for one call all carry that same `run_id`.
 
 `run_id` is built by `rules_engine/runner.py::_build_group_run_id()` on top
@@ -42,7 +42,7 @@ rules have no `project_name` set -- the id then starts straight from
 
 - `{project_name}.{rule_group}` says which business process this run
   belongs to, not just which rule_group -- readable at a glance in
-  `gre_log`/`gre_exceptions`/a log line without a join back to `gre_rules`.
+  `gre_results`/`gre_exceptions`/a log line without a join back to `gre_rules`.
 - `run_key` right after it means a human can tell what ran and for which
   batch/period together, in one look.
 - `attempt-{N}` (`N` = `count_prior_attempts()` + 1, counted from
@@ -57,8 +57,8 @@ rules have no `project_name` set -- the id then starts straight from
 - `triggered_by` -- who/what kicked this off (a login, a scheduler name,
   or `"SYSTEM"` for the default/unattended case) -- is already collected
   as a `run_rule_group()` parameter and recorded on `gre_rule_audit`; folding it
-  into the id too makes it visible on `gre_log`/`gre_exceptions`/
-  `gre_results` rows as well, which don't otherwise carry it.
+  into the id too makes it visible on `gre_exceptions`/`gre_results`
+  rows as well, which don't otherwise carry it.
 - `::` separates the parts because `rule_group`/`run_key`/`triggered_by`
   often already contain `_` or `-` themselves; nothing in this codebase
   parses a run_id back apart, so this is purely for readability, not
@@ -190,7 +190,7 @@ column `load_rules()` filters on. `run_rule_group()` reads them off the
 loaded rules (lowest `seq_no` wins if a group's rows disagree with
 themselves -- logged as a warning, same pattern as its `sequencing_mode`
 consistency check) and stamps them onto `gre_rule_audit` for the run; every
-`gre_log`/`gre_exceptions`/`gre_results` row carries its own rule's
+`gre_exceptions`/`gre_results` row carries its own rule's
 `project_name`/`process_name` too, so any of those tables can be sliced or
 joined by project without a round trip back to `gre_rules`.
 
@@ -294,11 +294,11 @@ in `rules_engine/` imports from `sampling/`, or vice versa.
 | File | What |
 |---|---|
 | `rules.py` | `load_rules()` -- loads active `gre_rules` rows for a rule_group (+ optional `rule_variant` filter), ordered by `seq_no`. |
-| `executor.py` | `execute_rule()` -- runs one rule end-to-end: source prepare (`db_conn.prepare(rule)`), `run_params` substitution, single-scan evaluation (`_scan_violations`), threshold evaluation, `gre_exceptions`/`gre_results`/`gre_log` writes. |
+| `executor.py` | `execute_rule()` -- runs one rule end-to-end: source prepare (`db_conn.prepare(rule)`), `run_params` substitution, single-scan evaluation (`_scan_violations`), threshold evaluation, `gre_exceptions`/`gre_results` writes. |
 | `runner.py` | `run_rule_group()` -- orchestration entry point: readiness gate, checkpoint/resume, sequencing_mode-aware loop over `execute_rule()`, `gre_rule_audit` start/finish. `discover_rule_groups()`/`run_all_active_groups()` -- multi-group fan-out by project/process (see "Running multiple projects/processes" above). Also the opt-in parallel path (`_run_pending_parallel()`) -- see "Parallel rule execution" below. |
 | `parallel.py` | `ConnectionPool`/`build_pools()`/`close_pools()` -- the bounded per-connection connection pooling the parallel path uses instead of the single shared `cf.get()` connection. |
 | `reporting.py` | `get_breaches()` / `get_records_for_result()` -- thin read-only queries against `gre_results`/`gre_exceptions`. `get_source_records_for_rule()` -- ties `gre_exceptions` back to the live source record (see "Tying exceptions back to source records" below). |
-| `schema.sql` | `gre_rules` (incl. `project_name`/`process_name`), `gre_log`, `gre_exceptions`, `gre_results`, `gre_rule_audit`, `gre_rule_errors`. Fully standalone -- no other package's `schema.sql` needs to run first. |
+| `schema.sql` | `gre_rules` (incl. `project_name`/`process_name`), `gre_exceptions`, `gre_results` (one row per rule per execution attempt), `gre_rule_audit`, `gre_rule_errors`. Fully standalone -- no other package's `schema.sql` needs to run first. |
 | `schema_drop.sql` | Drops the 6 tables above, for the drop-and-recreate redeploy policy (see the repo root README). |
 
 ## Parallel rule execution (opt-in)
@@ -341,8 +341,8 @@ capped by `GRE_MAX_PARALLEL_RULES` too, so a pool is never sized larger
 than the group could ever use concurrently -- and hands them out through
 a blocking queue, whose `get()` is what actually enforces the
 per-connection cap. This applies to the metadata connection too: every worker gets its
-own pooled connection for writing to `gre_exceptions`/`gre_results`/
-`gre_log`, not the single connection the top-level run uses for
+own pooled connection for writing to `gre_exceptions`/`gre_results`,
+not the single connection the top-level run uses for
 `gre_rule_audit` bookkeeping. Every pooled connection is closed once the group
 finishes, win or lose.
 

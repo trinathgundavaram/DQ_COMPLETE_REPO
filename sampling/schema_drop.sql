@@ -12,7 +12,7 @@
 -- script is destructive and will discard everything in these 7 tables.
 --
 -- Usage: run this, then re-run schema.sql. Does NOT touch rules_engine/'s
--- gre_rules/gre_log/gre_exceptions/gre_results/gre_rule_audit/
+-- gre_rules/gre_exceptions/gre_results/gre_rule_audit/
 -- gre_rule_errors -- see that package's own schema_drop.sql for those
 -- (the two packages share nothing -- see README.md's "Package
 -- separation").
@@ -29,10 +29,10 @@
 -- errored.
 -- ============================================================
 
-DROP TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selection_attrs;
-DROP TABLE CMSUNIV_FILELAND_DEV_T.gre_sample_selections;
-DROP TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_mix;
-DROP TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_strata;
-DROP TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_config;
-DROP TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_audit;
-DROP TABLE CMSUNIV_FILELAND_DEV_T.gre_sampling_errors;
+DROP TABLE {{META_DB}}.gre_sample_selection_attrs;
+DROP TABLE {{META_DB}}.gre_sample_selections;
+DROP TABLE {{META_DB}}.gre_sampling_mix;
+DROP TABLE {{META_DB}}.gre_sampling_strata;
+DROP TABLE {{META_DB}}.gre_sampling_config;
+DROP TABLE {{META_DB}}.gre_sampling_audit;
+DROP TABLE {{META_DB}}.gre_sampling_errors;
