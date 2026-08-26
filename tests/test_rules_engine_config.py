@@ -162,3 +162,72 @@ def test_check_run_ready_uses_registered_check():
         assert calls == [("ready_run", None), ("other_run", None)]
     finally:
         shared_config._READINESS_CHECKS.pop("my_group", None)
+
+
+# ── resolve_database_name(): $env/$ENV token + legacy GRE_DB_MAP_ override ──
+
+def test_resolve_database_name_no_token_no_mapping_returns_unchanged(monkeypatch, reload_config):
+    reload_config()
+    assert shared_config.resolve_database_name("STATIC_LOOKUP_T") == "STATIC_LOOKUP_T"
+
+
+def test_resolve_database_name_empty_input_returns_unchanged(reload_config):
+    reload_config()
+    assert shared_config.resolve_database_name("") is None or shared_config.resolve_database_name("") == ""
+    assert shared_config.resolve_database_name(None) is None
+
+
+@pytest.mark.parametrize("environment,expected", [
+    ("DEV", "QNXT_core_dev_T"),
+    ("QA", "QNXT_core_qa_T"),
+    ("INT", "QNXT_core_int_T"),
+    ("UAT", "QNXT_core_T"),     # no environment segment -- collapses cleanly
+    ("PROD", "QNXT_core_T"),    # shares UAT's physical database
+])
+def test_resolve_database_name_lowercase_env_token(monkeypatch, reload_config, environment, expected):
+    monkeypatch.setenv("GRE_ENVIRONMENT", environment)
+    reload_config()
+    assert shared_config.resolve_database_name("QNXT_core_$env_T") == expected
+
+
+@pytest.mark.parametrize("environment,expected", [
+    ("DEV", "CMSUNIV_FILELAND_DEV_T"),
+    ("QA", "CMSUNIV_FILELAND_QA_T"),
+    ("INT", "CMSUNIV_FILELAND_INT_T"),
+    ("UAT", "CMSUNIV_FILELAND_T"),
+    ("PROD", "CMSUNIV_FILELAND_T"),
+])
+def test_resolve_database_name_uppercase_env_token(monkeypatch, reload_config, environment, expected):
+    monkeypatch.setenv("GRE_ENVIRONMENT", environment)
+    reload_config()
+    assert shared_config.resolve_database_name("CMSUNIV_FILELAND_$ENV_T") == expected
+
+
+def test_resolve_database_name_env_value_override_wins_for_one_environment(monkeypatch, reload_config):
+    # A source system whose UAT copy DOES carry a suffix, unlike every
+    # other database that collapses UAT by default -- overridden without
+    # touching any other environment's default.
+    monkeypatch.setenv("GRE_ENVIRONMENT", "UAT")
+    monkeypatch.setenv("GRE_ENV_VALUE_UAT", "uat")
+    reload_config()
+    assert shared_config.resolve_database_name("QNXT_core_$env_T") == "QNXT_core_uat_T"
+
+
+def test_resolve_database_name_legacy_db_map_takes_priority_over_token(monkeypatch, reload_config):
+    # A database that happens to contain "$env" in its authored name AND
+    # has an explicit GRE_DB_MAP_ entry -- the legacy override wins.
+    monkeypatch.setenv("GRE_ENVIRONMENT", "QA")
+    monkeypatch.setenv("GRE_DB_MAP_LEGACYDB", "DEV=LEGACYDB_DEV,QA=LEGACYDB_QA")
+    reload_config()
+    assert shared_config.resolve_database_name("legacydb") == "LEGACYDB_QA"
+
+
+def test_resolve_database_name_legacy_db_map_falls_through_to_token_when_env_missing(monkeypatch, reload_config, caplog):
+    # GRE_DB_MAP_ is set but has no entry for the current environment --
+    # falls through to $env/$ENV token substitution instead of returning
+    # the authored name with an unresolved token still in it.
+    monkeypatch.setenv("GRE_ENVIRONMENT", "PROD")
+    monkeypatch.setenv("GRE_DB_MAP_QNXT_CORE_$ENV_T", "DEV=SOMETHING_ELSE")
+    reload_config()
+    with caplog.at_level(logging.WARNING):
+        assert shared_config.resolve_database_name("QNXT_core_$env_T") == "QNXT_core_T"

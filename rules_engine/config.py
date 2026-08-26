@@ -59,6 +59,7 @@ edit made twice -- accepted cost of full separation over a shared module.
 
 import logging
 import os
+import re
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable, Dict
@@ -188,65 +189,119 @@ def get_environment() -> str:
     return GRE_ENVIRONMENT
 
 
+# Default $env/$ENV token value per environment -- matches the naming
+# convention this project's source systems actually use (DEV/QA/INT get an
+# environment suffix, UAT/PROD collapse to the base name with none at all,
+# UAT and PROD sharing one physical database). Override any single entry
+# with GRE_ENV_VALUE_<ENVIRONMENT> without touching the others -- e.g. a
+# source system whose UAT copy DOES carry a "_UAT" suffix can set
+# GRE_ENV_VALUE_UAT=uat while every other database still collapses UAT by
+# default.
+_DEFAULT_ENV_TOKEN_VALUES = {"DEV": "dev", "QA": "qa", "INT": "int", "UAT": "", "PROD": ""}
+
+
+def _env_token_value() -> str:
+    """The lowercase string $env substitutes with for get_environment().
+    GRE_ENV_VALUE_<ENVIRONMENT> overrides the built-in default below for one
+    environment at a time; unset falls back to _DEFAULT_ENV_TOKEN_VALUES,
+    and an environment not in that table at all falls back to its own
+    lowercased name."""
+    override = os.getenv(f"GRE_ENV_VALUE_{GRE_ENVIRONMENT}")
+    if override is not None:
+        return override
+    return _DEFAULT_ENV_TOKEN_VALUES.get(GRE_ENVIRONMENT, GRE_ENVIRONMENT.lower())
+
+
 def resolve_database_name(authored_name: str) -> str:
     """
     Resolve gre_rules.database_name (as AUTHORED, almost always in DEV) to
     the PHYSICAL database this environment (get_environment(): DEV | QA |
-    INT | UAT | PROD) actually has that data in.
+    INT | UAT | PROD) actually has that data in. Two mechanisms, tried in
+    order -- pick whichever fits a given source database:
 
-    Configured per authored name via a GRE_DB_MAP_<AUTHORED_NAME> env var
-    -- a comma-separated ENV=name list. For a rule authored with
-    database_name="CMSUNIV_FILELAND_DEV_T", following the exact
-    DEV/QA/INT/UAT/PROD naming this project uses today:
+    1. $env / $ENV TOKEN (recommended -- scales to any number of source
+       databases with ZERO per-database config). Author database_name with
+       a literal "$env" (lowercase) or "$ENV" (uppercase) placeholder
+       wherever the environment segment goes, e.g.:
 
-        GRE_DB_MAP_CMSUNIV_FILELAND_DEV_T=DEV=CMSUNIV_FILELAND_DEV_T,QA=CMSUNIV_FILELAND_QA_T,INT=CMSUNIV_FILELAND_INT_T,UAT=CMSUNIV_FILELAND_T,PROD=CMSUNIV_FILELAND_T
+           database_name = "QNXT_core_$env_T"
 
-    With GRE_ENVIRONMENT=QA, that rule's database_name resolves to
-    CMSUNIV_FILELAND_QA_T at load time -- the SAME gre_rules row, promoted
-    completely unchanged, always finds its data in whichever environment
-    this process is running as. See dev.env.example for a filled-in
-    example and README.md's "Environments" section for the full
-    promotion workflow. Every rule authored against the same source
-    system shares one mapping -- this is set once per (source system,
-    deployment) pair, not per rule.
+       At load time this becomes "QNXT_core_dev_T" in DEV,
+       "QNXT_core_qa_T" in QA, "QNXT_core_int_T" in INT, and
+       "QNXT_core_T" in UAT/PROD -- the literal underscore on either side
+       of the token collapses automatically (see the re.sub below) when
+       the environment's value is empty, so UAT/PROD never end up with a
+       stray "QNXT_core__T" double underscore. The per-environment value
+       substituted in comes from _env_token_value() above -- one small,
+       GLOBAL set of at most 5 env vars (GRE_ENV_VALUE_DEV, _QA, _INT,
+       _UAT, _PROD) shared by every database that uses the token, not one
+       env var per database. Every rule authored against ANY source
+       system can use this same "$env"/"$ENV" token, since the SAME
+       environment values apply everywhere by default.
 
-    No mapping configured for this authored_name -- the common case for a
-    project that hasn't set this up yet, or a table whose name genuinely
-    never varies by environment -- returns authored_name UNCHANGED, so a
-    rule with no mapping configured behaves exactly as it always has. This
-    never touches gre_rules itself: the underlying table keeps whatever
-    name was originally authored; re-pointing an environment is purely an
-    env var change, never a data migration.
+    2. GRE_DB_MAP_<AUTHORED_NAME> (legacy / exception override -- one env
+       var per database, checked FIRST and taking priority over the token
+       above whenever it's set). Still here for the rare source database
+       whose per-environment names don't follow any consistent pattern at
+       all. A comma-separated ENV=name list, e.g. for a rule authored with
+       database_name="CMSUNIV_FILELAND_DEV_T":
+
+           GRE_DB_MAP_CMSUNIV_FILELAND_DEV_T=DEV=CMSUNIV_FILELAND_DEV_T,QA=CMSUNIV_FILELAND_QA_T,INT=CMSUNIV_FILELAND_INT_T,UAT=CMSUNIV_FILELAND_T,PROD=CMSUNIV_FILELAND_T
+
+       With GRE_ENVIRONMENT=QA, that rule's database_name resolves to
+       CMSUNIV_FILELAND_QA_T at load time. This is exactly what the $env
+       token above replaces for any database being newly onboarded --
+       author it as "CMSUNIV_FILELAND_$env_T" instead and drop the
+       GRE_DB_MAP_ line entirely; existing GRE_DB_MAP_ entries keep working
+       unchanged so nothing already configured this way needs to move.
+
+    Neither a $env/$ENV token nor a GRE_DB_MAP_ entry -- the common case
+    for a table whose name genuinely never varies by environment -- returns
+    authored_name UNCHANGED, so a rule with nothing configured behaves
+    exactly as it always has. This never touches gre_rules itself: the
+    underlying table keeps whatever name was originally authored;
+    re-pointing an environment is purely an env var change, never a data
+    migration.
 
     Applies equally to build_source_tieback_sql()'s generated SQL (see
-    rules_engine/executor.py) -- that function reads database_name off
-    the SAME already-resolved rule dict load_rules() returns, so the
-    tieback SQL it hands an analyst always references the correct
-    environment's table without any change needed in executor.py itself.
+    rules_engine/executor.py) -- that function reads database_name off the
+    SAME already-resolved rule dict load_rules() returns, so the tieback
+    SQL it hands an analyst always references the correct environment's
+    table without any change needed in executor.py itself.
     """
     if not authored_name:
         return authored_name
+
+    # 1. Legacy/exception per-database override -- takes priority when present.
     env_var = f"GRE_DB_MAP_{authored_name.upper()}"
     mapping_str = os.getenv(env_var)
-    if not mapping_str:
-        return authored_name
+    if mapping_str:
+        mapping = {}
+        for pair in mapping_str.split(","):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            env_key, db_name = pair.split("=", 1)
+            mapping[env_key.strip().upper()] = db_name.strip()
+        resolved = mapping.get(GRE_ENVIRONMENT)
+        if resolved:
+            return resolved
+        logger.warning(
+            "resolve_database_name: %s has no entry for GRE_ENVIRONMENT=%s -- "
+            "falling through to $env/$ENV token substitution (if present).",
+            env_var, GRE_ENVIRONMENT,
+        )
 
-    mapping = {}
-    for pair in mapping_str.split(","):
-        pair = pair.strip()
-        if not pair or "=" not in pair:
-            continue
-        env_key, db_name = pair.split("=", 1)
-        mapping[env_key.strip().upper()] = db_name.strip()
+    # 2. $env / $ENV token substitution -- the scalable default.
+    if "$env" in authored_name or "$ENV" in authored_name:
+        lower_val = _env_token_value()
+        upper_val = lower_val.upper()
+        resolved = authored_name.replace("$env", lower_val).replace("$ENV", upper_val)
+        # Collapse the double underscore left behind when an environment's
+        # value is empty (UAT/PROD by default) -- "QNXT_core__T" -> "QNXT_core_T".
+        return re.sub(r"_{2,}", "_", resolved)
 
-    resolved = mapping.get(GRE_ENVIRONMENT)
-    if resolved:
-        return resolved
-    logger.warning(
-        "resolve_database_name: %s has no entry for GRE_ENVIRONMENT=%s -- "
-        "using authored value %r unchanged.",
-        env_var, GRE_ENVIRONMENT, authored_name,
-    )
+    # 3. No override, no token -- environment-invariant name, unchanged.
     return authored_name
 
 
