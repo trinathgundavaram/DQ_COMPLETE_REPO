@@ -19,7 +19,7 @@ import pytest
 
 import rules_engine.executor as rules_engine_executor
 from rules_engine.executor import (
-    evaluate_threshold, build_src_key,
+    evaluate_threshold, build_src_key, split_src_key_cols,
     execute_rule, _compute_total, _scan_violations,
     build_source_tieback_sql,
 )
@@ -863,6 +863,85 @@ def test_scan_violations_issues_exactly_one_query():
     failed, rows = _scan_violations(wrapped, query)
     assert failed == 2
     assert wrapped.cursor_calls == 1   # ONE execution -- not a separate COUNT query plus a fetch query
+
+
+# ── src_key_cols memory projection ────────────────────────────────────────
+# _write_exceptions() (the only consumer of _scan_violations()'s rows) only
+# ever touches a row through build_src_key(rule, row), which only reads
+# src_key_cols -- so a wide rule_syntax can retain just those columns
+# instead of every SELECTed column, without changing correctness.
+
+def test_scan_violations_projects_to_src_key_cols_when_given():
+    conn = _conn()
+    # denial_reason is SELECTed but NOT part of src_key_cols -- it must be
+    # dropped from what's retained, proving the projection actually
+    # narrows the row instead of just being accepted and ignored.
+    query = "SELECT claim_id, denial_reason FROM claims WHERE denial_reason IS NULL AND batch_id = 'B1'"
+    failed, rows = _scan_violations(conn, query, src_key_cols=["claim_id"])
+    assert failed == 2
+    assert len(rows) == 2
+    for row in rows:
+        assert set(row.keys()) == {"claim_id"}   # denial_reason projected away
+    assert {r["claim_id"] for r in rows} == {"C1", "C3"}
+
+
+def test_scan_violations_projection_result_still_builds_correct_src_key():
+    # The whole point: a projected row must still produce the IDENTICAL
+    # build_src_key() output a full row would -- _write_exceptions()'s
+    # dedup/insert/reconcile logic depends entirely on that string.
+    conn = _conn()
+    query = "SELECT claim_id, denial_reason FROM claims WHERE denial_reason IS NULL AND batch_id = 'B1'"
+    rule = _rule(src_key_cols="claim_id")
+
+    _, full_rows = _scan_violations(conn, query, src_key_cols=None)
+    _, projected_rows = _scan_violations(conn, query, src_key_cols=split_src_key_cols(rule))
+
+    full_keys = sorted(build_src_key(rule, r) for r in full_rows)
+    projected_keys = sorted(build_src_key(rule, r) for r in projected_rows)
+    assert full_keys == projected_keys == ["claim_id=C1", "claim_id=C3"]
+
+
+def test_scan_violations_no_src_key_cols_keeps_full_row_unchanged():
+    # None (the default) preserves the OLD full-row behavior exactly --
+    # a caller that doesn't pass src_key_cols is unaffected.
+    conn = _conn()
+    query = "SELECT claim_id, denial_reason FROM claims WHERE denial_reason IS NULL AND batch_id = 'B1'"
+    failed, rows = _scan_violations(conn, query)
+    assert failed == 2
+    for row in rows:
+        assert set(row.keys()) == {"claim_id", "denial_reason"}
+
+
+def test_scan_violations_src_key_cols_not_in_result_falls_back_to_full_row():
+    # A misconfigured src_key_cols (naming a column rule_syntax doesn't
+    # SELECT at all) matches nothing -- key_idx ends up empty, so every
+    # row is kept in full, same as the no-projection case. This preserves
+    # _write_exceptions()'s existing "src_key_cols column not found" error
+    # behavior unchanged (the column is equally absent from a full row).
+    conn = _conn()
+    query = "SELECT claim_id, denial_reason FROM claims WHERE denial_reason IS NULL AND batch_id = 'B1'"
+    failed, rows = _scan_violations(conn, query, src_key_cols=["nonexistent_column"])
+    assert failed == 2
+    for row in rows:
+        assert set(row.keys()) == {"claim_id", "denial_reason"}
+
+
+def test_execute_rule_scans_with_src_key_cols_projection_end_to_end():
+    # execute_rule() itself must actually pass src_key_cols through --
+    # this is a regression guard for the STEP 1 call site, not just the
+    # _scan_violations() unit above.
+    conn = _conn()
+    rule = _rule(
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+                    "WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
+        src_key_cols="claim_id",
+        threshold_pct=25,
+    )
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    assert status == "SUCCESS"
+
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
+    assert {e["src_key_value"] for e in exceptions} == {"claim_id=C1", "claim_id=C3"}
 
 
 def test_execute_rule_issues_two_source_queries_not_three():

@@ -25,7 +25,7 @@ that module hardcodes exactly two stratification levels
 Built on this package's own db_ops.py + config.py
 -----------------------------------------------------
 The low-level DB helpers (execute_query/execute_dml/bulk_insert,
-_run_source_query, _substitute_params, build_run_key) and the
+_substitute_params, build_run_key) and the
 gre_sampling_errors writer (log_error) come from sampling/db_ops.py --
 this package's own copy of what used to be shared/db_ops.py, before
 rules_engine/ and sampling/ were split into fully independent packages
@@ -81,8 +81,9 @@ from datetime import datetime
 
 from sampling.db_ops import (
     execute_query, execute_dml, bulk_insert, log_error,
-    _run_source_query, _substitute_params, generate_run_id, count_prior_attempts,
+    _substitute_params, generate_run_id, count_prior_attempts,
     default_run_key as _default_run_key,
+    EXCEPTION_CHUNK,
 )
 
 # gre_sampling_audit -- sampling's OWN run-tracking table (sampling/
@@ -303,6 +304,53 @@ def _key_columns(config: dict) -> list:
     return [c.strip() for c in config["key_columns"].split(",") if c.strip()]
 
 
+def _stream_candidate_query(db_conn, query: str) -> list:
+    """
+    Run the candidate-pull query ONCE, streamed via fetchmany()
+    (EXCEPTION_CHUNK-sized batches) into the returned list, instead of one
+    unbounded fetchall() -- same rationale/pattern as rules_engine/
+    executor.py::_scan_violations() for its rule_syntax scan: avoids a
+    single huge network round-trip / driver-side buffer for a candidate
+    universe with a large row count, bounding the driver's in-flight
+    buffer to EXCEPTION_CHUNK rows at a time regardless of how large the
+    universe is.
+
+    This does NOT reduce the SIZE of what's ultimately held in `candidates`
+    -- stratification/ranking below needs the complete candidate set in
+    memory either way (target_volume is a share of each stratum's size,
+    which isn't known until every candidate is seen) -- it only smooths
+    out how that memory gets acquired. `_pull_candidates()`'s own SELECT
+    list is already narrow (key_columns + strata expressions + the rank
+    column only, never every universe_table column), which is the bigger
+    lever for a wide universe_table -- see this module's "Performance at
+    scale" notes in the README for the full picture (scope_sql/
+    exclusion_sql narrowing the row COUNT, this narrowing the row WIDTH).
+
+    Deliberately NOT wrapped in sampling/db_ops.py's @_source_retry (same
+    reasoning as _scan_violations()): a retry here would silently restart
+    a partially-streamed pull from the top rather than resuming it, which
+    is wasteful for a large candidate set and could reorder/duplicate rows
+    against a source with no stable ORDER BY guarantee across repeated
+    executions. A transient failure mid-stream surfaces as this attempt's
+    PULL_FAILURE instead (see run_sampling()'s call site).
+    """
+    cursor = db_conn.cursor()
+    try:
+        cursor.execute(query)
+        if cursor.description is None:
+            return []
+        columns = [c[0].lower() for c in cursor.description]
+        rows = []
+        while True:
+            batch = cursor.fetchmany(EXCEPTION_CHUNK)
+            if not batch:
+                break
+            rows.extend(dict(zip(columns, r)) for r in batch)
+        return rows
+    finally:
+        cursor.close()
+
+
 def _pull_candidates(db_conn, config: dict, levels: list, run_params: dict) -> list:
     """
     Pull the candidate universe, with _priority_rank computed by the
@@ -366,7 +414,7 @@ def _pull_candidates(db_conn, config: dict, levels: list, run_params: dict) -> l
     query = f"SELECT {select_cols} FROM {config['universe_table']} WHERE {where_clause} {order_clause}"
     logger.info("Sampling candidate pull (config_id=%s):\n%s", config.get("config_id"), query)
 
-    return _run_source_query(db_conn, query)
+    return _stream_candidate_query(db_conn, query)
 
 
 def _case_key(row: dict, key_cols: list) -> str:
@@ -376,7 +424,7 @@ def _case_key(row: dict, key_cols: list) -> str:
     same fix applied for the same reason (see that function's docstring).
 
     `row`'s keys are always lowercased (see sampling/db_ops.py::execute_query()/
-    _run_source_query()), but `key_cols` comes straight from
+    this module's own _stream_candidate_query()), but `key_cols` comes straight from
     gre_sampling_config.key_columns as authored -- look up case-
     insensitively so casing in that column never silently breaks this.
 

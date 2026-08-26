@@ -474,28 +474,84 @@ one-row-fails-N-rules scenario still produces N independent
 each is a single small row, and each ties back independently to the
 *same* underlying source record rather than N copies of it.
 
-## Big-dataset path
+## Big-dataset path / memory footprint at scale
 
-Two optimizations that matter once a rule matches millions of rows (see
+Optimizations that matter once a rule matches millions of rows (see
 `executor.py`'s module docstring for the full write-up):
 
 - **Single-scan evaluation** (`_scan_violations`): `rule_syntax` is scanned
-  ONCE via streamed `fetchmany()`, producing both the true failed-record
-  count and the complete violating-row list for detail capture -- instead
-  of a separate `COUNT(*)` query plus a full detail fetch. There is no cap
-  on how many rows get captured: every violating row is written to
-  `gre_exceptions`, every attempt, no matter how many rows `rule_syntax`
-  matches (memory for the scan scales with the violation count as a
-  result -- that trade-off is accepted so compliance/audit review never
-  gets a partial record set).
+  ONCE via streamed `fetchmany()` (`GRE_EXCEPTION_CHUNK`-sized batches,
+  default 500), producing both the true failed-record count and the
+  complete violating-row list for detail capture -- instead of a separate
+  `COUNT(*)` query plus a full detail fetch. This roughly halves read load
+  against the source for every rule.
+- **Natural-key projection** (`_scan_violations`'s `src_key_cols`
+  parameter): a violating row is retained ONLY as its `src_key_cols`
+  columns, not every column `rule_syntax` happened to `SELECT` -- safe
+  because `_write_exceptions()` (the only consumer of these rows) never
+  reads anything else off a row. For a rule that selects many/wide columns
+  (or `SELECT *`) but keys on just one or two of them, this is the single
+  biggest lever on retained memory for a rule with a large violation
+  count: it turns memory use from O(violations &times; every selected
+  column) into O(violations &times; key columns only). It does NOT reduce
+  what's fetched *over the wire* per batch -- the driver still returns
+  every selected column for the `GRE_EXCEPTION_CHUNK` rows in flight at
+  any one moment -- only what's kept afterward.
 - **Memoized total counts** (`_compute_total`'s `total_cache`): rules in
   the same group that ask the identical "how many rows are in this batch"
   question share one `COUNT(*)` result for the whole `run_rule_group()`
   call, threaded through via `total_cache`.
+- **Chunked bulk writes**: both `_scan_violations`'s reads and
+  `_write_exceptions`'s writes go through `GRE_EXCEPTION_CHUNK`-sized
+  batches (`bulk_insert_or_skip`/`bulk_execute`), never one row per
+  round trip.
 
-Both `_scan_violations`'s and `_write_exceptions`'s row writes go through
-`rules_engine/db_ops.py`'s chunked `bulk_insert_or_skip()` rather than one
-INSERT+commit per row.
+There is deliberately still NO cap on how many rows get captured: every
+violating row gets a `gre_exceptions` row, every attempt, no matter how
+many rows `rule_syntax` matches -- compliance/audit review needs the
+complete record set, not a sample. The trade-off this makes explicit:
+**memory for one rule's one attempt scales with that rule's violation
+count** (at the reduced, key-columns-only width above) -- a rule matching
+an extremely large number of rows needs correspondingly more memory to
+hold all of them before the bulk write. In practice this is now bounded by
+`violations &times; (a handful of key column values)`, not
+`violations &times; (every column the rule selects)`.
+
+**What this means for planning capacity, concretely:**
+
+- **A single rule, however large the source table, uses roughly constant
+  memory** as long as its *violation count* (not table size) stays
+  bounded -- a well-behaved rule on a healthy dataset should rarely
+  violate on more than a small fraction of rows. A rule matching, say, 5
+  million rows on a 2-column key needs on the order of a few hundred MB,
+  not the width of the whole table.
+- **`GRE_MAX_PARALLEL_RULES` multiplies this.** Raising it above 1 runs
+  that many rules concurrently (`sequencing_mode='independent'` groups
+  only), each with its own independent `_scan_violations()` call in
+  flight at the same time -- worst-case peak memory is roughly
+  `GRE_MAX_PARALLEL_RULES &times; (the single largest concurrently-running
+  rule's projected violation set)`, not just one rule's. Size this against
+  the server's available RAM, not just against source-connection
+  concurrency caps (`GRE_<SOURCE_TYPE>_MAX_PARALLEL`) -- those bound load
+  on the *source*, not memory on *this* process.
+- **`GRE_EXCEPTION_CHUNK`** (default 500) bounds the transient per-batch
+  full-row buffer during the scan and the batch size of every bulk write.
+  Raising it trades a few more rows in flight for fewer round trips;
+  lowering it trades the reverse. It rarely needs to change -- the
+  natural-key projection above already does the heavy lifting for wide
+  tables.
+- **Narrow `rule_syntax`'s `SELECT` list.** Even with projection, the
+  driver still buffers every selected column for each in-flight
+  `GRE_EXCEPTION_CHUNK`-sized batch -- a `SELECT *` on a wide table still
+  costs more per batch than `SELECT <just the columns the rule and
+  src_key_cols actually need>`, even though the retained memory afterward
+  is identical either way.
+- **Index what `rule_syntax`'s `WHERE` filters on and what `src_key_cols`
+  names**, same as any large-table query -- this engine pushes all
+  filtering/counting down to the source database; it never scans in
+  Python. The total-record count (`_build_total_query`) and the violation
+  scan both benefit from the same indexes a hand-written query against
+  that table would.
 
 ## Quick start
 

@@ -134,6 +134,51 @@ level are always processed in deterministic (sorted) order using one
 seeded `random.Random` instance threaded through the whole recursion, so
 re-running with the same seed reproduces every bucket's draw exactly.
 
+## Performance / memory footprint at scale
+
+Unlike `rules_engine/`, which only ever needs to hold ONE rule's *violating*
+rows in memory, sampling's stratification algorithm needs the FULL
+candidate universe in memory at once -- `_stratify()` can't know a
+bucket's share of `target_volume` until every candidate's bucket
+membership is known, so there's no equivalent of rules_engine's
+per-rule-violation-only footprint here. What keeps this manageable:
+
+- **The candidate pull is already narrow.** `_pull_candidates()`'s
+  `SELECT` list is exactly `key_columns` + each stratification level's
+  `stratify_expr` + the DB-computed `_priority_rank` -- never
+  `universe_table`'s other columns, regardless of how wide that table is.
+  This is the single biggest lever for a wide `universe_table`: narrowing
+  what's selected narrows every candidate row's memory footprint directly,
+  the same way `rules_engine/`'s natural-key projection does for its rows.
+- **The pull streams via `fetchmany()`** (`_stream_candidate_query()`,
+  `GRE_EXCEPTION_CHUNK`-sized batches, same knob/pattern as
+  `rules_engine/executor.py`'s `_scan_violations()`) instead of one
+  unbounded `fetchall()` -- this bounds the *transient* per-batch driver
+  buffer for a very large universe, though the final `candidates` list
+  still ends up holding every candidate regardless (see above -- that part
+  is inherent to the algorithm, not something chunking can avoid).
+- **`scope_sql`/`exclusion_sql` are the real lever on ROW COUNT.** Since
+  the whole candidate set must be held at once, the most effective way to
+  control memory for a huge `universe_table` is narrowing what counts as
+  "this cycle's candidates" in the first place -- a tighter `scope_sql`
+  (e.g. a date range, a status filter) directly shrinks what
+  `_pull_candidates()` has to hold, stratify, and rank.
+- **Writes are chunked.** `_persist()`'s `gre_sample_selections`/
+  `gre_sample_selection_attrs` inserts go through `bulk_insert()` in
+  `GRE_EXCEPTION_CHUNK`-sized `executemany()` batches, not one row per
+  round trip, regardless of how many candidates end up selected.
+- **Index what `scope_sql`/`exclusion_sql` filter on and what
+  `key_columns`/`priority_rank_sql` reference** -- the candidate pull, its
+  `ROW_NUMBER()` ordering, and any `COUNT`-style scope checks all run
+  against the source database, never in Python.
+
+Sampling has no equivalent of `rules_engine/`'s `GRE_MAX_PARALLEL_RULES` --
+each `run_sampling()` call is single-threaded internally, though
+`run_sampling_for_process_name()` still runs one config after another (not
+concurrently) within one process, so peak memory across a fan-out is
+whichever single config's candidate pull is largest, not the sum of all of
+them.
+
 ## Quick start
 
 ```python

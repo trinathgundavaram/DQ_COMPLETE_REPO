@@ -31,6 +31,7 @@ from sampling.sampling import (
     _target_for_bucket, _select, _stratify, run_sampling,
     _pull_candidates, discover_sampling_configs, run_sampling_for_process_name,
 )
+import sampling.sampling as sampling_module
 
 META_DB = "main"
 
@@ -464,6 +465,60 @@ def test_pull_candidates_exclusion_sql_unresolved_token_raises():
     }
     with pytest.raises(ValueError):
         _pull_candidates(conn, config, [], {"batch_id": "2026-08-01"})
+
+
+# ── _pull_candidates: chunked streaming (memory/perf) ────────────────────
+# _stream_candidate_query() fetches via cursor.fetchmany(EXCEPTION_CHUNK)
+# rather than one giant fetchall() -- same pattern rules_engine/executor.py::
+# _scan_violations() uses for its rule_syntax scan. These prove the
+# chunking is invisible to callers (identical results regardless of chunk
+# size) and that it's still exactly ONE query execution, not one per chunk.
+
+class _CursorCountingWrapper:
+    """Wraps a raw DuckDB connection and counts .cursor() calls, mirroring
+    tests/test_rules_engine_executor.py's identical helper."""
+    def __init__(self, conn):
+        self._conn = conn
+        self.cursor_calls = 0
+
+    def cursor(self):
+        self.cursor_calls += 1
+        return self._conn.cursor()
+
+
+def test_pull_candidates_streaming_matches_fetchall_regardless_of_chunk_size(monkeypatch):
+    conn = _conn()
+    _build_universe(conn, n=50)
+    config = {
+        "config_id": 1, "universe_table": "case_universe", "key_columns": "case_id",
+        "scope_sql": "pull_date = '{batch_id}'", "exclusion_sql": "auto_closed = 1",
+        "sampling_method": "RANKED", "priority_rank_sql": "revision DESC, case_id ASC",
+    }
+    # A tiny chunk size forces several fetchmany() round trips for the
+    # same 50-ish-row pull -- results must come back byte-for-byte
+    # identical to the default chunk size (EXCEPTION_CHUNK=500).
+    baseline = _pull_candidates(conn, config, [], {"batch_id": "2026-08-01"})
+
+    monkeypatch.setattr(sampling_module, "EXCEPTION_CHUNK", 3)
+    chunked = _pull_candidates(conn, config, [], {"batch_id": "2026-08-01"})
+
+    assert len(baseline) == len(chunked) > 3   # actually exercises multiple chunks
+    assert baseline == chunked
+
+
+def test_pull_candidates_issues_exactly_one_query_regardless_of_chunk_size(monkeypatch):
+    conn = _conn()
+    _build_universe(conn, n=50)
+    config = {
+        "config_id": 1, "universe_table": "case_universe", "key_columns": "case_id",
+        "scope_sql": "pull_date = '{batch_id}'", "exclusion_sql": "auto_closed = 1",
+        "sampling_method": "RANKED", "priority_rank_sql": "revision DESC, case_id ASC",
+    }
+    monkeypatch.setattr(sampling_module, "EXCEPTION_CHUNK", 3)
+    wrapped = _CursorCountingWrapper(conn)
+    candidates = _pull_candidates(wrapped, config, [], {"batch_id": "2026-08-01"})
+    assert len(candidates) > 3
+    assert wrapped.cursor_calls == 1   # one cursor/execute -- fetchmany() loops the SAME cursor
 
 
 # ── run_sampling end-to-end ───────────────────────────────────────────

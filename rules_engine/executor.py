@@ -100,7 +100,7 @@ def _log_error(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str,
 # partially-streamed scan from the top, which is wasteful for a rule
 # matching a large row count. A transient failure here is instead treated
 # as a hard error for this attempt (see execute_rule()'s STEP 1).
-def _scan_violations(db_conn, query: str) -> tuple:
+def _scan_violations(db_conn, query: str, src_key_cols: list = None) -> tuple:
     """
     Run rule_syntax ONCE, streamed via fetchmany() in EXCEPTION_CHUNK-sized
     batches rather than one giant fetchall(), instead of the old two-query
@@ -109,6 +109,33 @@ def _scan_violations(db_conn, query: str) -> tuple:
     source table/connection for every rule, since both old queries
     evaluated the identical predicate against the identical rows.
 
+    src_key_cols : the rule's gre_rules.src_key_cols, already split into a
+        list (e.g. ["claim_id"]) -- see build_src_key()'s docstring for
+        where this normally comes from. When given (and at least one entry
+        matches an actual result column), each row is PROJECTED down to
+        just these columns before being retained in `rows`, instead of
+        keeping every column rule_syntax happened to SELECT. This is safe
+        because _write_exceptions() -- the only consumer of `rows` -- only
+        ever reads a row through build_src_key(rule, row), which itself
+        only touches rule['src_key_cols']; nothing downstream needs any
+        other column's value. For a rule_syntax that SELECTs many/wide
+        columns (or `SELECT *`) but keys on just one or two of them, this
+        turns retained memory for a big violation set from O(violations x
+        every selected column) into O(violations x key columns only) --
+        often a large reduction. Pass None (or an empty/fully-unmatched
+        list) to keep the old full-row behavior -- e.g. for a caller that
+        doesn't know src_key_cols yet, or wants to preserve prior exact
+        behavior for some other reason.
+
+        A src_key_cols entry that doesn't match any actual result column
+        (rule misconfiguration -- src_key_cols naming a column rule_syntax
+        doesn't SELECT) is simply not projected either -- exactly like the
+        old full-row capture, where that column was equally absent from
+        `row`. _write_exceptions()'s build_src_key() call still raises the
+        same KeyError in the same place either way, so this projection
+        never changes error behavior, only what's retained in memory for
+        the columns that DO exist.
+
     Returns (failed, rows):
       failed : count of every row the query returns -- always == len(rows).
       rows   : EVERY violating row, uncapped, for gre_exceptions detail
@@ -116,11 +143,14 @@ def _scan_violations(db_conn, query: str) -> tuple:
                docstring's "Big-dataset path" section): compliance/audit
                review needs the complete violation set, not a sample, so
                nothing is ever dropped from `rows` regardless of how many
-               rows rule_syntax matches. This does mean memory use for
-               `rows` scales with the violation count for a single
-               attempt -- a rule matching an extremely large number of
-               rows needs correspondingly more memory to hold them all
-               before _write_exceptions() bulk-writes them.
+               rows rule_syntax matches. Each row is either the full
+               fetched row, or just its src_key_cols columns (see
+               src_key_cols above) -- either way this DOES mean memory use
+               for `rows` scales with the violation count for a single
+               attempt: a rule matching an extremely large number of rows
+               still needs memory proportional to that count (times
+               whichever column set was retained) before
+               _write_exceptions() bulk-writes them.
 
     Trade-off vs. the two-query design: previously, a failure that hit
     ONLY the detail-fetch step -- AFTER a separate COUNT(*) had already
@@ -133,14 +163,27 @@ def _scan_violations(db_conn, query: str) -> tuple:
     whose result rows are unusually wide/expensive to materialize (many
     columns, large text fields), where a bare COUNT(*) might succeed even
     if pulling full rows hits a resource limit -- accepted here in
-    exchange for cutting the common-case scan cost in half.
+    exchange for cutting the common-case scan cost in half. Note the
+    src_key_cols projection above only reduces what's RETAINED after each
+    EXCEPTION_CHUNK-sized batch is fetched, not what's fetched over the
+    wire per batch -- the driver still returns every SELECTed column for
+    each of the (bounded, EXCEPTION_CHUNK-sized) rows in flight at any one
+    time, same as before.
     """
+    lowered_key_cols = {c.strip().lower() for c in (src_key_cols or []) if c.strip()}
+
     cursor = db_conn.cursor()
     try:
         cursor.execute(query)
         if cursor.description is None:
             return 0, []
         columns = [c[0].lower() for c in cursor.description]
+
+        # Indices of columns actually worth projecting down to -- see
+        # src_key_cols above. Empty (falsy) when src_key_cols wasn't
+        # passed, or named nothing this query actually SELECTs, in which
+        # case every row is kept in full (unchanged prior behavior).
+        key_idx = [i for i, c in enumerate(columns) if c in lowered_key_cols]
 
         failed = 0
         rows = []
@@ -150,7 +193,10 @@ def _scan_violations(db_conn, query: str) -> tuple:
                 break
             for r in batch:
                 failed += 1
-                rows.append(dict(zip(columns, r)))
+                if key_idx:
+                    rows.append({columns[i]: r[i] for i in key_idx})
+                else:
+                    rows.append(dict(zip(columns, r)))
         return failed, rows
     finally:
         cursor.close()
@@ -197,6 +243,17 @@ def _format_src_key(cols: list, row: dict) -> str:
     return "|".join(f"{c}={_fmt(c)}" for c in cols)
 
 
+def split_src_key_cols(rule: dict) -> list:
+    """
+    gre_rules.src_key_cols ("claim_id, batch_id") -> ["claim_id", "batch_id"]
+    -- the one place this split happens, shared by build_src_key() below
+    and _scan_violations()'s memory-projection optimization (STEP 1 in
+    execute_rule()), so the two can never quietly drift out of sync on
+    what counts as a natural-key column for this rule.
+    """
+    return [c.strip() for c in (rule.get("src_key_cols") or "").split(",") if c.strip()]
+
+
 def build_src_key(rule: dict, row: dict) -> str:
     """
     "col1=val1|col2=val2" from rule['src_key_cols'] -- this engine's
@@ -204,7 +261,7 @@ def build_src_key(rule: dict, row: dict) -> str:
     Every violating row must produce one of these; it's what makes
     gre_exceptions_uix (rule_id, run_key, src_key_value) meaningful.
     """
-    cols = [c.strip() for c in (rule.get("src_key_cols") or "").split(",") if c.strip()]
+    cols = split_src_key_cols(rule)
     if not cols:
         raise ValueError(
             f"rule_id={rule.get('rule_id')} has no src_key_cols -- "
@@ -314,7 +371,7 @@ def build_source_tieback_sql(rule: dict, run_key: str, meta_db: str) -> str:
     if dialect not in _TIEBACK_SQL_DIALECTS:
         return None
 
-    cols = [c.strip() for c in (rule.get("src_key_cols") or "").split(",") if c.strip()]
+    cols = split_src_key_cols(rule)
     if not cols:
         return None
 
@@ -926,8 +983,12 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
         return "ERROR"
 
     # ── STEP 1: ONE scan of rule_syntax -- TRUE failed count + all rows ──────
+    # src_key_cols passed through so _scan_violations() can project each
+    # retained row down to just the natural-key columns instead of every
+    # column rule_syntax happened to SELECT -- see that function's
+    # docstring's src_key_cols parameter for why this is always safe.
     try:
-        failed, violating_rows = _scan_violations(db_conn, query)
+        failed, violating_rows = _scan_violations(db_conn, query, src_key_cols=split_src_key_cols(rule))
     except Exception as exc:
         logger.error("Rule %s: rule_syntax scan failed: %s", rule.get("rule_id"), exc, exc_info=True)
         _log_error(meta_conn, meta_db, run_id, rule, run_key, "SQL_RUNTIME", str(exc))
