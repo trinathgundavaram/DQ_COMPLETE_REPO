@@ -38,6 +38,7 @@ on_failure=halt_group support, both of which are meaningless once rules
 can finish out of order.
 """
 
+import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -117,13 +118,32 @@ def _build_group_run_id(meta_conn, meta_db: str, rule_group: str, run_key: str,
 
 def _start_audit(meta_conn, meta_db: str, run_id: str, rule_group: str, run_key: str,
                   total_rules: int, triggered_by: str, rule_variant: str = None,
-                  project_name: str = None, process_name: str = None) -> None:
+                  project_name: str = None, process_name: str = None,
+                  run_params: dict = None, extra_filters: dict = None) -> None:
+    """
+    run_params/extra_filters are recorded here, JSON-encoded, as the
+    RUN-LEVEL record of what this run_rule_group() call was actually
+    invoked with -- separate from (and a level up from)
+    gre_results.executed_sql, which is the fully-resolved SQL text for one
+    rule's one attempt. A reviewer can answer "what params/filters was
+    this run_id invoked with" straight off this one row, instead of
+    reading every gre_results row for the run and reverse-engineering it
+    out of executed_sql. NULL (not "{}") when the caller passed nothing,
+    so an empty dict and "never passed" both read the same simple way.
+    json.dumps() with default=str tolerates a non-JSON-native value (e.g.
+    a date) landing in either dict without crashing the write -- this is
+    an audit trail, not a re-parsed input, so best-effort stringification
+    beats failing the whole run over an unusual param value.
+    """
     execute_dml(meta_conn, f"""
         INSERT INTO {meta_db}.gre_rule_audit (
-            run_id, rule_group, project_name, process_name, run_key, rule_variant, started_at, status,
+            run_id, rule_group, project_name, process_name, run_key, rule_variant,
+            run_params, extra_filters, started_at, status,
             total_rules, rules_succeeded, rules_errored, triggered_by
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, 0, 0, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, 0, 0, ?)
     """, [run_id, rule_group, project_name, process_name, run_key, rule_variant,
+          json.dumps(run_params, default=str) if run_params else None,
+          json.dumps(extra_filters, default=str) if extra_filters else None,
           datetime.now(), total_rules, triggered_by])
 
 
@@ -448,7 +468,8 @@ def run_rule_group(
 
     run_id = _build_group_run_id(meta_conn, meta_db, rule_group, run_key, project_name, triggered_by)
     _start_audit(meta_conn, meta_db, run_id, rule_group, run_key, len(rules), triggered_by,
-                 rule_variant=rule_variant, project_name=project_name, process_name=process_name)
+                 rule_variant=rule_variant, project_name=project_name, process_name=process_name,
+                 run_params=resolved_params, extra_filters=extra_filters)
     logger.info("Starting GRE run: %s (%d rule(s))", run_id, len(rules))
 
     # Every rule always re-executes for its run_key -- no more skipping

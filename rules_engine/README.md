@@ -187,6 +187,18 @@ templated `rule_syntax` when substitution itself failed), so a reviewer
 never has to reconstruct it by hand from `gre_rules.rule_syntax` plus
 whatever parameters happened to be passed that run.
 
+At the RUN level (one row per `run_rule_group()` call, not per rule),
+the exact `run_params`/`extra_filters` dicts the caller passed in are
+also recorded, JSON-encoded, on `gre_rule_audit.run_params` /
+`gre_rule_audit.extra_filters` -- `NULL` on either column when that run
+didn't pass one. This is the fastest way to answer "what was `run_id X`
+actually invoked with" without reading every `gre_results` row for that
+run and reverse-engineering it out of `executed_sql`:
+
+```sql
+SELECT run_params, extra_filters FROM gre_rule_audit WHERE run_id = '...';
+```
+
 ## One connection per source: `sql_dialect`
 
 There is no separate named-connection column. `sql_dialect` -- `'teradata'

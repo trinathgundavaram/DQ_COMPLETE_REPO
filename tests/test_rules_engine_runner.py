@@ -167,7 +167,7 @@ def _conn():
     conn.execute("""
         CREATE TABLE gre_rule_audit (
             run_id VARCHAR, rule_group VARCHAR, project_name VARCHAR, process_name VARCHAR,
-            run_key VARCHAR, rule_variant VARCHAR,
+            run_key VARCHAR, rule_variant VARCHAR, run_params VARCHAR, extra_filters VARCHAR,
             started_at TIMESTAMP, ended_at TIMESTAMP, status VARCHAR,
             total_rules INTEGER, rules_succeeded INTEGER, rules_errored INTEGER,
             triggered_by VARCHAR, load_datetime TIMESTAMP DEFAULT current_timestamp
@@ -673,6 +673,46 @@ def test_parallel_shared_total_cache_still_avoids_redundant_count_queries(monkey
     # the correct total -- that's the actual correctness guarantee; the
     # redundant-query count itself isn't asserted since it's timing-dependent.
     assert {r["rule_id"]: r["total_records"] for r in results} == {1: 4, 2: 4}
+
+
+# ── run_params/extra_filters captured on gre_rule_audit (run-level) ───────
+# Separate from gre_results.executed_sql (per-rule, fully-resolved SQL) --
+# this is the run-level record of what run_rule_group() was actually
+# called with, so a reviewer can backtrack a run_id's inputs directly.
+
+def test_gre_rule_audit_captures_run_params_and_extra_filters_as_json():
+    import json
+
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10)
+
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB,
+                   run_params={"year": 2026, "month": 8}, extra_filters={"run_ty": "MNT"})
+    assert summary["status"] == "COMPLETED"
+
+    audit = execute_query(conn, "SELECT * FROM gre_rule_audit WHERE run_id = ?", [summary["run_id"]])
+    assert len(audit) == 1
+    # _run() merges {"batch_id": run_key} into run_params (see _run()'s docstring) --
+    # confirm the merged dict, not just the caller-supplied keys, was captured.
+    captured_params = json.loads(audit[0]["run_params"])
+    assert captured_params == {"batch_id": "B1", "year": 2026, "month": 8}
+    assert json.loads(audit[0]["extra_filters"]) == {"run_ty": "MNT"}
+
+
+def test_gre_rule_audit_run_params_and_extra_filters_null_when_not_passed():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10)
+
+    # _run() always injects {"batch_id": run_key} (see its docstring), so
+    # run_params is never actually empty here -- but extra_filters is
+    # never passed at all, and must come back NULL, not "{}" or "null".
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+    assert summary["status"] == "COMPLETED"
+
+    audit = execute_query(conn, "SELECT * FROM gre_rule_audit WHERE run_id = ?", [summary["run_id"]])
+    assert audit[0]["extra_filters"] is None
 
 
 # ── project_name/process_name propagation ─────────────────────────────────

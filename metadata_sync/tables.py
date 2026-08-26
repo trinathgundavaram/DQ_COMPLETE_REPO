@@ -105,7 +105,8 @@ GRE_RULE_AUDIT = {
     "reopen_filter": "status = 'RUNNING'",
     "columns": [
         "run_id", "rule_group", "project_name", "process_name", "run_key",
-        "rule_variant", "started_at", "ended_at", "status", "total_rules",
+        "rule_variant", "run_params", "extra_filters",
+        "started_at", "ended_at", "status", "total_rules",
         "rules_succeeded", "rules_errored", "triggered_by", "load_datetime",
     ],
 }

@@ -138,6 +138,8 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_rule_audit (
     process_name        VARCHAR(100),
     run_key             VARCHAR(100),
     rule_variant        VARCHAR(100),
+    run_params          TEXT,       -- JSON-encoded run_params dict for this run, NULL if none
+    extra_filters       TEXT,       -- JSON-encoded extra_filters dict for this run, NULL if none
     started_at          TIMESTAMP,
     ended_at            TIMESTAMP,
     status              VARCHAR(20),

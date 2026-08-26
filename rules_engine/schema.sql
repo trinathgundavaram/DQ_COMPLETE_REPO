@@ -417,6 +417,24 @@ CREATE MULTISET TABLE {{META_DB}}.gre_rule_audit (
     process_name              VARCHAR(100),      -- copied from gre_rules.process_name
     run_key                   VARCHAR(100),        -- caller-supplied tracking/idempotency key
     rule_variant               VARCHAR(100),      -- NULL = no variant requested
+    run_params                 CLOB,             -- the run_params dict this run was actually called
+                                                  -- with, JSON-encoded (e.g. '{"year": 2026, "month": 8}'),
+                                                  -- NULL when none was passed. This is the RUN-LEVEL
+                                                  -- record of what was passed in -- one row per
+                                                  -- run_rule_group() call, vs. gre_results.executed_sql
+                                                  -- which is the PER-RULE fully-resolved SQL text. Lets a
+                                                  -- reviewer answer "what params/filters was run_id X
+                                                  -- actually invoked with" directly off this table,
+                                                  -- without reading every gre_results row for the run
+                                                  -- and reverse-engineering it from executed_sql.
+    extra_filters               CLOB,            -- the extra_filters dict this run was actually called
+                                                  -- with, JSON-encoded, NULL when none was passed. See
+                                                  -- run_params above and rules_engine/db_ops.py::
+                                                  -- build_extra_filters_clause()'s docstring -- a rule
+                                                  -- without the "{extra_filters}"/"$extra_filters" marker
+                                                  -- is unaffected by this even when it's non-NULL here;
+                                                  -- this column only records what the CALLER passed for
+                                                  -- the whole run, not which individual rules used it.
     started_at                TIMESTAMP,
     ended_at                   TIMESTAMP,
     status                      VARCHAR(20),      -- 'RUNNING' | 'COMPLETED' | 'HALTED'
