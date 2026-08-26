@@ -125,6 +125,68 @@ reference the run's tracking value as a literal column filter, pass it
 explicitly via `run_params` under whatever key matches an actual column
 (e.g. `run_params={"batch_id": "BATCH_2026_08_14"}`).
 
+## Ad-hoc runtime filters: `extra_filters`
+
+`run_params` above is for tokens a rule's author explicitly wrote into
+`rule_syntax`. `extra_filters` is a separate, opt-in mechanism for a
+column the rule *wasn't* authored to anticipate -- e.g. narrowing a
+long-standing rule to `run_ty = 'MNT'` at run time without adding a
+`{run_ty}` token to every rule that might ever need it, and without
+touching `gre_rules` at all.
+
+A rule opts in by embedding the literal marker `"{extra_filters}"` or
+`"$extra_filters"` anywhere in its `rule_syntax` -- typically right
+before the end of the `WHERE` clause:
+
+```sql
+SELECT claim_id, denial_reason FROM claims
+WHERE denial_reason IS NULL AND claim_year = {year} AND claim_month = {month} {extra_filters}
+```
+
+A caller then passes one or more filters as a plain dict, and the engine
+splices in `AND col1 = 'v1' AND col2 = 'v2' ...` wherever the marker
+appears, BEFORE `run_params` substitution runs:
+
+```python
+summary = run_rule_group(
+    "claims_dq", "BATCH_2026_08_14", cf,
+    run_params={"year": 2026, "month": 8},
+    extra_filters={"run_ty": "MNT"},
+)
+```
+
+or from the CLI:
+
+```
+python run_by_process.py rules --process-name UNIVERSE_VALIDATION     --param year=2026 --param month=8 --filter run_ty=MNT
+```
+
+`extra_filters` supports more than one filter at once (`{"run_ty": "MNT",
+"region": "EAST"}` -> `AND region = 'EAST' AND run_ty = 'MNT'`, sorted for
+deterministic SQL text). A rule that never embeds the marker is
+completely unaffected even when a caller passes `extra_filters` -- same
+"extra values are silently unused" philosophy as an unused `run_params`
+key. `extra_filters` is also merged into the auto-generated total-record
+(denominator) count above, but ONLY for a rule that actually embeds the
+marker, so `failure_pct` still reflects the same narrowed scope the scan
+itself used.
+
+Unlike `run_params`' values (always escaped as literal data),
+`extra_filters`' KEYS become literal column names spliced directly into
+the SQL text -- each key is validated as a plain SQL identifier
+(letters/digits/underscore, not starting with a digit) and the whole
+attempt fails fast with `PARAM_SUBSTITUTION_ERROR` on anything else,
+rather than risking an unescapable column name reaching the source
+database. See `rules_engine/db_ops.py::build_extra_filters_clause()`'s
+docstring for the full mechanics.
+
+Whatever actually ran -- `run_params` and `extra_filters` both already
+resolved to literal values -- is captured verbatim on
+`gre_results.executed_sql` for every attempt (or the raw/partially
+templated `rule_syntax` when substitution itself failed), so a reviewer
+never has to reconstruct it by hand from `gre_rules.rule_syntax` plus
+whatever parameters happened to be passed that run.
+
 ## One connection per source: `sql_dialect`
 
 There is no separate named-connection column. `sql_dialect` -- `'teradata'

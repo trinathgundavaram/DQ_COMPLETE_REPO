@@ -393,6 +393,55 @@ def _substitute_params(sql: str, params: dict) -> str:
     return resolved
 
 
+_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def build_extra_filters_clause(extra_filters: dict) -> str:
+    """
+    Build a "AND col1 = 'val1' AND col2 = 'val2' ..." fragment from an
+    extra_filters dict -- ONE OR MORE ad-hoc equality filters a caller
+    wants applied at run time, on top of whatever run_params tokens the
+    rule_syntax already substitutes. Unlike run_params (which only fills
+    in "{key}"/"$key" placeholders the rule author explicitly wrote), this
+    is for a column the rule_syntax DIDN'T anticipate at all -- e.g.
+    filtering an already-authored rule by "run_ty='MNT'" without having
+    to add a {run_ty} token to every rule that might ever need it.
+
+    A rule opts into this by embedding the literal marker "{extra_filters}"
+    (or "$extra_filters") anywhere in its rule_syntax -- typically right
+    before the end of the WHERE clause, before any GROUP BY/ORDER BY. See
+    rules_engine/executor.py::execute_rule()'s extra_filters parameter for
+    where this gets spliced in. A rule that doesn't embed the marker
+    simply never has extra_filters applied to it -- same "extra values are
+    silently unused" philosophy as run_params' own unused keys.
+
+    Returns "" (empty string, so the marker disappears cleanly with no
+    dangling "AND") when extra_filters is empty/None. Every key is
+    validated as a plain SQL identifier (letters/digits/underscore,
+    not starting with a digit) and rejected with ValueError otherwise --
+    unlike run_params' values (always treated as literal data and safely
+    quoted/escaped), extra_filters' KEYS become literal column names
+    spliced directly into the SQL text, so they can't be escaped the same
+    way; this validation is what keeps that safe against a bad/malicious
+    key rather than quoting a column name like a string ever could.
+    Values ARE escaped via _escape_sql_literal(), same as every other
+    literal this package ever substitutes.
+    """
+    if not extra_filters:
+        return ""
+    bad_keys = [key for key in extra_filters if not _IDENTIFIER_RE.match(key)]
+    if bad_keys:
+        raise ValueError(
+            f"extra_filters key(s) {sorted(bad_keys)} are not valid SQL identifiers -- "
+            f"refusing to splice them into a query as column names."
+        )
+    clauses = [
+        f"{key} = '{_escape_sql_literal(value)}'"
+        for key, value in sorted(extra_filters.items())
+    ]
+    return "AND " + " AND ".join(clauses)
+
+
 def build_run_key(*parts, delimiter: str = "_") -> str:
     """
     Join one or more values into a single opaque tracking/idempotency key

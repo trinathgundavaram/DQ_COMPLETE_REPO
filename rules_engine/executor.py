@@ -71,7 +71,7 @@ from datetime import datetime
 from rules_engine.db_ops import (
     execute_dml, execute_query, bulk_insert_or_skip, bulk_execute, _is_duplicate_key_error,
     _substitute_params, _run_source_query, _escape_sql_literal,
-    log_error, EXCEPTION_CHUNK,
+    build_extra_filters_clause, log_error, EXCEPTION_CHUNK,
 )
 
 logger = logging.getLogger(__name__)
@@ -797,12 +797,13 @@ def _compute_total(db_conn, rule: dict, run_params: dict, total_cache: dict = No
 # ---------------------------------------------------------------------------
 
 def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_params: dict, meta_db: str,
-                  total_cache: dict = None) -> str:
+                  total_cache: dict = None, extra_filters: dict = None) -> str:
     """
     Execute one rule end-to-end: prepare its source (file/S3 rules register
-    their DuckDB view here), substitute run_params into rule_syntax, run it,
-    write every violating row to gre_exceptions, evaluate the rule-level
-    threshold, upsert gre_results, and log the attempt.
+    their DuckDB view here), substitute run_params into rule_syntax, splice
+    in extra_filters (if the rule opts in), run it, write every violating
+    row to gre_exceptions, evaluate the rule-level threshold, upsert
+    gre_results, and log the attempt.
 
     Parameters
     ----------
@@ -837,6 +838,17 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
                   COUNT(*) result -- see _compute_total()'s docstring.
                   None (the default) disables caching, e.g. for direct
                   single-rule calls in tests.
+    extra_filters : optional dict of ad-hoc equality filters (column ->
+                  value) applied ON TOP of run_params -- see
+                  rules_engine/db_ops.py::build_extra_filters_clause()'s
+                  docstring for the full rationale and safety notes. Only
+                  takes effect on a rule whose rule_syntax embeds the
+                  literal marker "{extra_filters}" or "$extra_filters";
+                  ignored entirely for a rule that doesn't. Also merged
+                  into the equality filters used for the auto-generated
+                  total-record count (_compute_total()), so the
+                  failure_pct denominator reflects the same narrowed
+                  scope rule_syntax itself was filtered by.
 
     Returns
     -------
@@ -886,14 +898,31 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
                             executed_sql=rule.get("rule_syntax"))
         return "ERROR"
 
-    # ── STEP 0b: run_params substitution -- fail fast, never mid-run ─────────
+    # ── STEP 0b: extra_filters splice + run_params substitution -- fail fast,
+    # never mid-run. extra_filters is spliced in FIRST, via plain text
+    # replace (not _substitute_params()'s escaping path -- the clause it
+    # builds is already-escaped, structural SQL, not a single literal
+    # value to be quoted) -- see build_extra_filters_clause()'s docstring.
+    # A rule_syntax with no "{extra_filters}"/"$extra_filters" marker is
+    # simply unaffected -- str.replace() on absent text is a no-op.
     try:
-        query = _substitute_params(rule["rule_syntax"], run_params)
+        extra_filters_sql = build_extra_filters_clause(extra_filters)
+    except ValueError as exc:
+        logger.error("Rule %s: extra_filters rejected: %s", rule.get("rule_id"), exc)
+        _log_error(meta_conn, meta_db, run_id, rule, run_key, "PARAM_SUBSTITUTION_ERROR", str(exc))
+        _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc),
+                            executed_sql=rule.get("rule_syntax"))
+        return "ERROR"
+    extra_filters_marker_present = "{extra_filters}" in rule["rule_syntax"] or "$extra_filters" in rule["rule_syntax"]
+    templated = rule["rule_syntax"].replace("{extra_filters}", extra_filters_sql).replace(
+        "$extra_filters", extra_filters_sql)
+    try:
+        query = _substitute_params(templated, run_params)
     except ValueError as exc:
         logger.error("Rule %s: run_params substitution failed: %s", rule.get("rule_id"), exc)
         _log_error(meta_conn, meta_db, run_id, rule, run_key, "PARAM_SUBSTITUTION_ERROR", str(exc))
         _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc),
-                            executed_sql=rule.get("rule_syntax"))
+                            executed_sql=templated)
         return "ERROR"
 
     # ── STEP 1: ONE scan of rule_syntax -- TRUE failed count + all rows ──────
@@ -907,8 +936,17 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
         return "ERROR"
 
     # ── STEP 2: total in-scope record count (memoized across the run_group) ──
+    # extra_filters only narrows the total-count denominator when the rule
+    # actually opted in (embedded the marker) -- a rule that never
+    # references "{extra_filters}"/"$extra_filters" must be completely
+    # unaffected by a caller passing extra_filters, same as an unused
+    # run_params key. Without this guard, extra_filters columns that don't
+    # even apply to this rule's table would still get spliced into the
+    # denominator query and break it (or silently narrow scope the actual
+    # scan never applied).
+    total_params = {**run_params, **(extra_filters or {})} if extra_filters_marker_present else run_params
     try:
-        total = _compute_total(db_conn, rule, run_params, total_cache=total_cache)
+        total = _compute_total(db_conn, rule, total_params, total_cache=total_cache)
     except Exception as exc:
         logger.error("Rule %s: scope/count query failed: %s", rule.get("rule_id"), exc, exc_info=True)
         _log_error(meta_conn, meta_db, run_id, rule, run_key, "SCOPE_QUERY_FAILURE", str(exc))

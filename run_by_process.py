@@ -31,6 +31,17 @@ Usage
     python run_by_process.py rules --process-name UNIVERSE_VALIDATION \
         --param year=2026 --param month=8
 
+    # Ad-hoc runtime filters -- ONE OR MORE "AND col = 'value'" conditions
+    # auto-appended on top of the run_params substitution above, for a
+    # column a rule's rule_syntax was never authored to anticipate (e.g.
+    # run_ty='MNT'). Only takes effect on a rule whose rule_syntax embeds
+    # the literal marker "{extra_filters}" or "$extra_filters" -- see
+    # rules_engine/db_ops.py::build_extra_filters_clause()'s docstring.
+    # Repeat --filter once per column; rules-only (no sampling equivalent
+    # yet). KEY=VALUE, split on the FIRST "=" only:
+    python run_by_process.py rules --process-name UNIVERSE_VALIDATION \
+        --param year=2026 --param month=8 --filter run_ty=MNT
+
     # Reproducible RANDOM/SYSTEMATIC sampling (rules_engine has no
     # equivalent -- its threshold evaluation has nothing to seed):
     python run_by_process.py sampling --process-name WEEKLY_REVIEW_SAMPLE --seed 42
@@ -95,6 +106,7 @@ def _run_rules(args):
 
     try:
         run_params = _parse_params(args.param)
+        extra_filters = _parse_params(args.filter)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -108,13 +120,14 @@ def _run_rules(args):
     run_key = args.run_key or default_run_key()
     print(f"Running rules_engine for process_name={args.process_name!r} "
           f"project_name={args.project_name!r} run_key={run_key!r} "
-          f"run_params={run_params!r} ...")
+          f"run_params={run_params!r} extra_filters={extra_filters!r} ...")
 
     try:
         outcome = run_by_process_name(
             args.process_name, run_key, cf,
             project_name=args.project_name,
             run_params=run_params,
+            extra_filters=extra_filters,
         )
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -194,6 +207,14 @@ def main():
                                    "'{KEY}' or '$KEY' (freely mixed). Repeatable -- pass --param "
                                    "once per key (e.g. --param year=2026 --param month=8). Values "
                                    "are always strings. Not merged into --run-key.")
+    rules_parser.add_argument("--filter", action="append", default=[], metavar="KEY=VALUE",
+                              help="An ad-hoc runtime equality filter ('AND KEY = 'VALUE'') "
+                                   "auto-appended on top of --param substitution -- for a column a "
+                                   "rule's rule_syntax was never authored to anticipate (e.g. "
+                                   "--filter run_ty=MNT). Only applies to a rule whose rule_syntax "
+                                   "embeds the literal marker '{extra_filters}' or '$extra_filters'. "
+                                   "Repeatable -- pass --filter once per column. Values are always "
+                                   "strings. Not merged into --run-key.")
     rules_parser.set_defaults(func=_run_rules)
 
     sampling_parser = subparsers.add_parser(

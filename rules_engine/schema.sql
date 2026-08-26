@@ -59,6 +59,27 @@
 --     self-contained -- an unresolved "{token}" fails the rule attempt
 --     immediately (PARAM_SUBSTITUTION_ERROR) rather than reaching the
 --     source database as a syntax error.
+--   * rule_syntax may ALSO embed the single reserved literal marker
+--     "{extra_filters}" OR "$extra_filters" -- a SEPARATE, opt-in
+--     mechanism from run_params above, for ad-hoc "AND col = 'value'"
+--     equality condition(s) a caller wants applied at RUN TIME, on a
+--     column the rule was never authored to anticipate (e.g. adding
+--     run_ty='MNT' without pre-authoring a {run_ty} token on every rule
+--     that might ever need it). A caller passes one or more filters as an
+--     extra_filters dict (e.g. {"run_ty": "MNT"}) to
+--     rules_engine/runner.py's entry points (or --filter KEY=VALUE on
+--     run_by_process.py's CLI); the engine splices in
+--     "AND col1 = 'v1' AND col2 = 'v2' ..." wherever the marker appears,
+--     BEFORE run_params substitution runs. A rule that doesn't embed the
+--     marker is completely unaffected even when a caller passes
+--     extra_filters -- same "extra values are silently unused"
+--     philosophy as an unused run_params key. Column names (the dict's
+--     KEYS) are validated as plain SQL identifiers and rejected
+--     (PARAM_SUBSTITUTION_ERROR) otherwise, since -- unlike run_params'
+--     values, which are always escaped as literal data -- these become
+--     column names spliced directly into the SQL text and can't be
+--     escaped the same way. See rules_engine/db_ops.py::
+--     build_extra_filters_clause()'s docstring for the full mechanics.
 --   * database_name + src_tbl_nm give the auto-generated total-record
 --     count query (see below) a fully-qualified FROM. There is no
 --     separate scope_sql column: the run_params dict that scopes
@@ -67,7 +88,12 @@
 --     duplication (and a real drift risk -- the two could silently
 --     disagree). Every key present in run_params is applied as an equality
 --     filter against database_name.src_tbl_nm, AND'd together -- see
---     rules_engine/executor.py::_build_total_query(). database_name is
+--     rules_engine/executor.py::_build_total_query(). extra_filters (see
+--     above) is ALSO merged into this equality-filter set, but ONLY for a
+--     rule that actually embeds the "{extra_filters}"/"$extra_filters"
+--     marker -- keeping the total-record-count denominator honoring the
+--     same narrowed scope as the rule_syntax scan itself, without
+--     affecting a rule that never opted in. database_name is
 --     stored here AS AUTHORED (almost always in DEV) and resolved to
 --     whichever physical database this process's environment actually
 --     has that data in at LOAD time, not stored per-environment -- see

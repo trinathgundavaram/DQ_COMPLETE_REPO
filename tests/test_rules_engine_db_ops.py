@@ -23,6 +23,7 @@ import pytest
 from rules_engine.db_ops import (
     execute_query, execute_dml, bulk_insert, bulk_insert_or_skip,
     _substitute_params, build_run_key, generate_run_id, count_prior_attempts,
+    build_extra_filters_clause,
 )
 
 
@@ -121,6 +122,49 @@ def test_substitute_params_dollar_token_unresolved_raises():
 def test_substitute_params_dollar_token_escapes_quotes():
     sql = "WHERE batch_id = '$batch_id'"
     assert _substitute_params(sql, {"batch_id": "O'Brien"}) == "WHERE batch_id = 'O''Brien'"
+
+
+# ── build_extra_filters_clause ──────────────────────────────────────────
+# Ad-hoc runtime equality filters ("{extra_filters}"/"$extra_filters"
+# marker), a mechanism SEPARATE from run_params substitution above -- see
+# build_extra_filters_clause()'s own docstring in rules_engine/db_ops.py.
+
+def test_build_extra_filters_clause_empty_or_none_is_blank():
+    # No dangling "AND" when there's nothing to filter on -- the marker
+    # just disappears cleanly wherever it was embedded in rule_syntax.
+    assert build_extra_filters_clause(None) == ""
+    assert build_extra_filters_clause({}) == ""
+
+
+def test_build_extra_filters_clause_single_filter():
+    assert build_extra_filters_clause({"run_ty": "MNT"}) == "AND run_ty = 'MNT'"
+
+
+def test_build_extra_filters_clause_multiple_filters_sorted_by_key():
+    # Deterministic output regardless of dict insertion order -- sorted by
+    # column name -- so the resulting SQL text (and executed_sql capture)
+    # is stable across runs with the same filters.
+    clause = build_extra_filters_clause({"run_ty": "MNT", "region": "EAST"})
+    assert clause == "AND region = 'EAST' AND run_ty = 'MNT'"
+
+
+def test_build_extra_filters_clause_escapes_quotes_in_values():
+    assert build_extra_filters_clause({"run_ty": "O'Brien"}) == "AND run_ty = 'O''Brien'"
+
+
+def test_build_extra_filters_clause_invalid_identifier_key_raises():
+    # Unlike run_params' VALUES (always safely quoted/escaped),
+    # extra_filters' KEYS become literal column names spliced directly
+    # into the SQL text -- a key that isn't a plain identifier can't be
+    # escaped the same way, so it's rejected outright instead.
+    with pytest.raises(ValueError) as exc_info:
+        build_extra_filters_clause({"run_ty = 'x'; DROP TABLE claims; --": "MNT"})
+    assert "not valid SQL identifiers" in str(exc_info.value)
+
+
+def test_build_extra_filters_clause_rejects_leading_digit_key():
+    with pytest.raises(ValueError):
+        build_extra_filters_clause({"1bad": "x"})
 
 
 # ── build_run_key ─────────────────────────────────────────────────────────

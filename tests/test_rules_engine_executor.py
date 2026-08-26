@@ -961,6 +961,135 @@ def test_execute_rule_writes_resolved_sql_to_executed_sql_on_success():
     assert executed.count("'B1'") == 2   # each style resolved to the same literal value
 
 
+# ── extra_filters -- runtime AND conditions on top of run_params ────────
+# A mechanism SEPARATE from run_params substitution: a rule opts in by
+# embedding the literal marker "{extra_filters}"/"$extra_filters"
+# somewhere in its rule_syntax; a caller then passes extra_filters=... at
+# run time. See rules_engine/db_ops.py::build_extra_filters_clause()'s
+# docstring for the full design rationale.
+
+def test_execute_rule_extra_filters_brace_marker_narrows_results():
+    # Only batch_id='B1' rows are visible to the scan at all once run_ty
+    # is spliced in as an extra_filters condition on a column rule_syntax
+    # never mentions on its own -- claims has no run_ty column, so if the
+    # marker weren't spliced correctly this would fail to bind, not just
+    # return the wrong count.
+    conn = _conn()
+    conn.execute("ALTER TABLE claims ADD COLUMN run_ty VARCHAR")
+    conn.execute("UPDATE claims SET run_ty = 'MNT' WHERE batch_id = 'B1'")
+    conn.execute("UPDATE claims SET run_ty = 'ADHOC' WHERE batch_id = 'B2'")
+
+    rule = _rule(
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+                    "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' {extra_filters}",
+        threshold_pct=100,
+    )
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB,
+                          extra_filters={"run_ty": "MNT"})
+    assert status == "SUCCESS"
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
+    assert len(results) == 1
+    executed = results[0]["executed_sql"]
+    assert "{extra_filters}" not in executed
+    assert "run_ty = 'MNT'" in executed
+    # total_records is the DENOMINATOR (every batch_id='B1' row, regardless
+    # of denial_reason -- 4 of claims' 5 rows: C1-C4), narrowed by the SAME
+    # extra_filters as the scan (all 4 also have run_ty='MNT' here) -- see
+    # _build_total_query()'s docstring. failed_records is the violation
+    # count from the actual scan: denial_reason IS NULL AND batch_id='B1'
+    # (C1, C3) -- 2.
+    assert results[0]["total_records"] == 4
+    assert results[0]["failed_records"] == 2
+
+
+def test_execute_rule_extra_filters_dollar_marker_also_works():
+    conn = _conn()
+    conn.execute("ALTER TABLE claims ADD COLUMN run_ty VARCHAR")
+    conn.execute("UPDATE claims SET run_ty = 'MNT' WHERE batch_id = 'B1'")
+
+    rule = _rule(
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+                    "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' $extra_filters",
+        threshold_pct=100,
+    )
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB,
+                          extra_filters={"run_ty": "MNT"})
+    assert status == "SUCCESS"
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
+    executed = results[0]["executed_sql"]
+    assert "$extra_filters" not in executed
+    assert "run_ty = 'MNT'" in executed
+
+
+def test_execute_rule_extra_filters_multiple_filters_all_applied():
+    conn = _conn()
+    conn.execute("ALTER TABLE claims ADD COLUMN run_ty VARCHAR")
+    conn.execute("ALTER TABLE claims ADD COLUMN region VARCHAR")
+    conn.execute("UPDATE claims SET run_ty = 'MNT', region = 'EAST' WHERE batch_id = 'B1'")
+
+    rule = _rule(
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+                    "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' {extra_filters}",
+        threshold_pct=100,
+    )
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB,
+                          extra_filters={"run_ty": "MNT", "region": "EAST"})
+    assert status == "SUCCESS"
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
+    executed = results[0]["executed_sql"]
+    assert "region = 'EAST'" in executed
+    assert "run_ty = 'MNT'" in executed
+
+
+def test_execute_rule_extra_filters_no_marker_silently_ignored():
+    # A rule that never embeds "{extra_filters}"/"$extra_filters" simply
+    # isn't affected, even when a caller passes extra_filters -- same
+    # "extra values are silently unused" philosophy as run_params' own
+    # unused keys. extra_filters references a column ("run_ty") this
+    # table doesn't even have -- proving it's never applied to the total-
+    # count denominator either, not just the scan, when the rule doesn't
+    # opt in via the marker.
+    conn = _conn()
+    rule = _rule(
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+                    "WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
+        threshold_pct=100,
+    )
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB,
+                          extra_filters={"run_ty": "MNT"})
+    assert status == "SUCCESS"
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
+    assert "run_ty" not in results[0]["executed_sql"]
+    assert results[0]["total_records"] == 4   # unaffected by the ignored extra_filters
+
+
+def test_execute_rule_extra_filters_invalid_identifier_key_writes_error():
+    # build_extra_filters_clause() rejects a non-identifier key before any
+    # query runs -- executor.py must catch that ValueError, log it, and
+    # write an ERROR row (executed_sql falling back to the raw rule_syntax,
+    # since substitution never even started), not let it propagate and
+    # crash the whole run.
+    conn = _conn()
+    rule = _rule(
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+                    "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' {extra_filters}",
+    )
+    bad_key = "run_ty = 'x'; DROP TABLE claims; --"
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB,
+                          extra_filters={bad_key: "MNT"})
+    assert status == "ERROR"
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
+    assert len(results) == 1
+    assert results[0]["status"] == "ERROR"
+    assert "not valid SQL identifiers" in results[0]["error_message"]
+    assert "{extra_filters}" in results[0]["executed_sql"]   # raw rule_syntax, splice never happened
+
+
 def test_execute_rule_with_year_month_run_key_not_batch_id():
     # run_key doesn't have to be a "batch" at all -- a year+month composite
     # (built via rules_engine/db_ops.py::build_run_key()) works identically, and
