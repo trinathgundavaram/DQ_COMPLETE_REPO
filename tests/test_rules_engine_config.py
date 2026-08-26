@@ -231,3 +231,20 @@ def test_resolve_database_name_legacy_db_map_falls_through_to_token_when_env_mis
     reload_config()
     with caplog.at_level(logging.WARNING):
         assert shared_config.resolve_database_name("QNXT_core_$env_T") == "QNXT_core_T"
+
+
+def test_resolve_database_name_token_is_case_insensitive_and_case_preserving(monkeypatch, reload_config):
+    # "$env" is matched regardless of how it's cased, and the substituted
+    # value follows the SAME casing the author used for the token itself.
+    monkeypatch.setenv("GRE_ENVIRONMENT", "DEV")
+    reload_config()
+    assert shared_config.resolve_database_name("QNXT_core_$env_T") == "QNXT_core_dev_T"    # all-lowercase token
+    assert shared_config.resolve_database_name("QNXT_core_$ENV_T") == "QNXT_core_DEV_T"    # all-uppercase token
+    assert shared_config.resolve_database_name("QNXT_core_$Env_T") == "QNXT_core_Dev_T"    # mixed -> Title case
+    assert shared_config.resolve_database_name("QNXT_core_$enV_T") == "QNXT_core_Dev_T"    # mixed -> Title case
+
+
+def test_resolve_database_name_mixed_case_token_still_collapses_for_uat_prod(monkeypatch, reload_config):
+    monkeypatch.setenv("GRE_ENVIRONMENT", "UAT")
+    reload_config()
+    assert shared_config.resolve_database_name("QNXT_core_$Env_T") == "QNXT_core_T"

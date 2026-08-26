@@ -199,6 +199,10 @@ def get_environment() -> str:
 # default.
 _DEFAULT_ENV_TOKEN_VALUES = {"DEV": "dev", "QA": "qa", "INT": "int", "UAT": "", "PROD": ""}
 
+# Matches the $env/$ENV placeholder in ANY casing ("$env", "$ENV", "$Env",
+# "$enV", ...) -- see resolve_database_name()'s case-preserving substitution.
+_ENV_TOKEN_RE = re.compile(r"\$env", re.IGNORECASE)
+
 
 def _env_token_value() -> str:
     """The lowercase string $env substitutes with for get_environment().
@@ -221,8 +225,11 @@ def resolve_database_name(authored_name: str) -> str:
 
     1. $env / $ENV TOKEN (recommended -- scales to any number of source
        databases with ZERO per-database config). Author database_name with
-       a literal "$env" (lowercase) or "$ENV" (uppercase) placeholder
-       wherever the environment segment goes, e.g.:
+       a literal "$env" placeholder wherever the environment segment goes
+       -- matched CASE-INSENSITIVELY, so "$env", "$ENV", "$Env", "$enV",
+       etc. all work, with the substituted value's case following
+       whichever casing was used ("$env" -> lowercase, "$ENV" -> uppercase,
+       anything mixed -> Title case). E.g.:
 
            database_name = "QNXT_core_$env_T"
 
@@ -292,11 +299,27 @@ def resolve_database_name(authored_name: str) -> str:
             env_var, GRE_ENVIRONMENT,
         )
 
-    # 2. $env / $ENV token substitution -- the scalable default.
-    if "$env" in authored_name or "$ENV" in authored_name:
+    # 2. $env / $ENV token substitution -- the scalable default. Matched
+    # CASE-INSENSITIVELY ("$env", "$ENV", "$Env", "$enV", ... all match --
+    # authors typing it by hand shouldn't have to get the casing exact),
+    # with the substituted value's case following whichever casing the
+    # token itself was written in: all-lowercase token -> lowercase value,
+    # all-uppercase token -> uppercase value, anything mixed (e.g. "$Env")
+    # -> Title-case value.
+    if _ENV_TOKEN_RE.search(authored_name):
         lower_val = _env_token_value()
         upper_val = lower_val.upper()
-        resolved = authored_name.replace("$env", lower_val).replace("$ENV", upper_val)
+        title_val = lower_val.capitalize()
+
+        def _sub(match: "re.Match") -> str:
+            token = match.group(0)[1:]   # strip the leading "$"
+            if token.isupper():
+                return upper_val
+            if token.islower():
+                return lower_val
+            return title_val
+
+        resolved = _ENV_TOKEN_RE.sub(_sub, authored_name)
         # Collapse the double underscore left behind when an environment's
         # value is empty (UAT/PROD by default) -- "QNXT_core__T" -> "QNXT_core_T".
         return re.sub(r"_{2,}", "_", resolved)
