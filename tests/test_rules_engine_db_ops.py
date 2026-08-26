@@ -84,6 +84,45 @@ def test_substitute_params_empty_params_dict_with_no_tokens_ok():
     assert _substitute_params("SELECT 1", None) == "SELECT 1"
 
 
+# ── $key (bare, no braces) -- interchangeable with {key}, freely mixed ────
+
+def test_substitute_params_dollar_token():
+    sql = "WHERE batch_id = '$batch_id'"
+    assert _substitute_params(sql, {"batch_id": "B1"}) == "WHERE batch_id = 'B1'"
+
+
+def test_substitute_params_dollar_and_brace_tokens_mixed_in_one_sql():
+    sql = "WHERE batch_id = '{batch_id}' AND yr = $year AND run_type = '$run_type'"
+    resolved = _substitute_params(sql, {"batch_id": "B1", "year": 2026, "run_type": "MONTHLY"})
+    assert resolved == "WHERE batch_id = 'B1' AND yr = 2026 AND run_type = 'MONTHLY'"
+
+
+def test_substitute_params_dollar_token_respects_word_boundary():
+    # "$year" must not also consume "_end" -- "$year_end" is a DIFFERENT
+    # token (year_end), not "$year" followed by literal "_end".
+    sql = "WHERE d = $year_end"
+    with pytest.raises(ValueError) as exc_info:
+        _substitute_params(sql, {"year": 2026})
+    assert "year_end" in str(exc_info.value)
+
+    resolved = _substitute_params(sql, {"year": 2026, "year_end": 999})
+    assert resolved == "WHERE d = 999"
+
+
+def test_substitute_params_dollar_token_unresolved_raises():
+    sql = "WHERE batch_id = '$batch_id' AND yr = $year"
+    with pytest.raises(ValueError) as exc_info:
+        _substitute_params(sql, {"batch_id": "B1"})
+    msg = str(exc_info.value)
+    assert "year" in msg
+    assert "batch_id" in msg
+
+
+def test_substitute_params_dollar_token_escapes_quotes():
+    sql = "WHERE batch_id = '$batch_id'"
+    assert _substitute_params(sql, {"batch_id": "O'Brien"}) == "WHERE batch_id = 'O''Brien'"
+
+
 # ── build_run_key ─────────────────────────────────────────────────────────
 
 def test_build_run_key_single_part():

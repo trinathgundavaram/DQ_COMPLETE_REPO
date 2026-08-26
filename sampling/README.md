@@ -80,7 +80,7 @@ from N.)
 
 ## Scoping the candidate pull: `run_params`
 
-`scope_sql` and `exclusion_sql` may both embed any number of `"{key}"`
+`scope_sql` and `exclusion_sql` may both embed any number of `"{key}"` or `"$key"` (freely mixed)
 tokens -- each run passes a `run_params` dict, and every matching token is
 substituted (quoted, escaped) before the pull query runs, the SAME
 mechanism and dict shape `rules_engine/` uses for `rule_syntax`/`scope_sql`.

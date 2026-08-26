@@ -257,17 +257,26 @@ def bulk_execute(conn, sql: str, rows: list, chunk_size: int = None) -> int:
 # scalar all the way down. Different projects scope their data differently
 # -- a month/year pair, a specific date, a region or contract column, or no
 # filter at all -- so v2 generalizes this to an arbitrary dict of named
-# values: a sampling config author embeds whichever "{key}" tokens their
-# SQL needs, and the caller supplies a matching dict at run time. There is
-# no reserved/required key -- run_params is entirely up to the config
-# author. The one value the idempotency/checkpoint schema
+# values: a sampling config author embeds whichever "{key}" (or "$key")
+# tokens their SQL needs, and the caller supplies a matching dict at run
+# time. There is no reserved/required key -- run_params is entirely up to
+# the config author. The one value the idempotency/checkpoint schema
 # (gre_sample_selections, gre_sampling_audit) keys off is `run_key`, a
 # separate explicit parameter callers pass to sampling/sampling.py's entry
 # points -- see build_run_key() below for a convenience way to build one
 # out of a batch id, a year+month pair, a specific date, or any other
 # column/combination.
 
-_TOKEN_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+# Two interchangeable token spellings, freely mixed in the same scope_sql/
+# exclusion_sql: "{key}" (braces) and "$key" (bare, no braces --
+# word-boundary terminated, so "$year" in "...$year_end..." does NOT
+# consume "_end"). Group 1 catches the braced form, group 2 the dollar
+# form -- exactly one of the two is non-None per match. Caution for
+# postgres scope_sql/exclusion_sql specifically: Postgres's own
+# dollar-quoted string literals ($tag$...$tag$) can collide with this if
+# `tag` happens to match a run_params key -- prefer "{key}" braces in any
+# SQL that also uses dollar-quoting.
+_TOKEN_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}|\$([a-zA-Z_][a-zA-Z0-9_]*)\b")
 
 
 def _escape_sql_literal(value) -> str:
@@ -282,26 +291,30 @@ def _escape_sql_literal(value) -> str:
 
 def _find_unresolved_tokens(sql: str) -> list:
     """
-    After substitution, scan for any "{name}"-shaped token still present
-    -- almost always a param the caller forgot to pass (or a typo in the
-    config's SQL), which would otherwise surface as a confusing SQL syntax
-    error from the source database instead of a clear, specific,
-    pre-execution one. Deliberately simple (a bare identifier in braces,
-    not a full templating grammar) since that's the only shape this
-    substitution mechanism ever produces or consumes.
+    After substitution, scan for any "{name}"- or "$name"-shaped token
+    still present -- almost always a param the caller forgot to pass (or a
+    typo in the config's SQL), which would otherwise surface as a
+    confusing SQL syntax error from the source database instead of a
+    clear, specific, pre-execution one. Deliberately simple (a bare
+    identifier, braced or dollar-prefixed, not a full templating grammar)
+    since that's the only shape this substitution mechanism ever produces
+    or consumes.
     """
-    return _TOKEN_RE.findall(sql)
+    return [braced or dollar for braced, dollar in _TOKEN_RE.findall(sql)]
 
 
 def _substitute_params(sql: str, params: dict) -> str:
     """
-    Replace every literal "{key}" token in `sql` with the escaped string
-    value of params[key], for every key present in `params`. Config
+    Replace every literal "{key}" or "$key" token in `sql` with the
+    escaped string value of params[key], for every key present in
+    `params` -- both spellings are recognized everywhere this mechanism is
+    used (scope_sql, exclusion_sql), freely mixed in the same SQL. Config
     authors are responsible for their own quoting (e.g. `WHERE run_date =
-    '{run_date}'`) -- this only does the swap.
+    '{run_date}'` / `WHERE run_date = '$run_date'`) -- this only does the
+    swap.
 
-    Raises ValueError if, after substitution, any "{token}"-shaped text
-    remains -- fail fast with a clear message naming the missing
+    Raises ValueError if, after substitution, any "{token}"/"$token"-shaped
+    text remains -- fail fast with a clear message naming the missing
     parameter(s), rather than letting an unsubstituted token reach the
     database as a syntax error. `sql` may be None/empty (returns it
     unchanged) so callers don't need to guard optional CLOB columns
@@ -309,9 +322,15 @@ def _substitute_params(sql: str, params: dict) -> str:
     """
     if not sql:
         return sql
-    resolved = sql
-    for key, value in (params or {}).items():
-        resolved = resolved.replace("{%s}" % key, _escape_sql_literal(value))
+    params = params or {}
+
+    def _replace(match: "re.Match") -> str:
+        key = match.group(1) or match.group(2)
+        if key not in params:
+            return match.group(0)   # left as-is; caught by the unresolved-token check below
+        return _escape_sql_literal(params[key])
+
+    resolved = _TOKEN_RE.sub(_replace, sql)
 
     unresolved = _find_unresolved_tokens(resolved)
     if unresolved:

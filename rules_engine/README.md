@@ -88,7 +88,7 @@ itself no longer uses it internally.
 
 ## Scoping a rule's data: `run_params`
 
-`rule_syntax` may embed any number of `"{key}"` tokens -- each run passes a
+`rule_syntax` may embed any number of `"{key}"` or `"$key"` tokens (freely mixed) -- each run passes a
 `run_params` dict, and every matching token is substituted (quoted,
 escaped) before the query runs. A project scopes its data however it
 needs: month/year, a business batch id, a date range, a region/contract

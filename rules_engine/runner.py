@@ -348,7 +348,7 @@ def run_rule_group(
                    gre_config.get_meta_db()
     triggered_by : freeform string recorded on gre_rule_audit
     run_params   : optional dict of named values a rule's rule_syntax can
-                   reference via "{key}" tokens -- passed through exactly
+                   reference via "{key}" or "$key" tokens (freely mixed) -- passed through exactly
                    as given, no reserved/required key. The SAME dict also
                    becomes the equality filters for the auto-generated
                    total-record count
@@ -678,7 +678,7 @@ def run_by_process_name(
                    rules_engine.config.get_meta_db() if not supplied.
     project_name : optional further narrowing to one project within this
                    process_name; omit to run every project under it.
-    run_params   : free-form dict for rule_syntax {key} substitution -- see
+    run_params   : free-form dict for rule_syntax {key}/$key substitution -- see
                    run_rule_group()'s docstring. run_key is deliberately
                    NOT merged into this.
 

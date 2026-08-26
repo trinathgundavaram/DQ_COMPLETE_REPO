@@ -24,9 +24,10 @@ Usage
     python run_by_process.py sampling --process-name WEEKLY_REVIEW_SAMPLE
 
     # Custom run_params -- values a rule's rule_syntax (or a sampling
-    # config's scope_sql/exclusion_sql) can reference via "{key}" tokens.
-    # Repeat --param once per key; KEY=VALUE, split on the FIRST "=" only
-    # (a value containing "=" is preserved intact):
+    # config's scope_sql/exclusion_sql) can reference via "{key}" OR "$key"
+    # tokens (freely mixed in the same SQL -- e.g. "{year}" and "$month"
+    # both work). Repeat --param once per key; KEY=VALUE, split on the
+    # FIRST "=" only (a value containing "=" is preserved intact):
     python run_by_process.py rules --process-name UNIVERSE_VALIDATION \
         --param year=2026 --param month=8
 
@@ -68,7 +69,8 @@ def _parse_params(pairs) -> dict:
     ["year=2026", "month=8"] -> {"year": "2026", "month": "8"} -- the
     run_params dict rules_engine.runner/sampling.sampling substitute into
     a rule's rule_syntax (or a sampling config's scope_sql/exclusion_sql)
-    "{key}" tokens. Every value arrives as a plain string (argparse/argv
+    "{key}" or "$key" tokens (freely mixed). Every value arrives as a
+    plain string (argparse/argv
     carries no type info) -- a rule_syntax comparing it against a numeric
     column should cast either side in SQL if that matters for the target
     database. Splits on the FIRST "=" only, so a value that itself
@@ -189,9 +191,9 @@ def main():
                                    "Defaults to today's date (YYYY-MM-DD) if omitted.")
     rules_parser.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
                               help="A run_params entry a rule's rule_syntax can reference via "
-                                   "'{KEY}'. Repeatable -- pass --param once per key "
-                                   "(e.g. --param year=2026 --param month=8). Values are always "
-                                   "strings. Not merged into --run-key.")
+                                   "'{KEY}' or '$KEY' (freely mixed). Repeatable -- pass --param "
+                                   "once per key (e.g. --param year=2026 --param month=8). Values "
+                                   "are always strings. Not merged into --run-key.")
     rules_parser.set_defaults(func=_run_rules)
 
     sampling_parser = subparsers.add_parser(
@@ -206,9 +208,9 @@ def main():
                                       "Defaults to today's date (YYYY-MM-DD) if omitted.")
     sampling_parser.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
                                  help="A run_params entry a config's scope_sql/exclusion_sql can "
-                                      "reference via '{KEY}'. Repeatable -- pass --param once per "
-                                      "key (e.g. --param year=2026 --param month=8). Values are "
-                                      "always strings. Not merged into --run-key.")
+                                      "reference via '{KEY}' or '$KEY' (freely mixed). Repeatable -- "
+                                      "pass --param once per key (e.g. --param year=2026 --param "
+                                      "month=8). Values are always strings. Not merged into --run-key.")
     sampling_parser.add_argument("--seed", type=int, default=None,
                                  help="Explicit seed for RANDOM/SYSTEMATIC sampling_method "
                                       "reproducibility, passed to every config in scope. Ignored "

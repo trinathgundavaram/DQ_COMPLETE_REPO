@@ -42,9 +42,10 @@
 -- Design notes (see rules_engine/config.py's usage,
 -- rules_engine/executor.py docstrings for the code that relies on these
 -- shapes):
---   * rule_syntax may embed any number of "{key}" tokens (e.g. "{run_date}",
---     "{year}", "{run_type}"). The engine string-substitutes each one
---     (quoted, escaped) from the run_params dict passed to this run --
+--   * rule_syntax may embed any number of "{key}" OR "$key" tokens (e.g.
+--     "{run_date}"/"$run_date", "{year}"/"$year", "{run_type}"/"$run_type"
+--     -- freely mixed). The engine string-substitutes each one (quoted,
+--     escaped) from the run_params dict passed to this run --
 --     see rules_engine/db_ops.py::_substitute_params(). run_params has NO
 --     reserved/required key -- entirely up to the rule author what it
 --     contains. The one value the tracking/idempotency schema

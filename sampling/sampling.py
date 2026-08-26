@@ -563,7 +563,7 @@ def run_sampling(config_id, run_key: str = None, cf=None, meta_conn=None, meta_d
     """
     Execute one stratified sampling pass for `config_id`, scoped to
     `run_key` and whatever else `run_params` supplies (substituted into
-    scope_sql's/exclusion_sql's "{key}" tokens -- same convention, and the
+    scope_sql's/exclusion_sql's "{key}" or "$key" tokens (freely mixed) -- same convention, and the
     same sampling.db_ops.py::_substitute_params() mechanism, as
     gre_rules.rule_syntax in rules_engine/).
 
@@ -591,7 +591,7 @@ def run_sampling(config_id, run_key: str = None, cf=None, meta_conn=None, meta_d
     seed         : explicit seed for RANDOM/SYSTEMATIC reproducibility; a
                    fresh one is generated and persisted if not supplied
     run_params   : optional dict of named values scope_sql/exclusion_sql can
-                   reference via "{key}" tokens -- passed through exactly as
+                   reference via "{key}" or "$key" tokens (freely mixed) -- passed through exactly as
                    given, no reserved/required key. Lets each project scope
                    its candidate universe however it needs, the same way
                    rules_engine's run_params does.
@@ -851,7 +851,7 @@ def run_sampling_for_process_name(
     seed         : explicit seed passed through to every run_sampling()
                    call (RANDOM/SYSTEMATIC only) -- omit to let each config
                    generate its own independent seed.
-    run_params   : free-form dict for scope_sql/exclusion_sql {key}
+    run_params   : free-form dict for scope_sql/exclusion_sql {key}/$key
                    substitution, passed through to every run_sampling()
                    call unchanged. run_key is deliberately NOT merged into
                    this -- see run_sampling()'s docstring.

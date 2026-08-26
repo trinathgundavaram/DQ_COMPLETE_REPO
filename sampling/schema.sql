@@ -46,7 +46,8 @@ CREATE MULTISET TABLE {{META_DB}}.gre_sampling_config (
     universe_table       VARCHAR(200) NOT NULL,   -- fully-qualified FROM target, e.g. "db.schema.table"
     key_columns          VARCHAR(500) NOT NULL,   -- entity key column(s), CSV
     scope_sql            CLOB,                    -- WHERE-fragment; may embed any number of
-                                                    -- "{key}" tokens (e.g. {run_date}, {year}),
+                                                    -- "{key}" OR "$key" tokens (e.g. {run_date}/
+                                                    -- $run_date, {year}/$year, freely mixed),
                                                     -- substituted from run_params the same way
                                                     -- rules_engine's rule_syntax is -- see
                                                     -- sampling/db_ops.py::_substitute_params().
@@ -60,7 +61,7 @@ CREATE MULTISET TABLE {{META_DB}}.gre_sampling_config (
                                                     -- candidates" isn't always a plain equality
                                                     -- filter (exclusions, date ranges, ...).
     exclusion_sql        CLOB,                    -- WHERE-fragment; matching rows are EXCLUDED.
-                                                    -- Same "{key}" run_params substitution as
+                                                    -- Same "{key}"/"$key" run_params substitution as
                                                     -- scope_sql above (both go through
                                                     -- _substitute_params with the same dict).
     target_volume        INTEGER NOT NULL DEFAULT 150,

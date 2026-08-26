@@ -808,7 +808,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
                   year+month pair, a specific date, or any other
                   column/combination) via rules_engine/db_ops.py::build_run_key(),
                   or pass your own string directly.
-    run_params  : dict of named values substituted into rule_syntax's "{key}"
+    run_params  : dict of named values substituted into rule_syntax's "{key}"/"$key"
                   tokens (see rules_engine/db_ops.py::_substitute_params()) AND
                   used, key-for-key, as the equality filters for the
                   auto-generated total-record count (see
