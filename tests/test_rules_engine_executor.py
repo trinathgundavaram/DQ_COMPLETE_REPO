@@ -133,7 +133,7 @@ def _conn():
             total_records BIGINT, failed_records BIGINT, failure_pct DOUBLE,
             threshold_pct_used DOUBLE, threshold_count_used INTEGER,
             threshold_operator_used VARCHAR, severity VARCHAR, status VARCHAR,
-            error_message VARCHAR, source_tieback_sql VARCHAR, active_ind VARCHAR DEFAULT 'Y',
+            error_message VARCHAR, executed_sql VARCHAR, source_tieback_sql VARCHAR, active_ind VARCHAR DEFAULT 'Y',
             load_datetime TIMESTAMP DEFAULT current_timestamp,
             last_updated_datetime TIMESTAMP
         )
@@ -925,11 +925,41 @@ def test_execute_rule_unresolved_token_fails_fast_before_any_query():
 
     results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1")
     assert len(results) == 1 and results[0]["status"] == "ERROR"
+    # Substitution itself failed -- executed_sql holds the RAW, unsubstituted
+    # rule_syntax, so the unresolved {run_type} token is still visible for
+    # a reviewer, instead of being empty/NULL just because nothing ran.
+    assert "{run_type}" in results[0]["executed_sql"]
+    assert "{batch_id}" in results[0]["executed_sql"]   # never substituted either -- raised before either token resolved
 
     assert execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1") == []
 
 
 # ── run_key genericity: no "batch_id" concept required ───────────────────
+
+def test_execute_rule_writes_resolved_sql_to_executed_sql_on_success():
+    # On a successful attempt (any status), gre_results.executed_sql holds
+    # the FULLY RESOLVED SQL that actually ran -- run_params tokens already
+    # substituted to their literal values -- not the raw, templated
+    # rule_syntax off gre_rules. batch_id is referenced via BOTH styles
+    # ("{batch_id}" braces AND "$batch_id" dollar) in the same rule_syntax
+    # to prove both resolve identically (must ALSO be a real run_params key
+    # here, since it doubles as the auto total-record-count's equality
+    # filter -- see _build_total_query()'s docstring).
+    conn = _conn()
+    rule = _rule(
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+                    "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' AND batch_id = '$batch_id'",
+        threshold_pct=25,
+    )
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    assert status == "SUCCESS"
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
+    assert len(results) == 1
+    executed = results[0]["executed_sql"]
+    assert "{batch_id}" not in executed and "$batch_id" not in executed   # both tokens resolved
+    assert executed.count("'B1'") == 2   # each style resolved to the same literal value
+
 
 def test_execute_rule_with_year_month_run_key_not_batch_id():
     # run_key doesn't have to be a "batch" at all -- a year+month composite

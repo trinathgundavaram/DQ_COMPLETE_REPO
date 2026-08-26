@@ -153,7 +153,7 @@ def _conn():
             total_records BIGINT, failed_records BIGINT, failure_pct DOUBLE,
             threshold_pct_used DOUBLE, threshold_count_used INTEGER,
             threshold_operator_used VARCHAR, severity VARCHAR, status VARCHAR,
-            error_message VARCHAR, source_tieback_sql VARCHAR, active_ind VARCHAR DEFAULT 'Y',
+            error_message VARCHAR, executed_sql VARCHAR, source_tieback_sql VARCHAR, active_ind VARCHAR DEFAULT 'Y',
             load_datetime TIMESTAMP DEFAULT current_timestamp,
             last_updated_datetime TIMESTAMP
         )

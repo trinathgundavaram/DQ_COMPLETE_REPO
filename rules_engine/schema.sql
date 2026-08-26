@@ -326,6 +326,22 @@ CREATE MULTISET TABLE {{META_DB}}.gre_results (
                                                -- the SAME column as the data verdict now, not a
                                                -- separate gre_log.status.
     error_message                VARCHAR(2000),  -- populated only when status = 'ERROR'
+    executed_sql                 CLOB,         -- the ACTUAL rule_syntax text that ran this attempt,
+                                               -- AFTER run_params substitution ({key}/$key already
+                                               -- resolved to their literal values) -- see
+                                               -- rules_engine/executor.py::execute_rule()'s "query"
+                                               -- variable. Lets a reviewer see EXACTLY what SQL
+                                               -- produced this attempt's verdict without having to
+                                               -- reconstruct it from gre_rules.rule_syntax + whatever
+                                               -- run_params happened to be passed that day. Populated
+                                               -- for every attempt, including ERROR ones where
+                                               -- substitution itself succeeded (SQL_RUNTIME,
+                                               -- CONNECTION_UNAVAILABLE, ...); for the two failure
+                                               -- points BEFORE substitution runs at all
+                                               -- (SOURCE_PREPARE_ERROR, PARAM_SUBSTITUTION_ERROR)
+                                               -- this instead holds the RAW, unsubstituted
+                                               -- rule_syntax -- still useful there precisely because
+                                               -- it shows any unresolved {key}/$key tokens.
     source_tieback_sql          CLOB,         -- generated (never executed) SQL TEXT that joins
                                                -- this rule's source table straight to its
                                                -- gre_exceptions rows for run_key, parsing

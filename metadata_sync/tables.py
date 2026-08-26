@@ -79,7 +79,7 @@ GRE_RESULTS = {
         "result_id", "run_id", "rule_id", "rule_group", "project_name", "process_name",
         "run_key", "seq_no", "start_time", "end_time", "total_records", "failed_records",
         "failure_pct", "threshold_pct_used", "threshold_count_used", "threshold_operator_used",
-        "severity", "status", "error_message", "source_tieback_sql", "active_ind",
+        "severity", "status", "error_message", "executed_sql", "source_tieback_sql", "active_ind",
         "load_datetime", "last_updated_datetime",
     ],
 }

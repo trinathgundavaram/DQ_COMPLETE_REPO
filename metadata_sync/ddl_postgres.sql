@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_results (
     severity                 VARCHAR(50),
     status                   VARCHAR(10),
     error_message            VARCHAR(2000),
+    executed_sql             TEXT,
     source_tieback_sql       TEXT,
     active_ind               CHAR(1),
     load_datetime            TIMESTAMP,

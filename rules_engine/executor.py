@@ -640,7 +640,8 @@ def _deactivate_prior_results(meta_conn, meta_db: str, rule_id, run_key: str, cu
 def _write_result(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str, start_time: float,
                    status: str, total_records=None, failed_records: int = 0, failure_pct=None,
                    threshold_pct_used=None, threshold_count_used=None, threshold_operator_used=None,
-                   source_tieback_sql: str = None, error_message: str = None) -> None:
+                   source_tieback_sql: str = None, error_message: str = None,
+                   executed_sql: str = None) -> None:
     """
     Insert ONE gre_results row for this execution attempt -- the single
     consolidated replacement for what used to be a gre_log row (one per
@@ -672,6 +673,14 @@ def _write_result(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str
     ONLY place an attempt's outcome is recorded at all; a caller that
     needs this call to be best-effort should go through the
     _write_result_safe() wrapper below instead of catching here.
+
+    executed_sql : the ACTUAL SQL text that ran for this attempt (rule_syntax
+                   AFTER _substitute_params() resolved every {key}/$key
+                   token), or -- for the two failure points before
+                   substitution runs at all -- the RAW, unsubstituted
+                   rule_syntax, so an unresolved token is still visible.
+                   See rules_engine/schema.sql's gre_results.executed_sql
+                   column comment for the full rationale.
     """
     rule_id = rule.get("rule_id")
     _deactivate_prior_results(meta_conn, meta_db, rule_id, run_key, run_id)
@@ -681,14 +690,15 @@ def _write_result(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str
             run_id, rule_id, rule_group, project_name, process_name, run_key, seq_no,
             start_time, end_time, total_records, failed_records, failure_pct,
             threshold_pct_used, threshold_count_used, threshold_operator_used,
-            severity, status, error_message, source_tieback_sql, active_ind
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Y')
+            severity, status, error_message, executed_sql, source_tieback_sql, active_ind
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Y')
     """
     execute_dml(meta_conn, sql, [
         run_id, rule_id, rule.get("rule_group"), rule.get("project_name"), rule.get("process_name"),
         run_key, rule.get("seq_no"), datetime.fromtimestamp(start_time), datetime.now(),
         total_records, failed_records, failure_pct, threshold_pct_used, threshold_count_used,
-        threshold_operator_used, rule.get("severity"), status, error_message, source_tieback_sql,
+        threshold_operator_used, rule.get("severity"), status, error_message, executed_sql,
+        source_tieback_sql,
     ])
 
 
@@ -872,7 +882,8 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     except Exception as exc:
         logger.error("Rule %s: source prepare failed: %s", rule.get("rule_id"), exc, exc_info=True)
         _log_error(meta_conn, meta_db, run_id, rule, run_key, "SOURCE_PREPARE_ERROR", str(exc))
-        _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc))
+        _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc),
+                            executed_sql=rule.get("rule_syntax"))
         return "ERROR"
 
     # ── STEP 0b: run_params substitution -- fail fast, never mid-run ─────────
@@ -881,7 +892,8 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     except ValueError as exc:
         logger.error("Rule %s: run_params substitution failed: %s", rule.get("rule_id"), exc)
         _log_error(meta_conn, meta_db, run_id, rule, run_key, "PARAM_SUBSTITUTION_ERROR", str(exc))
-        _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc))
+        _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc),
+                            executed_sql=rule.get("rule_syntax"))
         return "ERROR"
 
     # ── STEP 1: ONE scan of rule_syntax -- TRUE failed count + all rows ──────
@@ -890,7 +902,8 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     except Exception as exc:
         logger.error("Rule %s: rule_syntax scan failed: %s", rule.get("rule_id"), exc, exc_info=True)
         _log_error(meta_conn, meta_db, run_id, rule, run_key, "SQL_RUNTIME", str(exc))
-        _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc))
+        _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc),
+                            executed_sql=query)
         return "ERROR"
 
     # ── STEP 2: total in-scope record count (memoized across the run_group) ──
@@ -899,7 +912,8 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     except Exception as exc:
         logger.error("Rule %s: scope/count query failed: %s", rule.get("rule_id"), exc, exc_info=True)
         _log_error(meta_conn, meta_db, run_id, rule, run_key, "SCOPE_QUERY_FAILURE", str(exc))
-        _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc))
+        _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc),
+                            executed_sql=query)
         return "ERROR"
 
     # ── STEP 3: reconcile gre_exceptions against this attempt -- best effort ─
@@ -962,12 +976,13 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
                 threshold_count_used=verdict["threshold_count_used"],
                 threshold_operator_used=verdict["threshold_operator_used"],
                 source_tieback_sql=source_tieback_sql,
+                executed_sql=query,
             )
         except Exception as exc:
             logger.error("Rule %s: gre_results write failed: %s", rule.get("rule_id"), exc, exc_info=True)
             _log_error(meta_conn, meta_db, run_id, rule, run_key, "RESULTS_WRITE_FAILURE", str(exc))
             _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR",
-                                failed_records=failed, error_message=str(exc))
+                                failed_records=failed, error_message=str(exc), executed_sql=query)
             return "ERROR"
     else:
         # verdict["write_result"] is False for the "nothing to score"
@@ -981,7 +996,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
         _write_result_safe(
             meta_conn, meta_db, run_id, rule, run_key, start, verdict["status"],
             total_records=total, failed_records=failed, failure_pct=failure_pct,
-            source_tieback_sql=source_tieback_sql,
+            source_tieback_sql=source_tieback_sql, executed_sql=query,
         )
 
     logger.info(

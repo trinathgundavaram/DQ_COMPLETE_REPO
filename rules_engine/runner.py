@@ -270,7 +270,8 @@ def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, run_key, reso
             _log_error(meta_conn, meta_db, run_id, rule, run_key,
                        "CONNECTION_UNAVAILABLE", f"No connection '{rule['sql_dialect']}'")
             _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, time.time(), "ERROR",
-                        error_message=f"No connection '{rule['sql_dialect']}'")
+                        error_message=f"No connection '{rule['sql_dialect']}'",
+                        executed_sql=rule.get("rule_syntax"))
             results[rule["rule_id"]] = "ERROR"
             errored += 1
 
@@ -492,7 +493,8 @@ def run_rule_group(
                 _log_error(meta_conn, meta_db, run_id, rule, run_key,
                            "CONNECTION_UNAVAILABLE", f"No connection '{rule['sql_dialect']}'")
                 _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, time.time(), "ERROR",
-                            error_message=f"No connection '{rule['sql_dialect']}'")
+                            error_message=f"No connection '{rule['sql_dialect']}'",
+                            executed_sql=rule.get("rule_syntax"))
                 status = "ERROR"
             else:
                 status = execute_rule(rule, db_conn, meta_conn, run_id, run_key, resolved_params, meta_db,
