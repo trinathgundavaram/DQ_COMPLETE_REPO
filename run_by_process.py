@@ -23,12 +23,30 @@ Usage
     # Same idea for sampling (gre_sampling_config.process_name):
     python run_by_process.py sampling --process-name WEEKLY_REVIEW_SAMPLE
 
+    # Custom run_params -- values a rule's rule_syntax (or a sampling
+    # config's scope_sql/exclusion_sql) can reference via "{key}" tokens.
+    # Repeat --param once per key; KEY=VALUE, split on the FIRST "=" only
+    # (a value containing "=" is preserved intact):
+    python run_by_process.py rules --process-name UNIVERSE_VALIDATION \
+        --param year=2026 --param month=8
+
+    # Reproducible RANDOM/SYSTEMATIC sampling (rules_engine has no
+    # equivalent -- its threshold evaluation has nothing to seed):
+    python run_by_process.py sampling --process-name WEEKLY_REVIEW_SAMPLE --seed 42
+
     # Detailed debug logging (SQL text + row counts, never data/params --
     # see rules_engine/db_ops.py's or sampling/db_ops.py's module docstring
     # for exactly what's logged) is ON BY DEFAULT -- nothing to pass. To
     # quiet it down instead:
     python run_by_process.py rules --process-name UNIVERSE_VALIDATION \
         --log-level INFO
+
+    # Everything above reads gre_config's usual env vars too (GRE_ENVIRONMENT,
+    # GRE_META_DB, GRE_LOG_LEVEL, TERADATA_*, ...) -- set them in the shell
+    # (or a sourced env file) before invoking this script, same as any other
+    # env-driven CLI; there is no separate --env flag, because GRE_ENVIRONMENT
+    # is read directly from the process environment on import, not from argv:
+    GRE_ENVIRONMENT=QA python run_by_process.py rules --process-name UNIVERSE_VALIDATION
 
 Exit code is 0 if every group/config completed successfully, 1 otherwise
 (a rule_group/config that errored, or an unresolved process_name).
@@ -37,7 +55,7 @@ This is a thin convenience layer -- rules_engine/runner.py's
 run_by_process_name() and sampling/sampling.py's run_sampling_for_process_name()
 are the actual library functions; import and call those directly instead
 of this script for anything more involved than a one-off local/scheduled
-run (custom run_params, catching exceptions your own way, etc.).
+run (catching exceptions your own way, driving rule_variant, etc.).
 """
 import argparse
 import sys
@@ -45,10 +63,39 @@ import sys
 from db.connection_factory import build_and_load_connection_factory
 
 
+def _parse_params(pairs) -> dict:
+    """
+    ["year=2026", "month=8"] -> {"year": "2026", "month": "8"} -- the
+    run_params dict rules_engine.runner/sampling.sampling substitute into
+    a rule's rule_syntax (or a sampling config's scope_sql/exclusion_sql)
+    "{key}" tokens. Every value arrives as a plain string (argparse/argv
+    carries no type info) -- a rule_syntax comparing it against a numeric
+    column should cast either side in SQL if that matters for the target
+    database. Splits on the FIRST "=" only, so a value that itself
+    contains "=" (e.g. --param filter="a=b") is preserved intact. Raises
+    ValueError with the offending pair on anything with no "=" at all,
+    since a silently-dropped malformed --param is worse than failing fast
+    before any connection is even opened.
+    """
+    params = {}
+    for pair in pairs or []:
+        if "=" not in pair:
+            raise ValueError(f"--param must be KEY=VALUE, got: {pair!r}")
+        key, value = pair.split("=", 1)
+        params[key] = value
+    return params
+
+
 def _run_rules(args):
     from rules_engine.config import configure_logging
     from rules_engine.db_ops import default_run_key
     from rules_engine.runner import run_by_process_name
+
+    try:
+        run_params = _parse_params(args.param)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     configure_logging(args.log_level)
     cf = build_and_load_connection_factory()
@@ -58,12 +105,14 @@ def _run_rules(args):
     # not a second, independent default computation.
     run_key = args.run_key or default_run_key()
     print(f"Running rules_engine for process_name={args.process_name!r} "
-          f"project_name={args.project_name!r} run_key={run_key!r} ...")
+          f"project_name={args.project_name!r} run_key={run_key!r} "
+          f"run_params={run_params!r} ...")
 
     try:
         outcome = run_by_process_name(
             args.process_name, run_key, cf,
             project_name=args.project_name,
+            run_params=run_params,
         )
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -83,16 +132,25 @@ def _run_sampling(args):
     from sampling.db_ops import default_run_key
     from sampling.sampling import run_sampling_for_process_name
 
+    try:
+        run_params = _parse_params(args.param)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     configure_logging(args.log_level)
     cf = build_and_load_connection_factory()
     run_key = args.run_key or default_run_key()
     print(f"Running sampling for process_name={args.process_name!r} "
-          f"project_name={args.project_name!r} run_key={run_key!r} ...")
+          f"project_name={args.project_name!r} run_key={run_key!r} "
+          f"run_params={run_params!r} seed={args.seed!r} ...")
 
     try:
         outcome = run_sampling_for_process_name(
             args.process_name, run_key, cf,
             project_name=args.project_name,
+            run_params=run_params,
+            seed=args.seed,
         )
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -129,6 +187,11 @@ def main():
     rules_parser.add_argument("--run-key", default=None,
                               help="Tracking/idempotency identifier for this run. "
                                    "Defaults to today's date (YYYY-MM-DD) if omitted.")
+    rules_parser.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
+                              help="A run_params entry a rule's rule_syntax can reference via "
+                                   "'{KEY}'. Repeatable -- pass --param once per key "
+                                   "(e.g. --param year=2026 --param month=8). Values are always "
+                                   "strings. Not merged into --run-key.")
     rules_parser.set_defaults(func=_run_rules)
 
     sampling_parser = subparsers.add_parser(
@@ -141,6 +204,16 @@ def main():
     sampling_parser.add_argument("--run-key", default=None,
                                  help="Tracking/idempotency identifier for this run. "
                                       "Defaults to today's date (YYYY-MM-DD) if omitted.")
+    sampling_parser.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
+                                 help="A run_params entry a config's scope_sql/exclusion_sql can "
+                                      "reference via '{KEY}'. Repeatable -- pass --param once per "
+                                      "key (e.g. --param year=2026 --param month=8). Values are "
+                                      "always strings. Not merged into --run-key.")
+    sampling_parser.add_argument("--seed", type=int, default=None,
+                                 help="Explicit seed for RANDOM/SYSTEMATIC sampling_method "
+                                      "reproducibility, passed to every config in scope. Ignored "
+                                      "by RANKED configs. Omit to let each config generate its own "
+                                      "independent seed.")
     sampling_parser.set_defaults(func=_run_sampling)
 
     args = parser.parse_args()
