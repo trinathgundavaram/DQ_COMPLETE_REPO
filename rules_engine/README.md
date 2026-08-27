@@ -265,6 +265,20 @@ key. `extra_filters` is also merged into the auto-generated total-record
 marker, so `failure_pct` still reflects the same narrowed scope the scan
 itself used.
 
+**Not silent in the log, though**: whenever `extra_filters` is passed for
+a run but a given rule has no marker, `execute_rule()` logs a `WARNING`
+naming that `rule_id` -- "why isn't my `--filter` doing anything for
+this rule" is answerable from the log alone instead of requiring a
+`rule_syntax` diff. If you see `executed_sql`/`gre_results.executed_sql`
+missing a filter you expected, check for this warning first; the fix is
+adding the marker to that rule's `rule_syntax`. Note also that
+`gre_results.source_tieback_sql` (the generated re-join back to the live
+source table) never applies `run_params`/`extra_filters` at all, by
+design -- it joins directly on the natural key (`src_key_cols`) to the
+exact rows already captured in `gre_exceptions` for this `rule_id`/
+`run_key`, which were already correctly scoped when they were captured;
+re-applying the original filter there would be redundant, not a bug.
+
 Unlike `run_params`' values (always escaped as literal data),
 `extra_filters`' KEYS become literal column names spliced directly into
 the SQL text -- each key is validated as a plain SQL identifier
