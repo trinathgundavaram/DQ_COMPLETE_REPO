@@ -1059,6 +1059,28 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
                             executed_sql=rule.get("rule_syntax"))
         return "ERROR"
     extra_filters_marker_present = "{extra_filters}" in rule["rule_syntax"] or "$extra_filters" in rule["rule_syntax"]
+    if extra_filters and not extra_filters_marker_present:
+        # The single most common cause of "I passed --filter but nothing
+        # changed": extra_filters is opt-in PER RULE via the literal
+        # "{extra_filters}"/"$extra_filters" marker in rule_syntax (see
+        # build_extra_filters_clause()'s docstring) -- a rule authored
+        # before that marker was added, or one that was never meant to
+        # take ad-hoc runtime filters, silently ignores extra_filters
+        # entirely, by design ("extra values are silently unused," same
+        # as an unreferenced run_params key). That's the right default
+        # (a caller passing --filter for OTHER rules in the same run
+        # shouldn't break this one), but it's easy to mistake for a bug
+        # when you expected this specific rule to be scoped by it. Log it
+        # loudly so "why isn't my --filter doing anything" is answerable
+        # from the log alone instead of requiring a rule_syntax diff.
+        logger.warning(
+            "Rule %s: extra_filters=%s was passed for this run, but this rule's "
+            "rule_syntax has NO {extra_filters}/$extra_filters marker -- extra_filters "
+            "has NO EFFECT on this rule (its scan and total-record count run exactly as "
+            "authored, unfiltered by it). Add the marker to gre_rules.rule_syntax for "
+            "rule_id=%s if this rule should be scoped by extra_filters at run time.",
+            rule.get("rule_id"), extra_filters, rule.get("rule_id"),
+        )
     templated = rule["rule_syntax"].replace("{extra_filters}", extra_filters_sql).replace(
         "$extra_filters", extra_filters_sql)
     # text_params merges on top of run_params for SUBSTITUTION only (wins

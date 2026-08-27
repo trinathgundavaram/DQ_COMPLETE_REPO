@@ -14,6 +14,8 @@ exercises rule-specific behavior built on top of those primitives.
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import logging
+
 import duckdb
 import pytest
 
@@ -1437,27 +1439,55 @@ def test_execute_rule_extra_filters_multiple_filters_all_applied():
     assert "run_ty = 'MNT'" in executed
 
 
-def test_execute_rule_extra_filters_no_marker_silently_ignored():
+def test_execute_rule_extra_filters_no_marker_silently_ignored(caplog):
     # A rule that never embeds "{extra_filters}"/"$extra_filters" simply
     # isn't affected, even when a caller passes extra_filters -- same
     # "extra values are silently unused" philosophy as run_params' own
     # unused keys. extra_filters references a column ("run_ty") this
     # table doesn't even have -- proving it's never applied to the total-
     # count denominator either, not just the scan, when the rule doesn't
-    # opt in via the marker.
+    # opt in via the marker. NOT silent in the log, though -- a WARNING
+    # names exactly which rule ignored it and why, so "why isn't my
+    # --filter doing anything for this rule" is answerable from the log
+    # alone (see execute_rule()'s STEP 0b).
     conn = _conn()
     rule = _rule(
         rule_syntax="SELECT claim_id, denial_reason FROM claims "
                     "WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
         threshold_pct=100,
     )
-    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB,
-                          extra_filters={"run_ty": "MNT"})
+    with caplog.at_level(logging.WARNING):
+        status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB,
+                              extra_filters={"run_ty": "MNT"})
     assert status == "SUCCESS"
 
     results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
     assert "run_ty" not in results[0]["executed_sql"]
     assert results[0]["total_records"] == 4   # unaffected by the ignored extra_filters
+
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("NO EFFECT on this rule" in msg and "rule_id=1" in msg for msg in warnings)
+
+
+def test_execute_rule_extra_filters_with_marker_logs_no_ignored_warning(caplog):
+    # The flip side: a rule that DOES embed the marker never gets this
+    # warning, even though extra_filters was passed -- the warning is
+    # specifically about a rule that ignores it, not about extra_filters
+    # being passed at all.
+    conn = _conn()
+    conn.execute("ALTER TABLE claims ADD COLUMN run_ty VARCHAR")
+    conn.execute("UPDATE claims SET run_ty = 'MNT'")
+    rule = _rule(
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+                    "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' {extra_filters}",
+    )
+    with caplog.at_level(logging.WARNING):
+        status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB,
+                              extra_filters={"run_ty": "MNT"})
+    assert status == "SUCCESS"
+
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert not any("NO EFFECT on this rule" in msg for msg in warnings)
 
 
 def test_execute_rule_extra_filters_invalid_identifier_key_writes_error():
