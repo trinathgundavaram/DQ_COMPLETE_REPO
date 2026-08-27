@@ -681,6 +681,7 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
         WHERE rule_id = ? AND run_key = ?
         """,
         [rule_id, run_key],
+        log_params=True,
     )
     existing_by_key = {r["src_key_value"]: r for r in existing}
 
@@ -1100,14 +1101,41 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     # denominator query and break it (or silently narrow scope the actual
     # scan never applied).
     total_params = {**run_params, **(extra_filters or {})} if extra_filters_marker_present else run_params
+    extra_filters_only = extra_filters if extra_filters_marker_present else None
     try:
         total = _compute_total(db_conn, rule, total_params, total_cache=total_cache)
     except Exception as exc:
-        logger.error("Rule %s: scope/count query failed: %s", rule.get("rule_id"), exc, exc_info=True)
-        _log_error(meta_conn, meta_db, run_id, rule, run_key, "SCOPE_QUERY_FAILURE", str(exc))
-        _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc),
-                            executed_sql=query)
-        return "ERROR"
+        # A run_params/--param key that doesn't name a real column on this
+        # rule's table (the caller only ever meant it for rule_syntax TEXT
+        # substitution, not scoping -- text_params exists to say that
+        # explicitly, but a caller who didn't realize a --param key needed
+        # to be a real column shouldn't have the WHOLE RULE fail over it)
+        # breaks THIS query, since every run_params key is otherwise
+        # assumed to be a scoping column (see _build_total_query()'s
+        # docstring). Retry ONCE, dropping run_params from the denominator
+        # entirely and keeping only extra_filters (if the rule opted in) --
+        # this can never make the denominator MORE wrong than "unscoped by
+        # run_params," and lets the rule still produce a real verdict
+        # instead of erroring out over an unrelated column name mismatch.
+        fallback_params = extra_filters_only or {}
+        try:
+            total = _compute_total(db_conn, rule, fallback_params, total_cache=total_cache)
+            logger.warning(
+                "Rule %s: total-record count failed when scoped by run_params %s (%s) -- "
+                "retried WITHOUT run_params (extra_filters only: %s) and got total=%s. "
+                "A run_params/--param key here doesn't name a real column on this rule's "
+                "table -- pass it via text_params/--text-param instead to avoid this "
+                "fallback and its extra query round trip, and to keep the denominator "
+                "correctly scoped by whichever run_params keys ARE real columns.",
+                rule.get("rule_id"), sorted(run_params), exc, fallback_params, total,
+            )
+        except Exception as exc2:
+            logger.error("Rule %s: scope/count query failed even without run_params: %s",
+                         rule.get("rule_id"), exc2, exc_info=True)
+            _log_error(meta_conn, meta_db, run_id, rule, run_key, "SCOPE_QUERY_FAILURE", str(exc2))
+            _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc2),
+                                executed_sql=query)
+            return "ERROR"
 
     # ── STEP 3: reconcile gre_exceptions against this attempt -- best effort ─
     # A failure here is logged but never fails the rule: `failed`/`total`

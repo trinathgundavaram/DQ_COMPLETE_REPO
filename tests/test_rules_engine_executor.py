@@ -1212,14 +1212,17 @@ def test_execute_rule_unresolved_token_fails_fast_before_any_query():
 
 # ── text_params: substitution WITHOUT total-count scoping ────────────────
 
-def test_execute_rule_run_params_key_that_is_not_a_real_column_breaks_total_count():
-    # Reproduces the reported production bug directly: a run_params key
-    # (RUNTYPE) that doesn't name a real column on the table is STILL
+def test_execute_rule_run_params_key_that_is_not_a_real_column_falls_back_gracefully():
+    # Reproduces the reported production scenario: a run_params key
+    # (RUNTYPE) that doesn't name a real column on the table is initially
     # forced into the auto-generated total-record count's WHERE clause
     # (see _build_total_query()) -- "unresolved/unknown column" from the
-    # source database, even though rule_syntax itself never needed
-    # RUNTYPE to be a column at all (it's used as a plain literal
-    # comparison here, same as a user embedding a run-type marker inline).
+    # source database. Rather than failing the whole rule over an
+    # unrelated denominator-query problem, execute_rule() retries the
+    # total-count query ONCE with run_params dropped entirely (extra_filters
+    # only, none here), succeeds, and the rule still produces a real
+    # verdict -- a caller shouldn't have to know in advance whether a
+    # --param's key happens to be a real column just to avoid an ERROR.
     conn = _conn()
     rule = _rule(
         rule_syntax="SELECT claim_id, denial_reason FROM claims "
@@ -1227,11 +1230,53 @@ def test_execute_rule_run_params_key_that_is_not_a_real_column_breaks_total_coun
     )
     status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1",
                            {"batch_id": "B1", "RUNTYPE": "MNT"}, META_DB)
+    assert status == "SUCCESS"
+
+    assert execute_query(conn, "SELECT * FROM gre_rule_errors WHERE rule_id = 1") == []
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1")
+    assert len(results) == 1
+    # Fallback drops run_params (batch_id included) from the denominator
+    # entirely, not just the offending key -- total reflects the WHOLE
+    # table (5 rows) rather than the batch_id='B1' subset it would have
+    # used had the total-count query succeeded on the first try. This is
+    # the accepted trade-off of not requiring every --param to name a
+    # real column: the fallback denominator is coarser, never wrong in a
+    # way that hides a real breach (it only ever widens scope, never
+    # narrows it), but a caller who wants a precisely-scoped denominator
+    # should use text_params for a non-column value instead (see the
+    # sibling test below) to avoid the fallback entirely.
+    assert results[0]["total_records"] == 5
+
+
+def test_execute_rule_total_count_still_errors_when_fallback_also_fails(monkeypatch):
+    # If the fallback retry ALSO fails (a genuinely broken total-count
+    # query, not just a run_params key that isn't a column), the rule
+    # still errors -- the fallback softens "a run_params key isn't a
+    # column," it doesn't mask every possible total-count failure.
+    # _compute_total() is forced to always raise here to simulate that,
+    # since a bare "COUNT(*) FROM <the same table the scan just
+    # succeeded against>" fallback query has no realistic way to fail on
+    # its own in this test's in-memory DuckDB setup.
+    conn = _conn()
+    rule = _rule(
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+                 "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' AND '{RUNTYPE}' = 'MNT'",
+    )
+
+    def _always_raise(*args, **kwargs):
+        raise RuntimeError("simulated total-count failure")
+
+    monkeypatch.setattr(rules_engine_executor, "_compute_total", _always_raise)
+
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1",
+                           {"batch_id": "B1", "RUNTYPE": "MNT"}, META_DB)
     assert status == "ERROR"
 
     errors = execute_query(conn, "SELECT * FROM gre_rule_errors WHERE rule_id = 1")
     assert len(errors) == 1
-    assert errors[0]["error_type"] == "SCOPE_QUERY_FAILURE"   # the total-count query, not the rule scan
+    assert errors[0]["error_type"] == "SCOPE_QUERY_FAILURE"
+    assert "simulated total-count failure" in errors[0]["error_message"]
 
 
 def test_execute_rule_text_params_substitute_without_scoping_total_count():

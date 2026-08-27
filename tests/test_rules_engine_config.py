@@ -416,6 +416,119 @@ def test_configure_logging_malformed_retention_falls_back_to_default(tmp_path, m
     assert logging.getLogger().handlers[0].backupCount == 30
 
 
+def test_rotate_stale_log_at_startup_renames_yesterdays_file(tmp_path):
+    """
+    Direct unit test of the manual catch-up TimedRotatingFileHandler's own
+    timer can never perform for a short-lived process (see the function's
+    docstring): a log file last written YESTERDAY gets renamed with
+    yesterday's date suffix, so a fresh process starting today doesn't
+    just keep appending into the same undated file forever.
+    """
+    import os
+    import time
+    from datetime import datetime, timedelta
+
+    log_path = tmp_path / "rules_engine.log"
+    log_path.write_text("yesterday's activity\n")
+    yesterday = datetime.now().date() - timedelta(days=1)
+    stale_time = time.mktime(yesterday.timetuple())
+    os.utime(log_path, (stale_time, stale_time))
+
+    shared_config._rotate_stale_log_at_startup(log_path, retention_days=30)
+
+    dated_path = tmp_path / f"rules_engine.log.{yesterday.isoformat()}"
+    assert not log_path.exists()
+    assert dated_path.exists()
+    assert dated_path.read_text() == "yesterday's activity\n"
+
+
+def test_rotate_stale_log_at_startup_leaves_todays_file_alone(tmp_path):
+    log_path = tmp_path / "rules_engine.log"
+    log_path.write_text("today's activity so far\n")   # mtime is "now" by default
+
+    shared_config._rotate_stale_log_at_startup(log_path, retention_days=30)
+
+    assert log_path.exists()
+    assert log_path.read_text() == "today's activity so far\n"
+    assert list(tmp_path.glob("rules_engine.log.*")) == []
+
+
+def test_rotate_stale_log_at_startup_no_file_is_a_no_op(tmp_path):
+    # First-ever run on a fresh machine/log dir -- nothing to rotate.
+    shared_config._rotate_stale_log_at_startup(tmp_path / "rules_engine.log", retention_days=30)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_rotate_stale_log_at_startup_avoids_overwriting_existing_dated_file(tmp_path):
+    import os
+    import time
+    from datetime import datetime, timedelta
+
+    log_path = tmp_path / "rules_engine.log"
+    log_path.write_text("second stale file from the same day\n")
+    yesterday = datetime.now().date() - timedelta(days=1)
+    stale_time = time.mktime(yesterday.timetuple())
+    os.utime(log_path, (stale_time, stale_time))
+
+    already_there = tmp_path / f"rules_engine.log.{yesterday.isoformat()}"
+    already_there.write_text("first dated file from that same day\n")
+
+    shared_config._rotate_stale_log_at_startup(log_path, retention_days=30)
+
+    # Original dated file untouched, new content landed under a ".2" suffix
+    # instead of clobbering it.
+    assert already_there.read_text() == "first dated file from that same day\n"
+    collision_path = tmp_path / f"rules_engine.log.{yesterday.isoformat()}.2"
+    assert collision_path.exists()
+    assert collision_path.read_text() == "second stale file from the same day\n"
+
+
+def test_prune_old_dated_logs_deletes_beyond_retention_keeps_within(tmp_path):
+    from datetime import datetime, timedelta
+
+    log_path = tmp_path / "rules_engine.log"
+    old_date = (datetime.now().date() - timedelta(days=45)).isoformat()
+    recent_date = (datetime.now().date() - timedelta(days=5)).isoformat()
+    old_file = tmp_path / f"rules_engine.log.{old_date}"
+    recent_file = tmp_path / f"rules_engine.log.{recent_date}"
+    old_file.write_text("old")
+    recent_file.write_text("recent")
+
+    shared_config._prune_old_dated_logs(log_path, retention_days=30)
+
+    assert not old_file.exists()
+    assert recent_file.exists()
+
+
+def test_configure_logging_rotates_a_stale_log_before_attaching_handler(tmp_path, monkeypatch, reload_config, isolated_logging):
+    # End-to-end: configure_logging() itself (not just the helper directly)
+    # performs the startup catch-up rotation before opening today's file.
+    import os
+    import time
+    from datetime import datetime, timedelta
+
+    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("GRE_LOG_FILE", "rules_engine.log")
+    reload_config()
+
+    log_path = tmp_path / "rules_engine.log"
+    log_path.write_text("stale content from a prior day's process\n")
+    yesterday = datetime.now().date() - timedelta(days=1)
+    stale_time = time.mktime(yesterday.timetuple())
+    os.utime(log_path, (stale_time, stale_time))
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
+
+    dated_path = tmp_path / f"rules_engine.log.{yesterday.isoformat()}"
+    assert dated_path.exists()
+    assert dated_path.read_text() == "stale content from a prior day's process\n"
+    # Today's log_path is fresh (handler re-created it in append mode after
+    # the rename moved the stale content out of the way).
+    assert log_path.exists()
+    assert "stale content" not in log_path.read_text()
+
+
 def test_configure_logging_appends_across_calls_never_truncates(tmp_path, monkeypatch, reload_config, isolated_logging):
     # Restarting/reconfiguring should never wipe what's already in the log
     # file -- everything opens in append mode.

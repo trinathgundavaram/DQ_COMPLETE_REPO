@@ -44,6 +44,7 @@ def get_breaches(meta_conn, meta_db: str, run_id: str) -> list:
         ORDER BY status, rule_id
         """,
         [run_id],
+        log_params=True,
     )
 
 
@@ -66,6 +67,7 @@ def get_records_for_result(meta_conn, meta_db: str, rule_id, run_key: str) -> li
         ORDER BY e.record_id
         """,
         [rule_id, run_key],
+        log_params=True,
     )
 
 
@@ -163,6 +165,7 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, run_key: s
         WHERE rule_id = ? AND run_key = ? AND etl_is_curr_ind = 'Y'
         """,
         [rule_id, run_key],
+        log_params=True,
     )
     if not exceptions:
         return []
@@ -286,6 +289,7 @@ def get_source_records_for_process(cf, meta_conn, meta_db: str, process_name: st
         ORDER BY rule_id
         """,
         params,
+        log_params=True,
     )
     rule_ids = [r["rule_id"] for r in rows]
     if not rule_ids:

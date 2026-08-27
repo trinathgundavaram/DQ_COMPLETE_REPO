@@ -57,6 +57,7 @@ concurrent sampling runs ever be added.
 
 import logging
 import os
+from datetime import datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Callable, Dict
@@ -68,6 +69,62 @@ try:
     _DOTENV_AVAILABLE = True
 except ImportError:
     _DOTENV_AVAILABLE = False
+
+
+def _rotate_stale_log_at_startup(log_path: Path, retention_days: int) -> None:
+    """
+    Manually perform the rename TimedRotatingFileHandler's own doRollover()
+    would have done, for a day boundary its internal timer never got to
+    see live -- see rules_engine/config.py's identical function for the
+    full rationale (byte-for-byte mirrored here, same repo convention as
+    the rest of this file).
+    """
+    if not log_path.exists():
+        return
+    try:
+        last_modified = datetime.fromtimestamp(log_path.stat().st_mtime).date()
+    except OSError:
+        return
+    if last_modified == datetime.now().date():
+        return
+
+    dated_path = log_path.with_name(f"{log_path.name}.{last_modified.isoformat()}")
+    suffix_n = 2
+    while dated_path.exists():
+        dated_path = log_path.with_name(f"{log_path.name}.{last_modified.isoformat()}.{suffix_n}")
+        suffix_n += 1
+
+    try:
+        log_path.rename(dated_path)
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "Could not rotate stale log %s (last written %s) to %s at startup: %s -- "
+            "continuing to append new entries to the existing file instead.",
+            log_path, last_modified, dated_path, exc,
+        )
+        return
+
+    if retention_days:
+        _prune_old_dated_logs(log_path, retention_days)
+
+
+def _prune_old_dated_logs(log_path: Path, retention_days: int) -> None:
+    """
+    Delete dated backups older than retention_days -- see
+    rules_engine/config.py's identical function for the full rationale.
+    """
+    cutoff = datetime.now().date() - timedelta(days=retention_days)
+    for candidate in log_path.parent.glob(f"{log_path.name}.*"):
+        date_part = candidate.name[len(log_path.name) + 1:].split(".")[0]
+        try:
+            file_date = datetime.strptime(date_part, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if file_date < cutoff:
+            try:
+                candidate.unlink()
+            except OSError:
+                pass
 
 
 def configure_logging(level=None) -> None:
@@ -139,6 +196,7 @@ def configure_logging(level=None) -> None:
             retention_days = int(os.getenv("GRE_LOG_RETENTION_DAYS", "30"))
         except ValueError:
             retention_days = 30
+        _rotate_stale_log_at_startup(log_path, retention_days)
         handler = TimedRotatingFileHandler(
             log_path, when="midnight", backupCount=retention_days, encoding="utf-8",
         )
