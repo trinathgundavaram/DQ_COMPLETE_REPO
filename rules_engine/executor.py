@@ -923,7 +923,8 @@ def _compute_total(db_conn, rule: dict, run_params: dict, total_cache: dict = No
 # ---------------------------------------------------------------------------
 
 def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_params: dict, meta_db: str,
-                  total_cache: dict = None, extra_filters: dict = None, text_params: dict = None) -> str:
+                  total_cache: dict = None, extra_filters: dict = None, text_params: dict = None,
+                  extra_filters_sql: str = None) -> str:
     """
     Execute one rule end-to-end: prepare its source (file/S3 rules register
     their DuckDB view here), substitute run_params into rule_syntax, splice
@@ -1048,41 +1049,67 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     # replace (not _substitute_params()'s escaping path -- the clause it
     # builds is already-escaped, structural SQL, not a single literal
     # value to be quoted) -- see build_extra_filters_clause()'s docstring.
-    # A rule_syntax with no "{extra_filters}"/"$extra_filters" marker is
-    # simply unaffected -- str.replace() on absent text is a no-op.
-    try:
-        extra_filters_sql = build_extra_filters_clause(extra_filters)
-    except ValueError as exc:
-        logger.error("Rule %s: extra_filters rejected: %s", rule.get("rule_id"), exc)
-        _log_error(meta_conn, meta_db, run_id, rule, run_key, "PARAM_SUBSTITUTION_ERROR", str(exc))
-        _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc),
-                            executed_sql=rule.get("rule_syntax"))
-        return "ERROR"
+    #
+    # APPLIES TO EVERY RULE BY DEFAULT -- deliberate change from the
+    # original opt-in-via-marker design: a caller passing extra_filters
+    # wants it applied across the whole process/run, not only to rules an
+    # author remembered to add the "{extra_filters}"/"$extra_filters"
+    # marker to. Two cases:
+    #   1. Marker present -- spliced in at the marker's exact position,
+    #      same as before (the precise, author-controlled placement).
+    #   2. No marker -- appended at the very END of rule_syntax instead,
+    #      as "<rule_syntax> AND col1 = 'v1' AND ...". This is the least
+    #      invasive insertion point: for the single-WHERE-clause shape
+    #      virtually every rule_syntax in this package uses (nothing
+    #      after WHERE), it's exactly equivalent to a marker at the end
+    #      of the WHERE clause. For a rule_syntax with GROUP BY/HAVING/
+    #      ORDER BY/QUALIFY after its WHERE (or no WHERE at all), this
+    #      insertion point is WRONG and the source database raises a
+    #      syntax error -- caught below and logged as an ordinary
+    #      SQL_RUNTIME/SCOPE_QUERY_FAILURE error for THAT rule, same as
+    #      any other broken rule_syntax, rather than silently producing
+    #      a wrong result or silently skipping the rule. This trade-off
+    #      (apply everywhere, let a structurally incompatible rule fail
+    #      loudly) is intentional -- see rules_engine/README.md's
+    #      "Ad-hoc runtime filters" section for the full rationale.
+    # extra_filters_sql is precomputed ONCE per run by
+    # rules_engine/runner.py::run_rule_group() (validated/built up front,
+    # right after rules are loaded, instead of redundantly once per rule
+    # here -- the "optimize the code to run faster" half of this change)
+    # and threaded down through _run_one_pending_rule()/_run_pending_parallel()
+    # exactly like text_params already is. A caller that goes through
+    # run_rule_group() always has it precomputed; execute_rule() still
+    # builds it itself when it's None, so direct/unit-test callers that
+    # invoke execute_rule() straight (bypassing run_rule_group()) keep
+    # working unchanged -- this parameter is purely a fast path, never a
+    # behavior change, and an invalid extra_filters dict is still caught
+    # and logged as an error for this rule either way.
+    if extra_filters_sql is None:
+        try:
+            extra_filters_sql = build_extra_filters_clause(extra_filters)
+        except ValueError as exc:
+            logger.error("Rule %s: extra_filters rejected: %s", rule.get("rule_id"), exc)
+            _log_error(meta_conn, meta_db, run_id, rule, run_key, "PARAM_SUBSTITUTION_ERROR", str(exc))
+            _write_result_safe(meta_conn, meta_db, run_id, rule, run_key, start, "ERROR", error_message=str(exc),
+                                executed_sql=rule.get("rule_syntax"))
+            return "ERROR"
     extra_filters_marker_present = "{extra_filters}" in rule["rule_syntax"] or "$extra_filters" in rule["rule_syntax"]
-    if extra_filters and not extra_filters_marker_present:
-        # The single most common cause of "I passed --filter but nothing
-        # changed": extra_filters is opt-in PER RULE via the literal
-        # "{extra_filters}"/"$extra_filters" marker in rule_syntax (see
-        # build_extra_filters_clause()'s docstring) -- a rule authored
-        # before that marker was added, or one that was never meant to
-        # take ad-hoc runtime filters, silently ignores extra_filters
-        # entirely, by design ("extra values are silently unused," same
-        # as an unreferenced run_params key). That's the right default
-        # (a caller passing --filter for OTHER rules in the same run
-        # shouldn't break this one), but it's easy to mistake for a bug
-        # when you expected this specific rule to be scoped by it. Log it
-        # loudly so "why isn't my --filter doing anything" is answerable
-        # from the log alone instead of requiring a rule_syntax diff.
-        logger.warning(
-            "Rule %s: extra_filters=%s was passed for this run, but this rule's "
-            "rule_syntax has NO {extra_filters}/$extra_filters marker -- extra_filters "
-            "has NO EFFECT on this rule (its scan and total-record count run exactly as "
-            "authored, unfiltered by it). Add the marker to gre_rules.rule_syntax for "
-            "rule_id=%s if this rule should be scoped by extra_filters at run time.",
-            rule.get("rule_id"), extra_filters, rule.get("rule_id"),
+    if extra_filters_marker_present:
+        templated = rule["rule_syntax"].replace("{extra_filters}", extra_filters_sql).replace(
+            "$extra_filters", extra_filters_sql)
+    elif extra_filters:
+        templated = f"{rule['rule_syntax']} {extra_filters_sql}"
+        logger.debug(
+            "Rule %s: extra_filters=%s applied by DEFAULT-APPEND (no {extra_filters}/$extra_filters "
+            "marker in rule_syntax) -- appended after the rule's own WHERE clause. If this rule's "
+            "rule_syntax has anything after its WHERE clause (GROUP BY/HAVING/ORDER BY/...), or no "
+            "WHERE clause at all, this placement is wrong and the scan/total-count query below will "
+            "fail with a SQL error -- add the marker to gre_rules.rule_syntax at the correct position "
+            "for this rule if that happens.",
+            rule.get("rule_id"), extra_filters,
         )
-    templated = rule["rule_syntax"].replace("{extra_filters}", extra_filters_sql).replace(
-        "$extra_filters", extra_filters_sql)
+    else:
+        templated = rule["rule_syntax"]
     # text_params merges on top of run_params for SUBSTITUTION only (wins
     # on a key collision) -- run_params itself, unmodified, is what STEP 2
     # below uses for the total-count scoping columns. This keeps a
@@ -1114,16 +1141,15 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
         return "ERROR"
 
     # ── STEP 2: total in-scope record count (memoized across the run_group) ──
-    # extra_filters only narrows the total-count denominator when the rule
-    # actually opted in (embedded the marker) -- a rule that never
-    # references "{extra_filters}"/"$extra_filters" must be completely
-    # unaffected by a caller passing extra_filters, same as an unused
-    # run_params key. Without this guard, extra_filters columns that don't
-    # even apply to this rule's table would still get spliced into the
-    # denominator query and break it (or silently narrow scope the actual
-    # scan never applied).
-    total_params = {**run_params, **(extra_filters or {})} if extra_filters_marker_present else run_params
-    extra_filters_only = extra_filters if extra_filters_marker_present else None
+    # extra_filters now narrows the total-count denominator UNCONDITIONALLY
+    # (no more marker-presence guard) -- it applies to every rule's scan by
+    # default (STEP 0b above), so the denominator has to match. If the
+    # scan's own default-append placement already failed, execution never
+    # reaches here at all (STEP 1 already returned ERROR); if it succeeded,
+    # extra_filters' columns are real ones the scan already used
+    # successfully, so this query is expected to succeed too.
+    total_params = {**run_params, **(extra_filters or {})}
+    extra_filters_only = extra_filters or None
     try:
         total = _compute_total(db_conn, rule, total_params, total_cache=total_cache)
     except Exception as exc:

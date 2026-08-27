@@ -50,6 +50,7 @@ from rules_engine.db_ops import (
     generate_run_id as _generate_run_id,
     count_prior_attempts as _count_prior_attempts,
     default_run_key as _default_run_key,
+    build_extra_filters_clause,
 )
 from rules_engine.rules import load_rules
 from rules_engine.executor import execute_rule, _log_error, _write_result_safe
@@ -278,7 +279,7 @@ def _deactivate_all_active_for_run(meta_conn, meta_db: str, rule_group: str, run
 # ---------------------------------------------------------------------------
 
 def _run_one_pending_rule(rule, source_pools, meta_pool, meta_db, run_id, run_key, resolved_params, total_cache,
-                          extra_filters=None, text_params=None):
+                          extra_filters=None, text_params=None, extra_filters_sql=None):
     """
     One rule's worth of the ThreadPoolExecutor body -- acquire a source
     connection AND a metadata connection from their respective pools
@@ -298,7 +299,8 @@ def _run_one_pending_rule(rule, source_pools, meta_pool, meta_db, run_id, run_ke
     worker_meta_conn = meta_pool.acquire()
     try:
         status = execute_rule(rule, db_conn, worker_meta_conn, run_id, run_key, resolved_params, meta_db,
-                              total_cache=total_cache, extra_filters=extra_filters, text_params=text_params)
+                              total_cache=total_cache, extra_filters=extra_filters, text_params=text_params,
+                              extra_filters_sql=extra_filters_sql)
     finally:
         source_pool.release(db_conn)
         meta_pool.release(worker_meta_conn)
@@ -306,7 +308,7 @@ def _run_one_pending_rule(rule, source_pools, meta_pool, meta_db, run_id, run_ke
 
 
 def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, run_key, resolved_params,
-                          total_cache, max_workers, extra_filters=None, text_params=None):
+                          total_cache, max_workers, extra_filters=None, text_params=None, extra_filters_sql=None):
     """
     The parallel counterpart to run_rule_group()'s default sequential
     for-loop, used only when sequencing_mode='independent' and
@@ -423,6 +425,7 @@ def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, run_key, reso
                     pool_exec.submit(
                         _run_one_pending_rule, rule, source_pools, meta_pool, meta_db,
                         run_id, run_key, resolved_params, total_cache, extra_filters, text_params,
+                        extra_filters_sql,
                     )
                     for rule in runnable
                 ]
@@ -587,6 +590,32 @@ def run_rule_group(
             "succeeded": 0, "errored": 0, "results": {},
         }
 
+    # extra_filters is validated/built ONCE here for the whole run, instead
+    # of once per rule inside execute_rule() (rules_engine/executor.py) --
+    # every rule in this group applies the identical extra_filters clause
+    # by default now (see execute_rule()'s STEP 0b docstring), so
+    # rebuilding/re-validating the same dict N times (once per rule -- e.g.
+    # 68 times for a 68-rule group) was pure redundant work AND meant an
+    # invalid extra_filters dict only surfaced after N identical
+    # PARAM_SUBSTITUTION_ERROR log entries, one per rule, instead of
+    # failing the whole run immediately. build_extra_filters_clause(None)
+    # returns "" cheaply, so this is a no-op call when extra_filters isn't
+    # passed at all. execute_rule() still validates internally as a
+    # fallback for direct/unit-test callers that invoke it without going
+    # through run_rule_group() -- this hoist changes nothing about
+    # correctness, only when/how many times the validation runs.
+    try:
+        extra_filters_sql = build_extra_filters_clause(extra_filters)
+    except ValueError as exc:
+        logger.error(
+            "rule_group=%s: extra_filters=%s rejected -- failing this run before any rule executes: %s",
+            rule_group, extra_filters, exc,
+        )
+        return {
+            "run_id": None, "status": "INVALID_EXTRA_FILTERS", "total_rules": len(rules),
+            "succeeded": 0, "errored": 0, "results": {}, "error": str(exc),
+        }
+
     resolved_params = dict(run_params or {})
 
     # project_name/process_name are descriptive/reporting dimensions carried
@@ -674,6 +703,7 @@ def run_rule_group(
         results, succeeded, errored = _run_pending_parallel(
             pending, cf, meta_conn, meta_db, run_id, run_key, resolved_params,
             total_cache, max_workers, extra_filters=extra_filters, text_params=text_params,
+            extra_filters_sql=extra_filters_sql,
         )
     else:
         for rule in pending:
@@ -691,7 +721,8 @@ def run_rule_group(
                 status = "ERROR"
             else:
                 status = execute_rule(rule, db_conn, meta_conn, run_id, run_key, resolved_params, meta_db,
-                                      total_cache=total_cache, extra_filters=extra_filters, text_params=text_params)
+                                      total_cache=total_cache, extra_filters=extra_filters, text_params=text_params,
+                                      extra_filters_sql=extra_filters_sql)
 
             results[rule["rule_id"]] = status
 

@@ -217,24 +217,44 @@ column for it). It has no reserved/required key, same as `run_params`.
 ## Ad-hoc runtime filters: `extra_filters`
 
 `run_params` above is for tokens a rule's author explicitly wrote into
-`rule_syntax`. `extra_filters` is a separate, opt-in mechanism for a
-column the rule *wasn't* authored to anticipate -- e.g. narrowing a
-long-standing rule to `run_ty = 'MNT'` at run time without adding a
-`{run_ty}` token to every rule that might ever need it, and without
-touching `gre_rules` at all.
+`rule_syntax`. `extra_filters` is for a column the rule *wasn't*
+authored to anticipate -- e.g. narrowing a long-standing rule to
+`run_ty = 'MNT'` at run time without touching `gre_rules` at all.
 
-A rule opts in by embedding the literal marker `"{extra_filters}"` or
-`"$extra_filters"` anywhere in its `rule_syntax` -- typically right
-before the end of the `WHERE` clause:
+**`extra_filters` now applies to EVERY rule run under the process by
+default** -- a rule's `rule_syntax` does not need to embed anything for
+it to take effect. This is a deliberate default-on design: a caller
+passing `extra_filters` wants it applied across the whole run, not only
+to rules an author remembered to opt in. There are two cases, depending
+on whether a rule's `rule_syntax` happens to embed the literal marker
+`"{extra_filters}"`/`"$extra_filters"`:
 
-```sql
-SELECT claim_id, denial_reason FROM claims
-WHERE denial_reason IS NULL AND claim_year = {year} AND claim_month = {month} {extra_filters}
-```
+1. **Marker present** -- spliced in at that exact position, same as
+   before (the precise, author-controlled placement):
 
-A caller then passes one or more filters as a plain dict, and the engine
-splices in `AND col1 = 'v1' AND col2 = 'v2' ...` wherever the marker
-appears, BEFORE `run_params` substitution runs:
+   ```sql
+   SELECT claim_id, denial_reason FROM claims
+   WHERE denial_reason IS NULL AND claim_year = {year} AND claim_month = {month} {extra_filters}
+   ```
+
+2. **No marker** -- the filter clause is **default-appended** to the
+   very end of `rule_syntax` instead: `"<rule_syntax> AND col1 = 'v1'
+   AND col2 = 'v2' ..."`. For the single-`WHERE`-clause shape virtually
+   every rule in this package uses (nothing after `WHERE`), this is
+   exactly equivalent to a marker placed at the end of the `WHERE`
+   clause. **For a `rule_syntax` with `GROUP BY`/`HAVING`/`ORDER BY`/
+   `QUALIFY` after its `WHERE` (or no `WHERE` at all), this placement is
+   wrong and the source database raises a SQL syntax error** -- caught
+   and logged as an ordinary error (`SQL_RUNTIME`/`SCOPE_QUERY_FAILURE`)
+   for *that* rule, exactly like any other broken `rule_syntax`, rather
+   than silently producing a wrong result or silently skipping the
+   filter. **This is intentional: if applying `extra_filters` breaks a
+   structurally incompatible rule, that failure is expected and gets
+   logged, not prevented.** Fix a rule that breaks this way by adding
+   the `{extra_filters}`/`$extra_filters` marker at the correct position
+   in its `rule_syntax`.
+
+A caller passes one or more filters as a plain dict:
 
 ```python
 summary = run_rule_group(
@@ -257,27 +277,17 @@ same key passed twice to the same flag has the last occurrence win.
 
 `extra_filters` supports more than one filter at once (`{"run_ty": "MNT",
 "region": "EAST"}` -> `AND region = 'EAST' AND run_ty = 'MNT'`, sorted for
-deterministic SQL text). A rule that never embeds the marker is
-completely unaffected even when a caller passes `extra_filters` -- same
-"extra values are silently unused" philosophy as an unused `run_params`
-key. `extra_filters` is also merged into the auto-generated total-record
-(denominator) count above, but ONLY for a rule that actually embeds the
-marker, so `failure_pct` still reflects the same narrowed scope the scan
-itself used.
-
-**Not silent in the log, though**: whenever `extra_filters` is passed for
-a run but a given rule has no marker, `execute_rule()` logs a `WARNING`
-naming that `rule_id` -- "why isn't my `--filter` doing anything for
-this rule" is answerable from the log alone instead of requiring a
-`rule_syntax` diff. If you see `executed_sql`/`gre_results.executed_sql`
-missing a filter you expected, check for this warning first; the fix is
-adding the marker to that rule's `rule_syntax`. Note also that
-`gre_results.source_tieback_sql` (the generated re-join back to the live
-source table) never applies `run_params`/`extra_filters` at all, by
-design -- it joins directly on the natural key (`src_key_cols`) to the
-exact rows already captured in `gre_exceptions` for this `rule_id`/
-`run_key`, which were already correctly scoped when they were captured;
-re-applying the original filter there would be redundant, not a bug.
+deterministic SQL text). It is also merged into the auto-generated
+total-record (denominator) count UNCONDITIONALLY now (no marker-presence
+gate), since it structurally applies to every rule's scan by default --
+`failure_pct` always reflects the same narrowed scope the scan itself
+used. Note that `gre_results.source_tieback_sql` (the generated re-join
+back to the live source table) never applies `run_params`/
+`extra_filters` at all, by design -- it joins directly on the natural
+key (`src_key_cols`) to the exact rows already captured in
+`gre_exceptions` for this `rule_id`/`run_key`, which were already
+correctly scoped when they were captured; re-applying the original
+filter there would be redundant, not a bug.
 
 Unlike `run_params`' values (always escaped as literal data),
 `extra_filters`' KEYS become literal column names spliced directly into
@@ -286,7 +296,12 @@ the SQL text -- each key is validated as a plain SQL identifier
 attempt fails fast with `PARAM_SUBSTITUTION_ERROR` on anything else,
 rather than risking an unescapable column name reaching the source
 database. See `rules_engine/db_ops.py::build_extra_filters_clause()`'s
-docstring for the full mechanics.
+docstring for the full mechanics. This validation now runs ONCE per
+`run_rule_group()` call (not once per rule) -- see "Performance: one
+`extra_filters` validation per run, not per rule" below -- so an invalid
+`extra_filters` dict fails the WHOLE run immediately, before any rule
+executes, with `status="INVALID_EXTRA_FILTERS"`, instead of failing
+redundantly once per rule.
 
 Whatever actually ran -- `run_params` and `extra_filters` both already
 resolved to literal values -- is captured verbatim on
@@ -306,6 +321,24 @@ run and reverse-engineering it out of `executed_sql`:
 ```sql
 SELECT run_params, extra_filters FROM gre_rule_audit WHERE run_id = '...';
 ```
+
+## Performance: one `extra_filters` validation per run, not per rule
+
+`run_rule_group()` validates and builds the `extra_filters` SQL clause
+exactly ONCE per run (immediately after loading the rule group's active
+rules, before any rule executes), rather than once per rule inside
+`execute_rule()`. Since `extra_filters` now applies to every rule by
+default, rebuilding/re-validating the identical dict once per rule was
+pure redundant work for a group of any size (e.g. 68 rebuilds for a
+68-rule group) -- and meant an invalid `extra_filters` dict only
+surfaced after N identical `PARAM_SUBSTITUTION_ERROR` log entries, one
+per rule, instead of failing fast. The precomputed clause is threaded
+down through the sequential loop and the parallel (`sequencing_mode=
+'independent'`) path alike. `execute_rule()` still validates internally
+when called directly (bypassing `run_rule_group()`, e.g. from a test or
+a custom caller) -- the hoist is purely a fast path for the normal
+`run_rule_group()` entry point and changes no behavior, only how many
+times the identical validation runs.
 
 ## One connection per source: `sql_dialect`
 

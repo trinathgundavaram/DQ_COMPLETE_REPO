@@ -815,6 +815,54 @@ def test_gre_rule_audit_run_params_and_extra_filters_null_when_not_passed():
     assert audit[0]["extra_filters"] is None
 
 
+def test_run_rule_group_invalid_extra_filters_fails_whole_run_before_any_rule():
+    # extra_filters is now validated/built ONCE, up front in
+    # run_rule_group() (rules_engine/runner.py), before any rule executes
+    # or gre_rule_audit is even written -- instead of the old per-rule
+    # validation inside execute_rule(), which would have logged the same
+    # PARAM_SUBSTITUTION_ERROR once per rule in the group. An invalid key
+    # (not a valid SQL identifier) must fail the WHOLE run immediately,
+    # with status="INVALID_EXTRA_FILTERS" and zero gre_results/gre_rule_audit
+    # rows written for any rule.
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10)
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20)
+
+    bad_key = "run_ty = 'x'; DROP TABLE claims; --"
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB,
+                   extra_filters={bad_key: "MNT"})
+    assert summary["status"] == "INVALID_EXTRA_FILTERS"
+    assert summary["run_id"] is None
+    assert summary["results"] == {}
+
+    assert execute_query(conn, "SELECT * FROM gre_rule_audit") == []
+    assert execute_query(conn, "SELECT * FROM gre_results") == []
+
+
+def test_run_rule_group_valid_extra_filters_applies_to_every_rule_by_default():
+    # A run_rule_group()-level extra_filters, with no rule embedding the
+    # {extra_filters}/$extra_filters marker, still narrows every rule in
+    # the group by default (the hoisted extra_filters_sql is threaded down
+    # to execute_rule() for each rule) -- confirms the fast-path threading
+    # through run_rule_group() -> the sequential loop -> execute_rule()
+    # produces the identical end result as passing extra_filters directly
+    # to execute_rule().
+    conn = _conn()
+    conn.execute("ALTER TABLE claims ADD COLUMN run_ty VARCHAR")
+    conn.execute("UPDATE claims SET run_ty = 'MNT' WHERE batch_id = 'B1'")
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10)
+
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB,
+                   extra_filters={"run_ty": "MNT"})
+    assert summary["status"] == "COMPLETED"
+    assert summary["succeeded"] == 1
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
+    assert "run_ty = 'MNT'" in results[0]["executed_sql"]
+
+
 # ── project_name/process_name propagation ─────────────────────────────────
 
 def test_gre_rule_audit_carries_project_and_process_name_from_rules():

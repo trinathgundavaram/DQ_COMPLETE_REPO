@@ -1439,41 +1439,68 @@ def test_execute_rule_extra_filters_multiple_filters_all_applied():
     assert "run_ty = 'MNT'" in executed
 
 
-def test_execute_rule_extra_filters_no_marker_silently_ignored(caplog):
-    # A rule that never embeds "{extra_filters}"/"$extra_filters" simply
-    # isn't affected, even when a caller passes extra_filters -- same
-    # "extra values are silently unused" philosophy as run_params' own
-    # unused keys. extra_filters references a column ("run_ty") this
-    # table doesn't even have -- proving it's never applied to the total-
-    # count denominator either, not just the scan, when the rule doesn't
-    # opt in via the marker. NOT silent in the log, though -- a WARNING
-    # names exactly which rule ignored it and why, so "why isn't my
-    # --filter doing anything for this rule" is answerable from the log
-    # alone (see execute_rule()'s STEP 0b).
+def test_execute_rule_extra_filters_no_marker_default_appended(caplog):
+    # A rule that never embeds "{extra_filters}"/"$extra_filters" now gets
+    # extra_filters DEFAULT-APPENDED to the end of its rule_syntax instead
+    # of being silently ignored -- extra_filters applies to EVERY rule in
+    # a run by default now (see execute_rule()'s STEP 0b). This rule's
+    # rule_syntax is a plain single-WHERE-clause shape (nothing after the
+    # WHERE), so default-append is exactly equivalent to a marker placed
+    # at the end of the WHERE clause -- run_ty='MNT' narrows both the scan
+    # and the total-count denominator, and a DEBUG line names the rule and
+    # explains the placement.
     conn = _conn()
+    conn.execute("ALTER TABLE claims ADD COLUMN run_ty VARCHAR")
+    conn.execute("UPDATE claims SET run_ty = 'MNT' WHERE batch_id = 'B1'")
+    conn.execute("UPDATE claims SET run_ty = 'ADHOC' WHERE batch_id = 'B2'")
     rule = _rule(
         rule_syntax="SELECT claim_id, denial_reason FROM claims "
                     "WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
         threshold_pct=100,
     )
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.DEBUG):
         status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB,
                               extra_filters={"run_ty": "MNT"})
     assert status == "SUCCESS"
 
     results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
-    assert "run_ty" not in results[0]["executed_sql"]
-    assert results[0]["total_records"] == 4   # unaffected by the ignored extra_filters
+    executed = results[0]["executed_sql"]
+    assert "run_ty = 'MNT'" in executed
+    assert results[0]["total_records"] == 4
+    assert results[0]["failed_records"] == 2
 
-    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-    assert any("NO EFFECT on this rule" in msg and "rule_id=1" in msg for msg in warnings)
+    debugs = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
+    assert any("DEFAULT-APPEND" in msg and "Rule 1" in msg for msg in debugs)
 
 
-def test_execute_rule_extra_filters_with_marker_logs_no_ignored_warning(caplog):
-    # The flip side: a rule that DOES embed the marker never gets this
-    # warning, even though extra_filters was passed -- the warning is
-    # specifically about a rule that ignores it, not about extra_filters
-    # being passed at all.
+def test_execute_rule_extra_filters_no_marker_group_by_fails_loudly():
+    # A rule whose rule_syntax has content AFTER its WHERE clause (a GROUP
+    # BY here) is structurally incompatible with blind default-append --
+    # appending "AND col = 'val'" after a GROUP BY produces invalid SQL.
+    # Per the user's explicit instruction ("Donot worry about rule
+    # breaking. if it breaks its expected to log that error"), this must
+    # fail LOUDLY (ERROR/SQL_RUNTIME on this one rule) rather than
+    # silently skip extra_filters or silently produce a wrong result.
+    conn = _conn()
+    rule = _rule(
+        rule_syntax="SELECT batch_id, COUNT(*) AS cnt FROM claims "
+                    "WHERE denial_reason IS NULL GROUP BY batch_id",
+        threshold_pct=100,
+    )
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {}, META_DB,
+                          extra_filters={"run_ty": "MNT"})
+    assert status == "ERROR"
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
+    assert len(results) == 1
+    assert results[0]["status"] == "ERROR"
+    assert "run_ty" in results[0]["executed_sql"]   # the (invalid) spliced SQL, for diagnosis
+
+
+def test_execute_rule_extra_filters_with_marker_still_spliced_precisely():
+    # A rule that DOES embed the marker still gets the precise,
+    # author-controlled splice at that exact position -- unaffected by the
+    # default-append fallback used only when the marker is absent.
     conn = _conn()
     conn.execute("ALTER TABLE claims ADD COLUMN run_ty VARCHAR")
     conn.execute("UPDATE claims SET run_ty = 'MNT'")
@@ -1481,13 +1508,14 @@ def test_execute_rule_extra_filters_with_marker_logs_no_ignored_warning(caplog):
         rule_syntax="SELECT claim_id, denial_reason FROM claims "
                     "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' {extra_filters}",
     )
-    with caplog.at_level(logging.WARNING):
-        status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB,
-                              extra_filters={"run_ty": "MNT"})
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB,
+                          extra_filters={"run_ty": "MNT"})
     assert status == "SUCCESS"
 
-    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-    assert not any("NO EFFECT on this rule" in msg for msg in warnings)
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
+    executed = results[0]["executed_sql"]
+    assert "{extra_filters}" not in executed
+    assert "run_ty = 'MNT'" in executed
 
 
 def test_execute_rule_extra_filters_invalid_identifier_key_writes_error():
