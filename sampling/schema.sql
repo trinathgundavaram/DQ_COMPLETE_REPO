@@ -36,6 +36,7 @@
 -- ── 1. gre_sampling_config -- one row per sampling definition ─────────────
 CREATE MULTISET TABLE {{META_DB}}.gre_sampling_config (
     config_id            INTEGER NOT NULL,
+    act_ind                    BYTEINT DEFAULT 1,
     project_name         VARCHAR(100) NOT NULL,
     process_name         VARCHAR(100) NOT NULL,
     sample_name          VARCHAR(100) NOT NULL,
@@ -70,7 +71,6 @@ CREATE MULTISET TABLE {{META_DB}}.gre_sampling_config (
                                                     -- expression, lowest = highest priority
     rounding_mode          VARCHAR(10) DEFAULT 'FLOOR',  -- 'FLOOR'|'ROUND'|'CEIL'
     schedule_cron            VARCHAR(50),
-    act_ind                    BYTEINT DEFAULT 1,
     created_by                   VARCHAR(100),      -- purely descriptive/audit; mirrors
                                                     -- gre_rules.created_by for the same
                                                     -- reason -- see rules_engine/schema.sql
@@ -141,9 +141,9 @@ CREATE MULTISET TABLE {{META_DB}}.gre_sample_selections (
     case_key                 VARCHAR(500) NOT NULL,   -- entity key, matches key_columns
     priority_rank              INTEGER,                -- 1 = highest priority; NULL for RANDOM
                                                         -- (meaningless for that method)
+    selected_flag                       BYTEINT DEFAULT 0,
     excluded_flag                 BYTEINT DEFAULT 0,
     exclusion_reason                 VARCHAR(500),
-    selected_flag                       BYTEINT DEFAULT 0,
     etl_is_curr_ind                       CHAR(1) DEFAULT 'Y',  -- 'Y' = this run is the
                                                         -- current/active one for its
                                                         -- (config_id, run_key); 'N' = superseded

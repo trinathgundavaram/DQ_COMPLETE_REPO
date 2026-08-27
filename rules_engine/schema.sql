@@ -141,6 +141,22 @@
 CREATE MULTISET TABLE {{META_DB}}.gre_rules (
     rule_id              INTEGER NOT NULL,
     rule_nm              VARCHAR(500) NOT NULL,
+    act_ind              BYTEINT DEFAULT 1,
+    -- ── Grouping/orchestration columns below -- which rules run, in what
+    -- order, and what happens on failure.
+    rule_group           VARCHAR(100) NOT NULL,    -- groups rules for one use case / table pipeline
+    rule_variant         VARCHAR(100),             -- optional extra selection level within rule_group;
+                                                    -- NULL = always applies, see design notes above
+    project_name         VARCHAR(100) NOT NULL,    -- e.g. HEALTHSPRING_UM -- reporting/scoping dimension,
+                                                    -- NOT the filter key load_rules() uses (see design
+                                                    -- notes above); mirrors gre_sampling_config
+    process_name         VARCHAR(100) NOT NULL,    -- e.g. UNIVERSE_VALIDATION -- same as project_name
+    seq_no               INTEGER DEFAULT 100,      -- run order within a group (sequential mode only)
+    sequencing_mode      VARCHAR(20) DEFAULT 'independent',  -- 'independent' | 'sequential'
+    on_failure           VARCHAR(20) DEFAULT 'skip_and_continue',  -- 'halt_group' | 'skip_and_continue'
+                                                    -- meaningful only when sequencing_mode='sequential'
+    -- ── Source/query definition columns below -- what this rule actually
+    -- runs and against what.
     database_name        VARCHAR(200) NOT NULL,    -- teradata/postgres: schema the table lives in.
                                                     -- file: the directory. s3: the s3:// prefix/bucket.
                                                     -- Combined with src_tbl_nm for the auto total-record
@@ -158,17 +174,10 @@ CREATE MULTISET TABLE {{META_DB}}.gre_rules (
                                                     -- file/s3 rule, FROM the view name
                                                     -- db/connection_factory.py::_view_name(src_tbl_nm)
                                                     -- derives from src_tbl_nm.
-    project_name         VARCHAR(100) NOT NULL,    -- e.g. HEALTHSPRING_UM -- reporting/scoping dimension,
-                                                    -- NOT the filter key load_rules() uses (see design
-                                                    -- notes above); mirrors gre_sampling_config
-    process_name         VARCHAR(100) NOT NULL,    -- e.g. UNIVERSE_VALIDATION -- same as project_name
-    rule_group           VARCHAR(100) NOT NULL,    -- groups rules for one use case / table pipeline
-    rule_variant         VARCHAR(100),             -- optional extra selection level within rule_group;
-                                                    -- NULL = always applies, see design notes above
-    seq_no               INTEGER DEFAULT 100,      -- run order within a group (sequential mode only)
-    sequencing_mode      VARCHAR(20) DEFAULT 'independent',  -- 'independent' | 'sequential'
-    on_failure           VARCHAR(20) DEFAULT 'skip_and_continue',  -- 'halt_group' | 'skip_and_continue'
-                                                    -- meaningful only when sequencing_mode='sequential'
+    src_key_cols         VARCHAR(500) NOT NULL,    -- comma-separated cols from the rule's own SELECT
+    element_name         VARCHAR(200),             -- optional; copied straight into gre_exceptions
+    -- ── Breach-behavior columns below -- how a failed record count turns
+    -- into PASS/FAIL/WARN.
     threshold_pct        FLOAT,                    -- % of in-scope records that must fail to breach
     threshold_count      INTEGER,                  -- raw count of failed records that must be exceeded
                                                     -- BOTH NULL -- no tolerance was ever configured for
@@ -179,9 +188,6 @@ CREATE MULTISET TABLE {{META_DB}}.gre_rules (
                                                     -- rationale.
     threshold_operator   CHAR(3) DEFAULT 'OR',      -- 'OR' | 'AND' -- only relevant if both are set
     severity             VARCHAR(50) DEFAULT 'Data Validation Error',  -- free string, project-defined
-    src_key_cols         VARCHAR(500) NOT NULL,    -- comma-separated cols from the rule's own SELECT
-    element_name         VARCHAR(200),             -- optional; copied straight into gre_exceptions
-    act_ind              BYTEINT DEFAULT 1,
     -- ── Descriptive/reporting columns below -- purely informational, never
     -- read by engine logic (load_rules()/execute_rule() ignore them
     -- entirely). Added to carry a project's own rule-catalog vocabulary
@@ -199,6 +205,7 @@ CREATE MULTISET TABLE {{META_DB}}.gre_rules (
     business_rule        VARCHAR(2000),            -- business-friendly statement of what this rule
                                                     -- checks -- distinct from rule_syntax (the actual SQL)
     rule_description     VARCHAR(2000),            -- longer-form description
+    -- ── Audit columns below.
     created_by           VARCHAR(100),             -- audit: who/what created this row
     last_updated_by      VARCHAR(100),             -- audit: who/what last modified this row
     load_datetime            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -243,32 +250,38 @@ ON {{META_DB}}.gre_rules;
 CREATE MULTISET TABLE {{META_DB}}.gre_exceptions (
     record_id            BIGINT GENERATED ALWAYS AS IDENTITY,
     run_id                VARCHAR(200),
+    run_key               VARCHAR(100) NOT NULL,
     rule_id               INTEGER NOT NULL,
+    -- ── Descriptive/reporting columns below -- purely informational, never
+    -- read by engine logic. rule_nm/dgr_nbr/universe_version are copied
+    -- from gre_rules at write time (like element_name/project_name below);
+    -- run_type/batch_schedule are copied from run_params IF the caller
+    -- supplies those exact keys for this run, else NULL -- see
+    -- rules_engine/executor.py::_write_exceptions().
+    rule_nm               VARCHAR(500),                 -- copied from gre_rules.rule_nm
+    -- ── Source/scope columns below -- where this finding came from.
     database_name         VARCHAR(200),                 -- copied from gre_rules.database_name
     src_tbl_nm            VARCHAR(200),
     project_name          VARCHAR(200),                 -- copied from gre_rules.project_name
     process_name          VARCHAR(200),                 -- copied from gre_rules.process_name
     element_name          VARCHAR(200),
+    -- ── Finding detail columns below -- what was found and how to re-find it.
     source_name           VARCHAR(100),
     issue_desc            VARCHAR(2000),
-    exception_flag        VARCHAR(20) DEFAULT 'OPEN',   -- compliance disposition
-    exception_approver     VARCHAR(100),
-    run_key               VARCHAR(100) NOT NULL,
-    etl_is_curr_ind       CHAR(1) DEFAULT 'Y',
-    etl_load_dt           DATE,
-    etl_last_updt_dt      TIMESTAMP,
     src_key_value         VARCHAR(1000) NOT NULL,       -- built from rule.src_key_cols
-    -- ── Descriptive/reporting columns below -- purely informational, never
-    -- read by engine logic. rule_nm/dgr_nbr/universe_version are copied
-    -- from gre_rules at write time (like element_name/project_name above);
-    -- run_type/batch_schedule are copied from run_params IF the caller
-    -- supplies those exact keys for this run, else NULL -- see
-    -- rules_engine/executor.py::_write_exceptions().
-    rule_nm               VARCHAR(500),                 -- copied from gre_rules.rule_nm
+    -- ── Rule-catalog descriptive columns below -- see comment above.
     dgr_nbr               VARCHAR(50),                  -- copied from gre_rules.dgr_nbr
     universe_version      VARCHAR(50),                  -- copied from gre_rules.universe_version
     run_type              VARCHAR(50),                  -- from run_params["run_type"], if supplied
     batch_schedule        VARCHAR(100),                 -- from run_params["batch_schedule"], if supplied
+    -- ── Compliance disposition columns below.
+    exception_flag        VARCHAR(20) DEFAULT 'OPEN',   -- compliance disposition
+    exception_approver     VARCHAR(100),
+    -- ── ETL/legacy flag columns below.
+    etl_is_curr_ind       CHAR(1) DEFAULT 'Y',
+    etl_load_dt           DATE,
+    etl_last_updt_dt      TIMESTAMP,
+    -- ── Audit columns below.
     load_datetime             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_updated_by       VARCHAR(100),                 -- audit: who/what last modified this row
     last_updated_datetime     TIMESTAMP
@@ -419,10 +432,10 @@ ON {{META_DB}}.gre_results;
 CREATE MULTISET TABLE {{META_DB}}.gre_rule_audit (
     run_id                 VARCHAR(200) NOT NULL,
     rule_group              VARCHAR(100),
+    rule_variant               VARCHAR(100),      -- NULL = no variant requested
     project_name              VARCHAR(100),      -- copied from gre_rules.project_name
     process_name              VARCHAR(100),      -- copied from gre_rules.process_name
     run_key                   VARCHAR(100),        -- caller-supplied tracking/idempotency key
-    rule_variant               VARCHAR(100),      -- NULL = no variant requested
     run_params                 CLOB,             -- the run_params dict this run was actually called
                                                   -- with, JSON-encoded (e.g. '{"year": 2026, "month": 8}'),
                                                   -- NULL when none was passed. This is the RUN-LEVEL

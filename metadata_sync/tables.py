@@ -36,13 +36,13 @@ GRE_RULES = {
     "primary_key": ("rule_id",),
     "mode": "full_refresh",
     "columns": [
-        "rule_id", "rule_nm", "database_name", "src_tbl_nm", "sql_dialect",
-        "rule_syntax", "project_name", "process_name", "rule_group", "rule_variant",
-        "seq_no", "sequencing_mode", "on_failure", "threshold_pct", "threshold_count",
-        "threshold_operator", "severity", "src_key_cols", "element_name", "act_ind",
-        "universe_version", "universe_year", "dgr_nbr", "issue_category_name",
-        "business_rule", "rule_description", "created_by", "last_updated_by",
-        "load_datetime", "last_updated_datetime",
+        "rule_id", "rule_nm", "act_ind", "rule_group", "rule_variant",
+        "project_name", "process_name", "seq_no", "sequencing_mode", "on_failure",
+        "database_name", "src_tbl_nm", "sql_dialect", "rule_syntax", "src_key_cols",
+        "element_name", "threshold_pct", "threshold_count", "threshold_operator",
+        "severity", "universe_version", "universe_year", "dgr_nbr",
+        "issue_category_name", "business_rule", "rule_description", "created_by",
+        "last_updated_by", "load_datetime", "last_updated_datetime",
     ],
 }
 
@@ -54,12 +54,12 @@ GRE_EXCEPTIONS = {
     "mode": "incremental",
     "watermark_col": "COALESCE(last_updated_datetime, load_datetime)",
     "columns": [
-        "record_id", "run_id", "rule_id", "database_name", "src_tbl_nm",
-        "project_name", "process_name", "element_name", "source_name", "issue_desc",
-        "exception_flag", "exception_approver", "run_key", "etl_is_curr_ind",
-        "etl_load_dt", "etl_last_updt_dt", "src_key_value", "rule_nm", "dgr_nbr",
-        "universe_version", "run_type", "batch_schedule", "load_datetime",
-        "last_updated_by", "last_updated_datetime",
+        "record_id", "run_id", "run_key", "rule_id", "rule_nm", "database_name",
+        "src_tbl_nm", "project_name", "process_name", "element_name", "source_name",
+        "issue_desc", "src_key_value", "dgr_nbr", "universe_version", "run_type",
+        "batch_schedule", "exception_flag", "exception_approver", "etl_is_curr_ind",
+        "etl_load_dt", "etl_last_updt_dt", "load_datetime", "last_updated_by",
+        "last_updated_datetime",
     ],
 }
 
@@ -104,8 +104,8 @@ GRE_RULE_AUDIT = {
     "watermark_col": "load_datetime",
     "reopen_filter": "status = 'RUNNING'",
     "columns": [
-        "run_id", "rule_group", "project_name", "process_name", "run_key",
-        "rule_variant", "run_params", "extra_filters",
+        "run_id", "rule_group", "rule_variant", "project_name", "process_name",
+        "run_key", "run_params", "extra_filters",
         "started_at", "ended_at", "status", "total_rules",
         "rules_succeeded", "rules_errored", "triggered_by", "load_datetime",
     ],
@@ -158,10 +158,10 @@ GRE_SAMPLING_CONFIG = {
     "primary_key": ("config_id",),
     "mode": "full_refresh",
     "columns": [
-        "config_id", "project_name", "process_name", "sample_name", "source_type",
-        "universe_table", "key_columns", "scope_sql", "exclusion_sql", "target_volume",
-        "sampling_method", "priority_rank_sql", "rounding_mode", "schedule_cron",
-        "act_ind", "created_by", "last_updated_by", "load_datetime",
+        "config_id", "act_ind", "project_name", "process_name", "sample_name",
+        "source_type", "universe_table", "key_columns", "scope_sql", "exclusion_sql",
+        "target_volume", "sampling_method", "priority_rank_sql", "rounding_mode",
+        "schedule_cron", "created_by", "last_updated_by", "load_datetime",
     ],
 }
 
@@ -198,8 +198,8 @@ GRE_SAMPLE_SELECTIONS = {
     "watermark_col": "COALESCE(last_updated_datetime, load_datetime)",
     "columns": [
         "sample_run_id", "config_id", "project_name", "process_name", "sample_cycle",
-        "case_key", "priority_rank", "excluded_flag", "exclusion_reason",
-        "selected_flag", "etl_is_curr_ind", "load_datetime", "last_updated_datetime",
+        "case_key", "priority_rank", "selected_flag", "excluded_flag",
+        "exclusion_reason", "etl_is_curr_ind", "load_datetime", "last_updated_datetime",
     ],
 }
 
