@@ -24,6 +24,7 @@ from rules_engine.executor import (
     build_source_tieback_sql,
 )
 from rules_engine.db_ops import execute_query
+from rules_engine.runner import _deactivate_all_active_for_run
 
 META_DB = "main"
 
@@ -380,11 +381,21 @@ def test_execute_rule_keeps_attempt_history_on_rerun():
     stays idempotent (no duplicate detail rows on a rerun); gre_results
     instead accumulates one row per run_id, with active_ind marking which
     attempt is current.
+
+    Deactivating a rerun's prior rows is now an orchestration-level step
+    (rules_engine/runner.py::run_rule_group() calls
+    _deactivate_all_active_for_run() ONCE, up front, before any rule
+    executes -- see that function's docstring) rather than something
+    execute_rule()/_write_result() do themselves per rule_id. This test
+    calls execute_rule() directly (bypassing run_rule_group()), so it
+    reproduces that same upfront deactivation explicitly between the two
+    "attempts" below, exactly as run_rule_group() would.
     """
     conn = _conn()
     rule = _rule(threshold_pct=25)
 
     execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    _deactivate_all_active_for_run(conn, META_DB, rule["rule_group"], "B1", "RUN2")
     execute_rule(rule, _Adapter(conn), conn, "RUN2", "B1", {"batch_id": "B1"}, META_DB)  # simulate a rerun of the same batch
 
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
@@ -435,6 +446,12 @@ def test_execute_rule_deactivates_prior_result_attempts_on_rerun():
     this (rule_id, run_key) -- including an ERROR attempt, not just a
     PASS/FAIL/WARN one -- so a reader filtering active_ind='Y' always
     sees exactly the latest attempt, never a stale one left behind.
+
+    That deactivation is now an orchestration-level step
+    (run_rule_group()'s upfront _deactivate_all_active_for_run() call, not
+    something execute_rule()/_write_result() do per rule_id) -- see
+    test_execute_rule_keeps_attempt_history_on_rerun()'s docstring above
+    for why this test reproduces it explicitly between the two attempts.
     """
     conn = _conn()
     broken_rule = _rule(rule_syntax="SELECT * FROM no_such_table WHERE batch_id = '{batch_id}'")
@@ -447,6 +464,7 @@ def test_execute_rule_deactivates_prior_result_attempts_on_rerun():
     # threshold configured on the default _rule() means the no-threshold
     # fallback breaches on ANY failure, and 2/4 rows fail here -- see
     # evaluate_threshold()'s no-threshold fallback).
+    _deactivate_all_active_for_run(conn, META_DB, broken_rule["rule_group"], "B1", "RUN2")
     fixed_rule = _rule()
     status2 = execute_rule(fixed_rule, _Adapter(conn), conn, "RUN2", "B1", {"batch_id": "B1"}, META_DB)
     assert status2 == "SUCCESS"
@@ -470,11 +488,18 @@ def test_execute_rule_deactivates_prior_errors_on_rerun():
     active_ind reconciliation regression for gre_rule_errors: two consecutive
     failing reruns of the same run_key must leave only the LATEST run_id's
     error row active, with the earlier one deactivated (not deleted).
+
+    That deactivation is now an orchestration-level step
+    (run_rule_group()'s upfront _deactivate_all_active_for_run() call, not
+    something log_error() does per rule_id) -- see
+    test_execute_rule_keeps_attempt_history_on_rerun()'s docstring above
+    for why this test reproduces it explicitly between the two attempts.
     """
     conn = _conn()
     broken_rule = _rule(rule_syntax="SELECT * FROM no_such_table WHERE batch_id = '{batch_id}'")
 
     execute_rule(broken_rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    _deactivate_all_active_for_run(conn, META_DB, broken_rule["rule_group"], "B1", "RUN2")
     execute_rule(broken_rule, _Adapter(conn), conn, "RUN2", "B1", {"batch_id": "B1"}, META_DB)
 
     errors = execute_query(conn, "SELECT * FROM gre_rule_errors WHERE rule_id = 1 AND run_key = 'B1'")

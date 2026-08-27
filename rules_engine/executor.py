@@ -757,46 +757,6 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
     return {"inserted": inserted, "reactivated": reactivated, "deactivated": deactivated}
 
 
-def _deactivate_prior_results(meta_conn, meta_db: str, rule_id, run_key: str, current_run_id: str) -> None:
-    """
-    Soft-deactivate every gre_results row for (rule_id, run_key) left over
-    from an EARLIER run_id -- i.e. a previous, separate run of this same
-    run_key (rules_engine/runner.py::generate_run_id() mints a brand new
-    run_id every call, even for a repeated run_key). Mirrors
-    sampling/sampling.py::_deactivate_prior_sampling_runs()'s "always
-    re-execute, deactivate stale, activate new" pattern.
-
-    Deliberately scoped to run_id <> current_run_id, NOT status: an ERROR
-    attempt from an earlier run_id is exactly as stale as a PASS/FAIL/WARN
-    one once this run_key has been re-run -- the LATEST run_id's own row
-    (whatever its status) is what should read as "active" for this
-    rule_id/run_key, not a mix of whichever old rows happened to verdict
-    PASS. Never deletes -- gre_results keeps full attempt history for
-    audit; only active_ind flips.
-
-    Called once per rule per attempt, immediately before _write_result()
-    inserts this attempt's own row -- see execute_rule()'s call sites
-    below. Never raises: a failure here must not mask the real attempt
-    outcome, same contract as _write_result()'s own bookkeeping calls.
-    """
-    try:
-        execute_dml(
-            meta_conn,
-            f"""
-            UPDATE {meta_db}.gre_results
-            SET active_ind = 'N', last_updated_datetime = CURRENT_TIMESTAMP
-            WHERE rule_id = ? AND run_key = ? AND run_id <> ? AND active_ind = 'Y'
-            """,
-            [rule_id, run_key, current_run_id],
-            log_params=True,
-        )
-    except Exception as exc:
-        logger.error(
-            "Failed to deactivate prior gre_results attempts for rule_id=%s run_key=%s: %s",
-            rule_id, run_key, exc,
-        )
-
-
 def _write_result(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str, start_time: float,
                    status: str, total_records=None, failed_records: int = 0, failure_pct=None,
                    threshold_pct_used=None, threshold_count_used=None, threshold_operator_used=None,
@@ -820,13 +780,18 @@ def _write_result(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str
     there's exactly one place to look for "did this rule pass, fail, or
     blow up," and exactly one column meaning "status."
 
-    Deactivates any earlier run_id's row for this (rule_id, run_key) first
-    -- see _deactivate_prior_results()'s docstring -- then always INSERTs
-    (never UPDATEs): unlike the old gre_results upsert-in-place, this
-    keeps full attempt history the way gre_log used to, with active_ind
-    marking which row is current for this (rule_id, run_key). A rerun of
-    the same run_key -- the same kind of run, just re-executed -- never
-    deletes a prior attempt's row; it deactivates it and adds a new one.
+    Every row this attempt's rule_group produces for this run_key was
+    already blanket-deactivated up front, once, before any rule in the
+    group started executing -- see rules_engine/runner.py::
+    _deactivate_all_active_for_run()'s docstring for why that's a single
+    broad pass instead of a per-rule deactivate-then-insert here. This
+    function therefore always just INSERTs (never UPDATEs, never
+    deactivates anything itself): unlike the old gre_results
+    upsert-in-place, this keeps full attempt history the way gre_log used
+    to, with active_ind marking which row is current for this
+    (rule_id, run_key). A rerun of the same run_key -- the same kind of
+    run, just re-executed -- never deletes a prior attempt's row; the
+    upfront blanket pass deactivates it, and this call adds the new one.
 
     Raises on a genuine write failure (does NOT swallow it) -- unlike the
     old _log_attempt()'s "never raises" contract, because this is now the
@@ -843,7 +808,6 @@ def _write_result(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str
                    column comment for the full rationale.
     """
     rule_id = rule.get("rule_id")
-    _deactivate_prior_results(meta_conn, meta_db, rule_id, run_key, run_id)
 
     sql = f"""
         INSERT INTO {meta_db}.gre_results (

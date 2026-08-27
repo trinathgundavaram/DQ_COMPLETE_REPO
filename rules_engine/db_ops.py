@@ -647,43 +647,18 @@ def _run_source_query(db_conn, sql: str) -> list:
 # rules_engine error is tied to a specific rule) -- no more "rule_id IS
 # NULL" branch to worry about.
 
-def _deactivate_prior_errors(meta_conn, meta_db: str, rule_id, run_key, current_run_id) -> None:
-    """
-    Soft-deactivate every gre_rule_errors row for (rule_id, run_key) left
-    active from an EARLIER run_id, mirroring rules_engine/executor.py::
-    _deactivate_prior_results() for gre_results -- the same "always
-    re-execute, deactivate stale, activate new" pattern applied here to
-    gre_rule_errors. Never deletes -- gre_rule_errors keeps full history
-    for audit; only active_ind flips. Never raises: a failure here must
-    not mask the real error being logged.
-    """
-    try:
-        execute_dml(
-            meta_conn,
-            f"""
-            UPDATE {meta_db}.gre_rule_errors
-            SET active_ind = 'N', last_updated_datetime = CURRENT_TIMESTAMP
-            WHERE rule_id = ? AND run_key = ? AND run_id <> ? AND active_ind = 'Y'
-            """,
-            [rule_id, run_key, current_run_id],
-            log_params=True,
-        )
-    except Exception as exc:
-        logger.error(
-            "Failed to deactivate prior gre_rule_errors rows for rule_id=%s run_key=%s: %s",
-            rule_id, run_key, exc,
-        )
-
-
 def log_error(meta_conn, meta_db: str, run_id, rule_id, rule_group, run_key,
               error_type: str, message: str, detail: str = None, rule_variant=None) -> None:
     """
-    Insert one gre_rule_errors row, after deactivating any row left active
-    for this (rule_id, run_key) from an earlier run_id -- see
-    _deactivate_prior_errors()'s docstring. This error is always inserted
-    with active_ind='Y': it belongs to the run_id currently executing,
-    which is by definition the newest one for this run_key. Never raises
-    -- an errors-table failure must not mask the real error.
+    Every row this attempt's rule_group produces for this run_key was
+    already blanket-deactivated up front, once, before any rule in the
+    group started executing -- see rules_engine/runner.py::
+    _deactivate_all_active_for_run()'s docstring. This error is therefore
+    always just INSERTed with active_ind='Y': it belongs to the run_id
+    currently executing, which is by definition the newest one for this
+    run_key, and nothing else active for this run_key is left over to
+    conflict with it. Never raises -- an errors-table failure must not
+    mask the real error.
 
     rule_variant : the ERRORING RULE's OWN gre_rules.rule_variant (NOT the
         run's requested rule_variant filter, which may be None/"run every
@@ -696,8 +671,6 @@ def log_error(meta_conn, meta_db: str, run_id, rule_id, rule_group, run_key,
     rule-dict convenience wrapper _log_error() rather than each call site
     keeping its own INSERT+try/except copy.
     """
-    _deactivate_prior_errors(meta_conn, meta_db, rule_id, run_key, run_id)
-
     sql = f"""
         INSERT INTO {meta_db}.gre_rule_errors (
             run_id, rule_id, rule_group, rule_variant, run_key, error_type,

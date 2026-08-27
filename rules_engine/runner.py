@@ -156,6 +156,123 @@ def _finish_audit(meta_conn, meta_db: str, run_id: str, status: str,
     """, [datetime.now(), status, rules_succeeded, rules_errored, run_id], log_params=True)
 
 
+def _deactivate_all_active_for_run(meta_conn, meta_db: str, rule_group: str, run_key: str,
+                                    current_run_id: str) -> None:
+    """
+    Blanket-deactivate EVERY currently-active gre_results / gre_rule_errors
+    / gre_exceptions row for (rule_group, run_key) -- regardless of which
+    specific rule_id produced it -- called ONCE per run_rule_group()
+    attempt, right after the new run_id is minted and gre_rule_audit is
+    started, BEFORE any rule in this attempt executes.
+
+    Why a single broad pass, not the earlier per-rule approach: this
+    package used to deactivate "prior" rows lazily, one rule_id at a time,
+    right before that SAME rule_id's own new row was written
+    (executor.py's old _deactivate_prior_results(), db_ops.py's old
+    _deactivate_prior_errors(), both since removed). That worked fine for
+    a rule_id that runs again this attempt, but left a real gap: a rule_id
+    that had active rows on file for this run_key from an EARLIER attempt
+    -- but is no longer part of this rule_group's active set THIS time
+    (deactivated in gre_rules, removed from the group, or excluded by a
+    narrower rule_variant this attempt) -- was never touched by anything,
+    since nothing ever executes for it again. Its stale 'Y' rows would
+    stay active forever, even though this run_key's current, true state
+    no longer includes that rule at all -- exactly the confusion "how is
+    active_ind actually being set" points at.
+
+    This function closes that gap the direct way instead: wipe EVERYTHING
+    on file for (rule_group, run_key) to inactive FIRST, unconditionally,
+    then let the normal per-rule write/reconcile logic re-activate exactly
+    what THIS attempt actually produces:
+      - gre_results / gre_rule_errors: each rule that still runs this
+        attempt gets a fresh INSERT (executor.py::_write_result(),
+        db_ops.py::log_error()) a few lines later in the same call --
+        those functions no longer deactivate anything themselves, since
+        everything is already 'N' by the time they run.
+      - gre_exceptions: a still-violating key gets reactivated back to 'Y'
+        by executor.py::_write_exceptions()'s existing per-key
+        reconciliation loop (which already treats "existing row is 'N'"
+        as "reactivate" -- see that function's docstring) -- nothing
+        about that reconciliation logic needed to change, it just now
+        always starts from an all-'N' baseline instead of whatever was
+        left over from a rule_id no longer in scope.
+      - a rule_id that DOESN'T run this attempt correctly stays
+        deactivated across all three tables -- which is the whole point.
+
+    One known, accepted limitation: this scopes by the CURRENT rule_group
+    value, so a rule_id whose gre_rules.rule_group was reassigned to a
+    DIFFERENT value between attempts leaves its old rows (recorded under
+    the OLD rule_group) untouched by this pass. Reassigning a rule's
+    rule_group is rare and outside the "rerun the same rule_group for this
+    run_key" scenario this exists for.
+
+    Scoped to run_id <> current_run_id, not status -- matches every other
+    deactivation in this engine: an ERROR attempt's row is exactly as
+    stale as a PASS/FAIL/WARN one once a run_key has been re-run. In
+    practice this condition is always true here (current_run_id was just
+    minted moments ago by _build_group_run_id() and no row has been
+    written with it yet), but it's kept for defensive clarity and
+    consistency with the write-side deactivation pattern elsewhere.
+
+    Never deletes anything -- same soft-deactivate-only contract as every
+    other write in this engine; full history stays queryable by run_id.
+    Each of the three statements is wrapped independently so one table's
+    failure doesn't block the other two, and never raises -- a failure
+    here must not abort a run over bookkeeping, same contract as the
+    per-rule deactivation this replaces.
+    """
+    try:
+        execute_dml(
+            meta_conn,
+            f"""
+            UPDATE {meta_db}.gre_results
+            SET active_ind = 'N', last_updated_datetime = CURRENT_TIMESTAMP
+            WHERE rule_group = ? AND run_key = ? AND run_id <> ? AND active_ind = 'Y'
+            """,
+            [rule_group, run_key, current_run_id],
+            log_params=True,
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to blanket-deactivate prior gre_results rows for rule_group=%s run_key=%s: %s",
+            rule_group, run_key, exc,
+        )
+
+    try:
+        execute_dml(
+            meta_conn,
+            f"""
+            UPDATE {meta_db}.gre_rule_errors
+            SET active_ind = 'N', last_updated_datetime = CURRENT_TIMESTAMP
+            WHERE rule_group = ? AND run_key = ? AND run_id <> ? AND active_ind = 'Y'
+            """,
+            [rule_group, run_key, current_run_id],
+            log_params=True,
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to blanket-deactivate prior gre_rule_errors rows for rule_group=%s run_key=%s: %s",
+            rule_group, run_key, exc,
+        )
+
+    try:
+        execute_dml(
+            meta_conn,
+            f"""
+            UPDATE {meta_db}.gre_exceptions
+            SET etl_is_curr_ind = 'N', last_updated_by = 'SYSTEM', last_updated_datetime = CURRENT_TIMESTAMP
+            WHERE rule_group = ? AND run_key = ? AND run_id <> ? AND etl_is_curr_ind = 'Y'
+            """,
+            [rule_group, run_key, current_run_id],
+            log_params=True,
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to blanket-deactivate prior gre_exceptions rows for rule_group=%s run_key=%s: %s",
+            rule_group, run_key, exc,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Parallel execution (sequencing_mode='independent' only -- see module docstring)
 # ---------------------------------------------------------------------------
@@ -401,8 +518,11 @@ def run_rule_group(
     rule_variant : optional extra selection level on top of rule_group/
                    table -- passed straight to rules_engine.rules.load_rules()
                    (see its docstring) and recorded on gre_rule_audit for
-                   this run. None (the default) loads only rules with
-                   rule_variant IS NULL (universal rules for the group).
+                   this run. None (the default) applies NO rule_variant
+                   filter at all -- every active rule in the group runs,
+                   regardless of its own rule_variant. Passing a value
+                   narrows to universal (rule_variant IS NULL) rules PLUS
+                   rules tagged with that exact value.
 
     Returns
     -------
@@ -470,6 +590,16 @@ def run_rule_group(
     _start_audit(meta_conn, meta_db, run_id, rule_group, run_key, len(rules), triggered_by,
                  rule_variant=rule_variant, project_name=project_name, process_name=process_name,
                  run_params=resolved_params, extra_filters=extra_filters)
+
+    # Blanket-deactivate every currently-active gre_results/gre_rule_errors/
+    # gre_exceptions row for (rule_group, run_key), BEFORE any rule below
+    # executes -- see _deactivate_all_active_for_run()'s docstring for why
+    # this is a single broad pass rather than the old per-rule-id
+    # deactivation. Guarantees a rerun of this run_key never leaves a
+    # previous attempt's row active for a rule that isn't even part of
+    # this attempt's rule set any more.
+    _deactivate_all_active_for_run(meta_conn, meta_db, rule_group, run_key, run_id)
+
     logger.info("Starting GRE run: %s (%d rule(s))", run_id, len(rules))
 
     # Every rule always re-executes for its run_key -- no more skipping

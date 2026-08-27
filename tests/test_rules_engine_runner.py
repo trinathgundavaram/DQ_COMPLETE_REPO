@@ -319,6 +319,64 @@ def test_rerun_always_re_executes_already_succeeded_rules():
     assert len(logs_r2) == 1
 
 
+
+def test_rerun_deactivates_stale_rows_for_a_rule_no_longer_in_scope():
+    """
+    The gap the old per-rule-id deactivation could never close: rule_id 99
+    has active gre_results/gre_rule_errors/gre_exceptions rows for
+    (rule_group='claims_dq', run_key='B1') from some earlier attempt, but
+    rule_id 99 is NOT part of THIS attempt's active rule set at all (it's
+    simply not inserted into gre_rules below -- same observable effect as
+    act_ind=0, removed from the group, or narrowed out by rule_variant).
+
+    The old _deactivate_prior_results()/_deactivate_prior_errors()
+    functions only ever ran right before a rule wrote ITS OWN new row, so
+    a rule_id that never executes again in a later attempt kept its stale
+    active_ind='Y'/etl_is_curr_ind='Y' rows forever -- exactly the
+    "anything for same run_key should be set to N" complaint. The new
+    runner.py::_deactivate_all_active_for_run() call, made once up front
+    for the whole (rule_group, run_key) before any rule in the attempt
+    executes, closes this: rule_id 99's rows get deactivated even though
+    rule_id 99 never runs in this attempt.
+    """
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10)
+
+    # Pre-seed stale active rows for rule_id 99 -- a rule that is NOT
+    # inserted into gre_rules for this attempt, so it can never re-execute
+    # and re-deactivate its own prior rows the old way.
+    conn.execute("""
+        INSERT INTO gre_results (run_id, rule_id, rule_group, run_key, status, failed_records, active_ind)
+        VALUES ('PRIOR_RUN', 99, 'claims_dq', 'B1', 'FAIL', 3, 'Y')
+    """)
+    conn.execute("""
+        INSERT INTO gre_rule_errors (run_id, rule_id, rule_group, run_key, error_type, error_message, active_ind)
+        VALUES ('PRIOR_RUN', 99, 'claims_dq', 'B1', 'RUNTIME', 'boom', 'Y')
+    """)
+    conn.execute("""
+        INSERT INTO gre_exceptions (run_id, run_key, rule_id, rule_group, src_key_value, etl_is_curr_ind)
+        VALUES ('PRIOR_RUN', 'B1', 99, 'claims_dq', 'REC1', 'Y')
+    """)
+
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
+
+    assert summary["status"] == "COMPLETED"
+    assert summary["results"][1] == "SUCCESS"
+
+    stale_results = execute_query(conn, "SELECT active_ind FROM gre_results WHERE rule_id = 99")
+    assert len(stale_results) == 1
+    assert stale_results[0]["active_ind"] == "N"
+
+    stale_errors = execute_query(conn, "SELECT active_ind FROM gre_rule_errors WHERE rule_id = 99")
+    assert len(stale_errors) == 1
+    assert stale_errors[0]["active_ind"] == "N"
+
+    stale_exceptions = execute_query(conn, "SELECT etl_is_curr_ind FROM gre_exceptions WHERE rule_id = 99")
+    assert len(stale_exceptions) == 1
+    assert stale_exceptions[0]["etl_is_curr_ind"] == "N"
+
+
 def test_sequential_halt_group_stops_before_next_rule():
     conn = _conn()
     cf = _FakeConnectionFactory(conn)
