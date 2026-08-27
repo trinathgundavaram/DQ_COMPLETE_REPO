@@ -579,7 +579,28 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
 
     Rows are de-duplicated by src key WITHIN this call first (a
     rule_syntax that legitimately returns the same src key twice in one
-    pull would otherwise be treated as two separate changes).
+    pull would otherwise be treated as two separate changes). Two
+    diagnostics wrap this de-dup step, both purely additive (neither
+    changes gre_exceptions content or the rule's PASS/FAIL/WARN verdict):
+
+      - Structural fail-fast: before the de-dup loop runs at all, `rows[0]`
+        is checked once for every configured src_key_cols column. A
+        missing column is a property of the query (rule_syntax never
+        SELECTs it), identical for every row, so it's validated once up
+        front and raises immediately -- instead of surfacing N rows deep
+        into the loop, aborting reconciliation for every row after
+        whichever one the DB driver happened to return first.
+      - Per-row resilience + visibility: build_src_key() is called inside
+        a try/except per row, so any OTHER (non-structural) per-row
+        failure skips just that row rather than aborting the whole
+        attempt; skipped rows are counted and logged once as
+        KEY_BUILD_FAILURE (gre_rule_errors), not one row per failure.
+        Rows that build a key successfully but collide with an
+        already-seen key (src_key_cols isn't a true natural key for this
+        table, or multiple rows are all-NULL in every key column and
+        collapse onto the same "NULL"-encoded string) are still merged
+        first-encountered-wins via setdefault() -- unchanged -- but the
+        collapse is now counted and logged once as KEY_NOT_DISTINCT.
 
     rule_nm/dgr_nbr/universe_version are copied straight from `rule`
     (gre_rules), same as element_name/project_name/process_name above --
@@ -594,11 +615,60 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
     run_params = run_params or {}
     rule_id = rule.get("rule_id")
 
-    # de-dup this attempt's violating rows by src key
+    # Fail fast on a structural misconfiguration (src_key_cols naming a
+    # column rule_syntax never SELECTs) -- this is a property of the query,
+    # identical for every row it returns, so check it ONCE against the
+    # first row rather than discovering it N rows deep in the loop below,
+    # where it would otherwise abort processing for every row after it.
+    if rows:
+        key_cols = split_src_key_cols(rule)
+        missing = [c for c in key_cols if c.strip().lower() not in rows[0]]
+        if missing:
+            raise KeyError(
+                f"rule_id={rule_id}: src_key_cols {missing} not found among "
+                f"result columns {sorted(rows[0].keys())} -- gre_rules.src_key_cols "
+                "must name columns rule_syntax actually SELECTs (case-insensitive)."
+            )
+
+    # de-dup this attempt's violating rows by src key. Per-row try/except
+    # so one anomalous row can't abort reconciliation for every other row
+    # in this attempt -- the structural (whole-query) failure case is
+    # already caught above before this loop runs.
     new_rows_by_key = {}
+    key_build_errors = 0
     for row in rows:
-        nk = build_src_key(rule, row)
+        try:
+            nk = build_src_key(rule, row)
+        except Exception:
+            key_build_errors += 1
+            continue
         new_rows_by_key.setdefault(nk, row)
+
+    if key_build_errors:
+        logger.warning(
+            "rule_id=%s run_key=%s: %d/%d violating rows failed key-building "
+            "and were skipped this attempt",
+            rule_id, run_key, key_build_errors, len(rows),
+        )
+        _log_error(
+            meta_conn, meta_db, run_id, rule, run_key, "KEY_BUILD_FAILURE",
+            f"{key_build_errors}/{len(rows)} violating rows failed key-building",
+        )
+
+    if len(rows) > len(new_rows_by_key) + key_build_errors:
+        collapsed = len(rows) - key_build_errors - len(new_rows_by_key)
+        logger.warning(
+            "rule_id=%s run_key=%s: %d violating rows collapsed into %d "
+            "distinct src_key_value(s) -- src_key_cols may not be a true "
+            "natural key for this rule's table",
+            rule_id, run_key, len(rows), len(new_rows_by_key),
+        )
+        _log_error(
+            meta_conn, meta_db, run_id, rule, run_key, "KEY_NOT_DISTINCT",
+            f"{collapsed} duplicate-key row(s) collapsed into existing "
+            f"src_key_value entries ({len(new_rows_by_key)} distinct keys "
+            f"from {len(rows)} violating rows)",
+        )
 
     # every gre_exceptions row currently on file for (rule_id, run_key),
     # regardless of its current etl_is_curr_ind -- needed to tell "new"

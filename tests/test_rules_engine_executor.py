@@ -716,6 +716,142 @@ def test_write_exceptions_dedupes_src_key_within_one_pull():
     assert results[0]["failed_records"] == 4   # true COUNT(*) on rule_syntax counts every returned row
 
 
+# ── _write_exceptions(): structural fail-fast, per-row resilience, and
+# duplicate-key visibility (missing src_key_cols column / colliding keys) ──
+
+def test_write_exceptions_missing_key_column_fails_fast_before_any_db_call():
+    """
+    3a: a src_key_cols column absent from EVERY row (rule_syntax never
+    SELECTs it) is a structural, query-wide misconfiguration -- it must be
+    caught once, up front, before the existing-rows query even runs, not
+    discovered mid-loop. Proven here by dropping gre_exceptions first: if
+    _write_exceptions() ever reached its `existing = execute_query(...)`
+    call, it would raise a DuckDB catalog error instead of the expected
+    KeyError.
+    """
+    from rules_engine.executor import _write_exceptions
+
+    conn = _conn()
+    conn.execute("DROP TABLE gre_exceptions")
+    rule = _rule(src_key_cols="claim_id")
+
+    with pytest.raises(KeyError, match="claim_id"):
+        _write_exceptions(
+            conn, META_DB, rule, "RUN1", "B1",
+            rows=[{"other_col": "x"}],   # claim_id missing from every row
+        )
+
+
+def test_write_exceptions_partial_key_build_failure_skips_only_bad_rows():
+    """
+    3b: a row missing the key column only manifests as a per-row failure
+    when row[0] itself HAS the column (so 3a's fail-fast doesn't fire) but
+    a later row doesn't -- a genuinely per-row anomaly, not a structural
+    one. The good row must still be reconciled; exactly one aggregated
+    KEY_BUILD_FAILURE row must land in gre_rule_errors, not one per bad row.
+    """
+    from rules_engine.executor import _write_exceptions
+
+    conn = _conn()
+    rule = _rule()
+
+    summary = _write_exceptions(
+        conn, META_DB, rule, "RUN1", "B1",
+        rows=[{"claim_id": "C1"}, {"other_col": "bad"}],
+    )
+    assert summary["inserted"] == 1   # the good row still made it through
+
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
+    assert {e["src_key_value"] for e in exceptions} == {"claim_id=C1"}
+
+    errors = execute_query(conn, "SELECT * FROM gre_rule_errors WHERE rule_id = 1")
+    assert len(errors) == 1   # aggregated, not one row per bad row
+    assert errors[0]["error_type"] == "KEY_BUILD_FAILURE"
+    assert "1/2" in errors[0]["error_message"]
+
+
+def test_write_exceptions_duplicate_keys_collapse_and_are_logged():
+    """
+    3c: rows sharing one src_key_value (e.g. src_key_cols isn't a true
+    natural key, or several rows are all-NULL in every key column and
+    collapse onto the literal "NULL" encoding) still merge
+    first-encountered-wins via setdefault() -- unchanged behavior -- but
+    the collapse must now be visible as one aggregated KEY_NOT_DISTINCT
+    row instead of vanishing silently.
+    """
+    from rules_engine.executor import _write_exceptions
+
+    conn = _conn()
+    rule = _rule()
+
+    summary = _write_exceptions(
+        conn, META_DB, rule, "RUN1", "B1",
+        rows=[{"claim_id": "C1"}] * 10,   # 10 rows, all the same key
+    )
+    assert summary["inserted"] == 1   # existing dedup behavior unchanged -- still just 1 row
+
+    errors = execute_query(conn, "SELECT * FROM gre_rule_errors WHERE rule_id = 1")
+    assert len(errors) == 1
+    assert errors[0]["error_type"] == "KEY_NOT_DISTINCT"
+    assert "9" in errors[0]["error_message"]   # 9 of the 10 collapsed into the 1 that survived
+
+
+def test_write_exceptions_key_build_failures_and_duplicates_dont_double_count():
+    """
+    3b + 3c together: a mix of one key-build failure and one duplicate-key
+    collision among the rows that DID build a key. The two counts must not
+    double-count each other -- this is why 3c's condition subtracts
+    key_build_errors before computing the collapsed count.
+    """
+    from rules_engine.executor import _write_exceptions
+
+    conn = _conn()
+    rule = _rule()
+
+    rows = [
+        {"claim_id": "C1"},
+        {"claim_id": "C1"},      # duplicate of the row above
+        {"claim_id": "C2"},
+        {"other_col": "bad"},    # fails key-building
+    ]
+    summary = _write_exceptions(conn, META_DB, rule, "RUN1", "B1", rows=rows)
+    assert summary["inserted"] == 2   # C1 (deduped) + C2
+
+    errors = execute_query(conn, "SELECT * FROM gre_rule_errors WHERE rule_id = 1 ORDER BY error_type")
+    assert len(errors) == 2
+    by_type = {e["error_type"]: e["error_message"] for e in errors}
+    assert set(by_type) == {"KEY_BUILD_FAILURE", "KEY_NOT_DISTINCT"}
+    assert "1/4" in by_type["KEY_BUILD_FAILURE"]      # 1 of the 4 rows failed key-building
+    assert "1 duplicate-key row" in by_type["KEY_NOT_DISTINCT"]   # only the genuine dup, not the failed row too
+
+
+def test_execute_rule_structural_key_failure_still_reports_success_and_a_verdict():
+    """
+    Rule status is unaffected by any of the above: a structural
+    src_key_cols misconfiguration still routes through execute_rule()'s
+    existing STEP 3 try/except (WRITE_FAILURE, unchanged) -- the rule
+    itself still reports "SUCCESS" and gre_results still gets a normal
+    verdict from the STEP 1/2 scan, exactly as before this change.
+    """
+    conn = _conn()
+    rule = _rule(threshold_pct=None, threshold_count=None, src_key_cols="nonexistent_col")
+
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    assert status == "SUCCESS"
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
+    assert len(results) == 1
+    assert results[0]["status"] == "FAIL"          # 2/4 fail, no threshold -> breaches (unchanged verdict logic)
+    assert results[0]["failed_records"] == 2
+
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
+    assert len(exceptions) == 0   # reconciliation never got a valid key to write
+
+    errors = execute_query(conn, "SELECT * FROM gre_rule_errors WHERE rule_id = 1")
+    assert len(errors) == 1
+    assert errors[0]["error_type"] == "WRITE_FAILURE"   # STEP 3's existing catch-all, unchanged
+
+
 def test_no_max_exceptions_cap_captures_every_violating_row():
     """
     Regression for the removal of GRE_MAX_EXCEPTIONS: gre_exceptions
