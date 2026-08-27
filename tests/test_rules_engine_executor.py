@@ -1209,6 +1209,79 @@ def test_execute_rule_unresolved_token_fails_fast_before_any_query():
     assert execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1") == []
 
 
+
+# ── text_params: substitution WITHOUT total-count scoping ────────────────
+
+def test_execute_rule_run_params_key_that_is_not_a_real_column_breaks_total_count():
+    # Reproduces the reported production bug directly: a run_params key
+    # (RUNTYPE) that doesn't name a real column on the table is STILL
+    # forced into the auto-generated total-record count's WHERE clause
+    # (see _build_total_query()) -- "unresolved/unknown column" from the
+    # source database, even though rule_syntax itself never needed
+    # RUNTYPE to be a column at all (it's used as a plain literal
+    # comparison here, same as a user embedding a run-type marker inline).
+    conn = _conn()
+    rule = _rule(
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+                 "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' AND '{RUNTYPE}' = 'MNT'",
+    )
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1",
+                           {"batch_id": "B1", "RUNTYPE": "MNT"}, META_DB)
+    assert status == "ERROR"
+
+    errors = execute_query(conn, "SELECT * FROM gre_rule_errors WHERE rule_id = 1")
+    assert len(errors) == 1
+    assert errors[0]["error_type"] == "SCOPE_QUERY_FAILURE"   # the total-count query, not the rule scan
+
+
+def test_execute_rule_text_params_substitute_without_scoping_total_count():
+    # The fix: the SAME RUNTYPE value, passed via text_params instead of
+    # run_params, still substitutes into rule_syntax ("{RUNTYPE}" resolves
+    # to 'MNT' below) but is NEVER folded into the total-count WHERE
+    # clause -- only run_params (batch_id here) is. No "unknown column"
+    # error, because the total query only ever references batch_id.
+    conn = _conn()
+    rule = _rule(
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+                 "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' AND '{RUNTYPE}' = 'MNT'",
+    )
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1",
+                           {"batch_id": "B1"}, META_DB,
+                           text_params={"RUNTYPE": "MNT"})
+    assert status == "SUCCESS"
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1")
+    assert len(results) == 1
+    assert "'MNT' = 'MNT'" in results[0]["executed_sql"]   # {RUNTYPE} resolved via text_params
+    assert results[0]["total_records"] == 4   # same denominator as batch_id='B1' alone -- RUNTYPE never scoped it
+
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
+    assert len(exceptions) == 2   # C1, C3 -- unaffected, same as run_params-only equivalents elsewhere
+
+
+def test_execute_rule_text_params_key_collision_with_run_params_favors_text_params():
+    # Documented precedence: when the same key appears in both dicts,
+    # text_params wins for SUBSTITUTION -- but run_params (not the merged
+    # value) is still what's used for total-count scoping, since
+    # batch_id must remain a real column filter regardless.
+    conn = _conn()
+    rule = _rule(
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+                 "WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
+    )
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1",
+                           {"batch_id": "B1"}, META_DB,
+                           text_params={"batch_id": "OVERRIDE_NOT_A_REAL_BATCH"})
+    assert status == "SUCCESS"
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1")
+    assert len(results) == 1
+    # rule_syntax substitution used text_params' value (collision winner) --
+    # no row in `claims` has this batch_id, so the scan itself finds nothing.
+    assert "OVERRIDE_NOT_A_REAL_BATCH" in results[0]["executed_sql"]
+    assert results[0]["total_records"] == 4   # total-count still scoped by run_params' real batch_id='B1'
+
+
 # ── run_key genericity: no "batch_id" concept required ───────────────────
 
 def test_execute_rule_writes_resolved_sql_to_executed_sql_on_success():

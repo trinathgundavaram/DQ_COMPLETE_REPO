@@ -922,7 +922,7 @@ def _compute_total(db_conn, rule: dict, run_params: dict, total_cache: dict = No
 # ---------------------------------------------------------------------------
 
 def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_params: dict, meta_db: str,
-                  total_cache: dict = None, extra_filters: dict = None) -> str:
+                  total_cache: dict = None, extra_filters: dict = None, text_params: dict = None) -> str:
     """
     Execute one rule end-to-end: prepare its source (file/S3 rules register
     their DuckDB view here), substitute run_params into rule_syntax, splice
@@ -948,7 +948,10 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
                   tokens (see rules_engine/db_ops.py::_substitute_params()) AND
                   used, key-for-key, as the equality filters for the
                   auto-generated total-record count (see
-                  _compute_total()/_build_total_query()). Has no
+                  _compute_total()/_build_total_query()) -- EVERY run_params
+                  key is treated as a literal column name on this rule's
+                  table for that count, so a run_params key only makes
+                  sense here if it's ALSO a real column. Has no
                   reserved/required key -- entirely up to the rule author
                   what it contains. Two keys get an extra, optional
                   courtesy: if present, "run_type" and "batch_schedule"
@@ -957,6 +960,22 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
                   rules_engine/schema.sql) -- this doesn't make them
                   reserved, it's just where those two particular values
                   land if you choose to use them.
+    text_params : optional dict of named values substituted into
+                  rule_syntax's "{key}"/"$key" tokens EXACTLY like
+                  run_params -- the only difference is text_params is
+                  NEVER treated as a total-count scoping column (see
+                  run_params above). Use this for a substitution value
+                  whose name doesn't match a real column on the table --
+                  e.g. a run_params key like RUNTYPE used only inside
+                  rule_syntax's own SQL text, where the actual runtime
+                  column is named differently (run_ty) and is scoped via
+                  extra_filters instead. Passing a value as run_params
+                  when it isn't a real column breaks the auto-generated
+                  total-record count with an "unresolved/unknown column"
+                  error from the source database -- that's exactly the
+                  case text_params exists for. Merged with run_params for
+                  substitution purposes only (text_params wins on a key
+                  collision); has no reserved/required key either.
     meta_db     : schema name the gre_ tables live in
     total_cache : optional dict, shared across every rule in one
                   run_rule_group() call, that memoizes _compute_total()'s
@@ -1041,8 +1060,15 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     extra_filters_marker_present = "{extra_filters}" in rule["rule_syntax"] or "$extra_filters" in rule["rule_syntax"]
     templated = rule["rule_syntax"].replace("{extra_filters}", extra_filters_sql).replace(
         "$extra_filters", extra_filters_sql)
+    # text_params merges on top of run_params for SUBSTITUTION only (wins
+    # on a key collision) -- run_params itself, unmodified, is what STEP 2
+    # below uses for the total-count scoping columns. This keeps a
+    # text-only value (e.g. RUNTYPE, when the real column is run_ty) out
+    # of the auto-generated denominator query entirely -- see
+    # execute_rule()'s text_params docstring above.
+    substitution_params = {**run_params, **(text_params or {})}
     try:
-        query = _substitute_params(templated, run_params)
+        query = _substitute_params(templated, substitution_params)
     except ValueError as exc:
         logger.error("Rule %s: run_params substitution failed: %s", rule.get("rule_id"), exc)
         _log_error(meta_conn, meta_db, run_id, rule, run_key, "PARAM_SUBSTITUTION_ERROR", str(exc))

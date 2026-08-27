@@ -59,6 +59,29 @@ Usage
     python run_by_process.py rules --process-name UNIVERSE_VALIDATION \
         --param year=2026 --param month=8 --filter run_ty=MNT
 
+    # --param is ALSO used, key-for-key, as an equality filter on the
+    # auto-generated total-record count (see rules_engine/executor.py::
+    # _build_total_query()) -- every --param KEY is assumed to name a real
+    # column on the rule's table. If a --param value is only ever meant
+    # for text substitution inside rule_syntax (its key doesn't match an
+    # actual column -- e.g. RUNTYPE, when the real runtime column is
+    # run_ty and gets its own --filter), use --text-param instead: same
+    # "{KEY}"/"$KEY" substitution into rule_syntax, but NEVER folded into
+    # the total-count WHERE clause. Passing such a value via --param
+    # instead breaks the total-record count with an "unresolved/unknown
+    # column" error from the source database:
+    python run_by_process.py rules --process-name UNIVERSE_VALIDATION \
+        --text-param RUNTYPE=MNT --filter run_ty=MNT
+
+    # --param/--filter/--text-param/--run-key/--project-name/etc. are all
+    # named flags (argparse options, not positional arguments) -- pass
+    # them in ANY order on the command line, mixed freely with each
+    # other and with --project-name/--process-name/--rule-group/
+    # --rule-variant. Each --param/--filter/--text-param is independently
+    # repeatable (once per KEY=VALUE pair); passing the SAME key twice to
+    # the same flag has the last occurrence win (an ordinary dict
+    # assignment), same as a shell environment variable set twice.
+
     # Reproducible RANDOM/SYSTEMATIC sampling (rules_engine has no
     # equivalent -- its threshold evaluation has nothing to seed):
     python run_by_process.py sampling --process-name WEEKLY_REVIEW_SAMPLE --seed 42
@@ -124,6 +147,7 @@ def _run_rules(args):
     try:
         run_params = _parse_params(args.param)
         extra_filters = _parse_params(args.filter)
+        text_params = _parse_params(args.text_param)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -143,7 +167,8 @@ def _run_rules(args):
     print(f"Running rules_engine for project_name={args.project_name!r} "
           f"process_name={args.process_name!r} rule_group={args.rule_group!r} "
           f"rule_variant={args.rule_variant!r} run_key={run_key!r} "
-          f"run_params={run_params!r} extra_filters={extra_filters!r} ...")
+          f"run_params={run_params!r} extra_filters={extra_filters!r} "
+          f"text_params={text_params!r} ...")
     if not args.rule_variant:
         print("  (no --rule-variant passed -- every active rule in scope runs, "
               "regardless of its own rule_variant)")
@@ -157,6 +182,7 @@ def _run_rules(args):
             rule_variant=args.rule_variant,
             run_params=run_params,
             extra_filters=extra_filters,
+            text_params=text_params,
         )
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -261,6 +287,16 @@ def main():
                                    "--filter run_ty=MNT). Only applies to a rule whose rule_syntax "
                                    "embeds the literal marker '{extra_filters}' or '$extra_filters'. "
                                    "Repeatable -- pass --filter once per column. Values are always "
+                                   "strings. Not merged into --run-key.")
+    rules_parser.add_argument("--text-param", action="append", default=[], metavar="KEY=VALUE",
+                              help="Same '{KEY}'/'$KEY' rule_syntax substitution as --param, but "
+                                   "NEVER treated as a column for the auto-generated total-record "
+                                   "count -- use this instead of --param when KEY doesn't name a "
+                                   "real column on the rule's table (e.g. --text-param RUNTYPE=MNT "
+                                   "when the actual scoping column is run_ty, passed separately via "
+                                   "--filter). A --param whose key isn't a real column breaks the "
+                                   "total-record count with an 'unresolved/unknown column' error. "
+                                   "Repeatable -- pass --text-param once per key. Values are always "
                                    "strings. Not merged into --run-key.")
     rules_parser.set_defaults(func=_run_rules)
 

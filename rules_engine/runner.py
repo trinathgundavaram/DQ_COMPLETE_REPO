@@ -278,7 +278,7 @@ def _deactivate_all_active_for_run(meta_conn, meta_db: str, rule_group: str, run
 # ---------------------------------------------------------------------------
 
 def _run_one_pending_rule(rule, source_pools, meta_pool, meta_db, run_id, run_key, resolved_params, total_cache,
-                          extra_filters=None):
+                          extra_filters=None, text_params=None):
     """
     One rule's worth of the ThreadPoolExecutor body -- acquire a source
     connection AND a metadata connection from their respective pools
@@ -298,7 +298,7 @@ def _run_one_pending_rule(rule, source_pools, meta_pool, meta_db, run_id, run_ke
     worker_meta_conn = meta_pool.acquire()
     try:
         status = execute_rule(rule, db_conn, worker_meta_conn, run_id, run_key, resolved_params, meta_db,
-                              total_cache=total_cache, extra_filters=extra_filters)
+                              total_cache=total_cache, extra_filters=extra_filters, text_params=text_params)
     finally:
         source_pool.release(db_conn)
         meta_pool.release(worker_meta_conn)
@@ -306,7 +306,7 @@ def _run_one_pending_rule(rule, source_pools, meta_pool, meta_db, run_id, run_ke
 
 
 def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, run_key, resolved_params,
-                          total_cache, max_workers, extra_filters=None):
+                          total_cache, max_workers, extra_filters=None, text_params=None):
     """
     The parallel counterpart to run_rule_group()'s default sequential
     for-loop, used only when sequencing_mode='independent' and
@@ -422,7 +422,7 @@ def _run_pending_parallel(pending, cf, meta_conn, meta_db, run_id, run_key, reso
                 futures = [
                     pool_exec.submit(
                         _run_one_pending_rule, rule, source_pools, meta_pool, meta_db,
-                        run_id, run_key, resolved_params, total_cache, extra_filters,
+                        run_id, run_key, resolved_params, total_cache, extra_filters, text_params,
                     )
                     for rule in runnable
                 ]
@@ -458,6 +458,7 @@ def run_rule_group(
     run_params: dict = None,
     rule_variant: str = None,
     extra_filters: dict = None,
+    text_params: dict = None,
 ) -> dict:
     """
     Run every active rule in `rule_group` for this `run_key`.
@@ -515,6 +516,23 @@ def run_rule_group(
                    rules_engine/db_ops.py::build_extra_filters_clause()'s
                    docstring for the full mechanics (identifier validation,
                    value escaping, multiple filters).
+    text_params  : optional dict of named values substituted into
+                   rule_syntax's "{key}"/"$key" tokens EXACTLY like
+                   run_params, with ONE difference: a text_params key is
+                   NEVER treated as a total-count scoping column, unlike
+                   every run_params key. Use this for a run_params-style
+                   value whose name doesn't match a real column on the
+                   table -- e.g. RUNTYPE used only inside rule_syntax's
+                   own SQL text, where the actual runtime column
+                   (run_ty) is scoped instead via extra_filters. Passing
+                   such a value as run_params breaks the auto-generated
+                   total-record count with an "unresolved/unknown column"
+                   error, since _build_total_query() would try to filter
+                   on a column literally named after the run_params key.
+                   See rules_engine/executor.py::execute_rule()'s
+                   text_params docstring for the full rationale. Merged
+                   with run_params for substitution purposes only
+                   (text_params wins on a key collision); no reserved key.
     rule_variant : optional extra selection level on top of rule_group/
                    table -- passed straight to rules_engine.rules.load_rules()
                    (see its docstring) and recorded on gre_rule_audit for
@@ -587,9 +605,14 @@ def run_rule_group(
         )
 
     run_id = _build_group_run_id(meta_conn, meta_db, rule_group, run_key, project_name, triggered_by)
+    # text_params merged into the audit's own run_params JSON purely for
+    # reviewer visibility (gre_rule_audit has no separate text_params
+    # column, and adding one is a schema change -- see schema.sql's
+    # no-ALTER-TABLE convention) -- resolved_params itself, unmodified,
+    # is still what's actually used for total-count scoping below.
     _start_audit(meta_conn, meta_db, run_id, rule_group, run_key, len(rules), triggered_by,
                  rule_variant=rule_variant, project_name=project_name, process_name=process_name,
-                 run_params=resolved_params, extra_filters=extra_filters)
+                 run_params={**resolved_params, **(text_params or {})}, extra_filters=extra_filters)
 
     # Blanket-deactivate every currently-active gre_results/gre_rule_errors/
     # gre_exceptions row for (rule_group, run_key), BEFORE any rule below
@@ -650,7 +673,7 @@ def run_rule_group(
     if use_parallel:
         results, succeeded, errored = _run_pending_parallel(
             pending, cf, meta_conn, meta_db, run_id, run_key, resolved_params,
-            total_cache, max_workers, extra_filters=extra_filters,
+            total_cache, max_workers, extra_filters=extra_filters, text_params=text_params,
         )
     else:
         for rule in pending:
@@ -668,7 +691,7 @@ def run_rule_group(
                 status = "ERROR"
             else:
                 status = execute_rule(rule, db_conn, meta_conn, run_id, run_key, resolved_params, meta_db,
-                                      total_cache=total_cache, extra_filters=extra_filters)
+                                      total_cache=total_cache, extra_filters=extra_filters, text_params=text_params)
 
             results[rule["rule_id"]] = status
 
@@ -759,6 +782,7 @@ def run_all_active_groups(
     run_params: dict = None,
     rule_variant: str = None,
     extra_filters: dict = None,
+    text_params: dict = None,
 ) -> dict:
     """
     Discover every active rule_group in scope (optionally filtered by
@@ -788,12 +812,12 @@ def run_all_active_groups(
         len(rule_groups), project_name, process_name, run_key,
     )
     return _run_rule_groups(rule_groups, meta_conn, meta_db, run_key, cf,
-                             triggered_by, run_params, rule_variant, extra_filters)
+                             triggered_by, run_params, rule_variant, extra_filters, text_params)
 
 
 def _run_rule_groups(rule_groups, meta_conn, meta_db: str, run_key: str, cf,
                       triggered_by: str, run_params: dict, rule_variant: str,
-                      extra_filters: dict = None) -> dict:
+                      extra_filters: dict = None, text_params: dict = None) -> dict:
     """
     Shared tail of run_all_active_groups()/run_by_process_name(): run
     run_rule_group() once per already-discovered rule_group and collect
@@ -809,6 +833,7 @@ def _run_rule_groups(rule_groups, meta_conn, meta_db: str, run_key: str, cf,
             rule_group, run_key, cf,
             meta_conn=meta_conn, meta_db=meta_db, triggered_by=triggered_by,
             run_params=run_params, rule_variant=rule_variant, extra_filters=extra_filters,
+            text_params=text_params,
         )
     return {"rule_groups": summaries}
 
@@ -824,6 +849,7 @@ def run_by_process_name(
     run_params: dict = None,
     rule_variant: str = None,
     extra_filters: dict = None,
+    text_params: dict = None,
 ) -> dict:
     """
     Thin convenience wrapper around run_all_active_groups(), scoped to one
@@ -859,6 +885,9 @@ def run_by_process_name(
     extra_filters : optional dict of ad-hoc runtime equality filters
                    ("{extra_filters}"/"$extra_filters" marker) -- see
                    run_rule_group()'s docstring.
+    text_params  : optional dict, same substitution as run_params but
+                   NEVER used for total-count scoping -- see
+                   run_rule_group()'s docstring.
 
     Returns the same {"rule_groups": {...}} shape as run_all_active_groups().
     Raises ValueError if no active rule_group matches this process_name
@@ -891,7 +920,7 @@ def run_by_process_name(
     # Reuses the discover_rule_groups() call above instead of going through
     # run_all_active_groups() (which would re-run that identical query).
     return _run_rule_groups(rule_groups, meta_conn, meta_db, run_key, cf,
-                             triggered_by, run_params, rule_variant, extra_filters)
+                             triggered_by, run_params, rule_variant, extra_filters, text_params)
 
 
 def run_by_scope(
@@ -906,6 +935,7 @@ def run_by_scope(
     triggered_by: str = "SYSTEM",
     run_params: dict = None,
     extra_filters: dict = None,
+    text_params: dict = None,
 ) -> dict:
     """
     One entry point for every level of scoping this engine supports --
@@ -982,6 +1012,7 @@ def run_by_scope(
             rule_group, run_key, cf, meta_conn=meta_conn, meta_db=meta_db,
             triggered_by=triggered_by, run_params=run_params,
             rule_variant=rule_variant, extra_filters=extra_filters,
+            text_params=text_params,
         )
         return {"rule_groups": {rule_group: summary}}
 
@@ -998,4 +1029,4 @@ def run_by_scope(
         len(rule_groups), project_name, process_name, run_key,
     )
     return _run_rule_groups(rule_groups, meta_conn, meta_db, run_key, cf,
-                             triggered_by, run_params, rule_variant, extra_filters)
+                             triggered_by, run_params, rule_variant, extra_filters, text_params)

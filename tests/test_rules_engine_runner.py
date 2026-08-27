@@ -377,6 +377,37 @@ def test_rerun_deactivates_stale_rows_for_a_rule_no_longer_in_scope():
     assert stale_exceptions[0]["etl_is_curr_ind"] == "N"
 
 
+
+def test_run_rule_group_text_params_reach_execute_rule_without_scoping_total():
+    """
+    End-to-end proof that text_params is plumbed all the way from
+    run_rule_group() down to execute_rule(): a rule_syntax token that
+    ISN'T a real column (RUNTYPE) substitutes correctly via text_params,
+    while the total-record count stays scoped by run_params (batch_id)
+    alone -- see tests/test_rules_engine_executor.py's twin unit tests
+    for the underlying mechanics this exercises through the full
+    orchestration path instead of calling execute_rule() directly.
+    """
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(
+        conn, 1,
+        "SELECT claim_id FROM claims WHERE denial_reason IS NULL "
+        "AND batch_id = '{batch_id}' AND '{RUNTYPE}' = 'MNT'",
+        seq_no=10,
+    )
+
+    summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB,
+                    text_params={"RUNTYPE": "MNT"})
+
+    assert summary["status"] == "COMPLETED"
+    assert summary["results"][1] == "SUCCESS"
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1")
+    assert len(results) == 1
+    assert "'MNT' = 'MNT'" in results[0]["executed_sql"]
+
+
 def test_sequential_halt_group_stops_before_next_rule():
     conn = _conn()
     cf = _FakeConnectionFactory(conn)
