@@ -264,17 +264,41 @@ One deliberate limitation: `resolve_env_tokens()` does **not** apply the `GRE_DB
 
 `db_ops.py::execute_query()`/`execute_dml()` take an opt-in `log_params`
 flag. When `True`, the actual bound parameter values are logged (not just
-a count) -- used at the metadata-store call sites that matter most for
-diagnosing "why didn't my rules run" issues: rule discovery
-(`discover_rule_groups()`), rule loading (`load_rules()`), and
-`gre_rule_audit` start/finish writes. This is safe specifically because
-those call sites only ever bind metadata-store values (rule_group,
-run_key, project_name, and the like) -- never source/business data. The
-one place a source connection reaches `execute_query()`/`execute_dml()`
-(`_run_source_query()`, evaluating `rule_syntax` against a source table)
-never passes bind params at all, so `log_params` defaults to `False` and
-is simply never turned on there -- source/business data is never logged,
-regardless of this flag.
+a count) -- turned on at every metadata-store call site in this package:
+rule discovery (`discover_rule_groups()`), rule loading (`load_rules()`),
+`gre_rule_audit` start/finish, `gre_results` writes/deactivations
+(`_write_result()`/`_deactivate_prior_results()`), and `gre_rule_errors`
+writes/deactivations (`log_error()`/`_deactivate_prior_errors()`). This is
+safe specifically because those call sites only ever bind metadata-store
+values (rule_group, run_key, project_name, executed_sql text, error
+messages, and the like) -- never a raw fetched source/business row value.
+The one place a source connection reaches `execute_query()`/
+`execute_dml()` (`_run_source_query()`, evaluating `rule_syntax` against a
+source table) never passes bind params at all, so `log_params` defaults
+to `False` and is simply never turned on there -- source/business data is
+never logged, regardless of this flag.
+
+**For `rule_syntax` itself, there's no separate "params" step to enable at
+all.** `run_params`/`extra_filters` substitution (`_substitute_params()`/
+`build_extra_filters_clause()`) is TEXT substitution, not a DB-API bind
+parameter -- every `{key}`/`$key` value is already baked into the literal
+SQL string BEFORE it's ever executed. So the DEBUG-level SQL text logged
+by `_run_source_query()`/`execute_query()` for a rule's own scan, and for
+the auto-generated total-record `COUNT(*)` query (`_build_total_query()`),
+is ALREADY the fully-resolved query with every substituted value visible
+inline -- there's nothing more to turn on. (That log line truncates at
+500 characters, same as any other SQL text this package logs -- for the
+complete, untruncated resolved SQL of one specific attempt, `gre_results.
+executed_sql` has no length cap; see "Outcomes" in `GRE_Execution_Guide.md`
+for that column's full behavior, including its fallback to the
+raw/partially-templated `rule_syntax` when substitution itself failed.)
+
+**Note**: `gre_exceptions`' bulk writes (`bulk_insert_or_skip()`/
+`bulk_execute()`) are deliberately excluded from `log_params` -- unlike
+every other write above, a `gre_exceptions` row's own values (`src_key_
+value`, `element_name`, etc.) ARE real source/business data copied off a
+violating record, not metadata-store bookkeeping, so those bulk writers
+keep their existing "row counts only, never values" logging unconditionally.
 
 ## Selecting which rules run: `rule_variant`
 

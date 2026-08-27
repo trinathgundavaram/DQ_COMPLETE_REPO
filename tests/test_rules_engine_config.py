@@ -318,3 +318,120 @@ def test_resolve_env_tokens_does_not_disturb_run_params_style_tokens(reload_conf
     reload_config()
     sql = "SELECT * FROM claims WHERE claim_year = {year} AND claim_month = $month"
     assert shared_config.resolve_env_tokens(sql) == sql
+
+
+# ── configure_logging(): daily (not size-based) rotation, append-not-overwrite ──
+#
+# configure_logging() only installs its own handler when the root logger
+# has none yet ("won't clobber a caller's existing setup"); pytest's own
+# log-capturing plugin keeps at least one handler on the root logger for
+# the whole test body regardless of what a fixture does around it, so
+# these tests clear logging.getLogger().handlers INLINE, immediately
+# before calling configure_logging(), rather than via a fixture -- that's
+# the one place in the test body guaranteed to run with nothing else
+# touching root.handlers in between.
+
+@pytest.fixture
+def isolated_logging():
+    """Save/restore root logger handlers+level around a test that clears
+    them itself (see note above) -- restores whatever was there before
+    (pytest's own handler(s) included) once the test finishes, and closes
+    whatever configure_logging() installed so no file handle leaks."""
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_level = root.level
+    yield
+    for h in list(root.handlers):
+        if h not in saved_handlers:
+            h.close()
+        root.removeHandler(h)
+    for h in saved_handlers:
+        root.addHandler(h)
+    root.setLevel(saved_level)
+
+
+def test_configure_logging_uses_timed_daily_rotation_not_size(tmp_path, monkeypatch, reload_config, isolated_logging):
+    from logging.handlers import TimedRotatingFileHandler
+
+    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("GRE_LOG_FILE", "rules_engine.log")
+    reload_config()
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
+
+    root = logging.getLogger()
+    assert len(root.handlers) == 1
+    handler = root.handlers[0]
+    assert isinstance(handler, TimedRotatingFileHandler)
+    assert handler.when.upper() == "MIDNIGHT"
+    assert handler.suffix == "%Y-%m-%d"
+    assert (tmp_path / "rules_engine.log").exists()
+
+
+def test_configure_logging_default_retention_is_30_days(tmp_path, monkeypatch, reload_config, isolated_logging):
+    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
+    monkeypatch.delenv("GRE_LOG_RETENTION_DAYS", raising=False)
+    reload_config()
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
+
+    assert logging.getLogger().handlers[0].backupCount == 30
+
+
+def test_configure_logging_retention_env_override(tmp_path, monkeypatch, reload_config, isolated_logging):
+    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("GRE_LOG_RETENTION_DAYS", "90")
+    reload_config()
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
+
+    assert logging.getLogger().handlers[0].backupCount == 90
+
+
+def test_configure_logging_retention_zero_means_keep_forever(tmp_path, monkeypatch, reload_config, isolated_logging):
+    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("GRE_LOG_RETENTION_DAYS", "0")
+    reload_config()
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
+
+    # backupCount=0 is TimedRotatingFileHandler's own "never delete old
+    # rotated files" setting -- confirms "0" is passed through, not
+    # silently coerced to some other default.
+    assert logging.getLogger().handlers[0].backupCount == 0
+
+
+def test_configure_logging_malformed_retention_falls_back_to_default(tmp_path, monkeypatch, reload_config, isolated_logging):
+    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("GRE_LOG_RETENTION_DAYS", "not-a-number")
+    reload_config()
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
+
+    assert logging.getLogger().handlers[0].backupCount == 30
+
+
+def test_configure_logging_appends_across_calls_never_truncates(tmp_path, monkeypatch, reload_config, isolated_logging):
+    # Restarting/reconfiguring should never wipe what's already in the log
+    # file -- everything opens in append mode.
+    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("GRE_LOG_FILE", "rules_engine.log")
+    reload_config()
+
+    log_path = tmp_path / "rules_engine.log"
+    log_path.write_text("PRE-EXISTING LINE FROM AN EARLIER RUN\n")
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
+    logging.getLogger("rules_engine").info("fresh line from this run")
+    for h in logging.getLogger().handlers:
+        h.flush()
+
+    content = log_path.read_text()
+    assert "PRE-EXISTING LINE FROM AN EARLIER RUN" in content
+    assert "fresh line from this run" in content

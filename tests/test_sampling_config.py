@@ -162,3 +162,108 @@ def test_check_run_ready_uses_registered_check():
         assert calls == [("ready_run", None), ("other_run", None)]
     finally:
         shared_config._READINESS_CHECKS.pop("my_group", None)
+
+
+# ── configure_logging(): daily (not size-based) rotation, append-not-overwrite ──
+#
+# Same rationale as rules_engine/config.py's identical test block: clear
+# logging.getLogger().handlers INLINE, immediately before calling
+# configure_logging(), rather than via fixture setup -- pytest's own
+# log-capturing plugin keeps a handler on the root logger through the
+# whole test body regardless of what a fixture does around it.
+
+@pytest.fixture
+def isolated_logging():
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_level = root.level
+    yield
+    for h in list(root.handlers):
+        if h not in saved_handlers:
+            h.close()
+        root.removeHandler(h)
+    for h in saved_handlers:
+        root.addHandler(h)
+    root.setLevel(saved_level)
+
+
+def test_configure_logging_uses_timed_daily_rotation_not_size(tmp_path, monkeypatch, reload_config, isolated_logging):
+    from logging.handlers import TimedRotatingFileHandler
+
+    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("GRE_LOG_FILE", "sampling.log")
+    reload_config()
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
+
+    root = logging.getLogger()
+    assert len(root.handlers) == 1
+    handler = root.handlers[0]
+    assert isinstance(handler, TimedRotatingFileHandler)
+    assert handler.when.upper() == "MIDNIGHT"
+    assert handler.suffix == "%Y-%m-%d"
+    assert (tmp_path / "sampling.log").exists()
+
+
+def test_configure_logging_default_retention_is_30_days(tmp_path, monkeypatch, reload_config, isolated_logging):
+    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
+    monkeypatch.delenv("GRE_LOG_RETENTION_DAYS", raising=False)
+    reload_config()
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
+
+    assert logging.getLogger().handlers[0].backupCount == 30
+
+
+def test_configure_logging_retention_env_override(tmp_path, monkeypatch, reload_config, isolated_logging):
+    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("GRE_LOG_RETENTION_DAYS", "90")
+    reload_config()
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
+
+    assert logging.getLogger().handlers[0].backupCount == 90
+
+
+def test_configure_logging_retention_zero_means_keep_forever(tmp_path, monkeypatch, reload_config, isolated_logging):
+    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("GRE_LOG_RETENTION_DAYS", "0")
+    reload_config()
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
+
+    assert logging.getLogger().handlers[0].backupCount == 0
+
+
+def test_configure_logging_malformed_retention_falls_back_to_default(tmp_path, monkeypatch, reload_config, isolated_logging):
+    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("GRE_LOG_RETENTION_DAYS", "not-a-number")
+    reload_config()
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
+
+    assert logging.getLogger().handlers[0].backupCount == 30
+
+
+def test_configure_logging_appends_across_calls_never_truncates(tmp_path, monkeypatch, reload_config, isolated_logging):
+    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("GRE_LOG_FILE", "sampling.log")
+    reload_config()
+
+    log_path = tmp_path / "sampling.log"
+    log_path.write_text("PRE-EXISTING LINE FROM AN EARLIER RUN\n")
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
+    logging.getLogger("sampling").info("fresh line from this run")
+    for h in logging.getLogger().handlers:
+        h.flush()
+
+    content = log_path.read_text()
+    assert "PRE-EXISTING LINE FROM AN EARLIER RUN" in content
+    assert "fresh line from this run" in content

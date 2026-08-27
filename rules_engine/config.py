@@ -60,7 +60,7 @@ edit made twice -- accepted cost of full separation over a shared module.
 import logging
 import os
 import re
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Callable, Dict
 
@@ -102,29 +102,56 @@ def configure_logging(level=None) -> None:
 
     Writes to a FILE, not the console -- GRE_LOG_DIR (default "logs" at
     the repo root, created if missing) / GRE_LOG_FILE (default
-    "rules_engine.log"). A rotating file handler caps any one file at 10MB
-    with 5 backups kept (rules_engine.log, rules_engine.log.1, ...,
-    rules_engine.log.5), so a long-running or frequently-scheduled process
-    can never silently fill the disk with log text -- the oldest backup is
-    dropped as new ones roll in. This sets the level on rules_engine's own
-    logger namespace plus db.connection_factory's (the one intentionally-
-    shared dependency -- see README.md's "Package separation"), and
-    calls logging.basicConfig() ONLY if the root logger has no handlers
-    yet, so it won't clobber a caller's existing logging setup (file,
-    console, or otherwise) if one is already in place -- including a
-    caller that has already called sampling.config.configure_logging()
-    first in the same process, so the two packages' calls compose rather
-    than one silently overriding the other's handler.
+    "rules_engine.log"). Never overwrites on a fresh run -- every handler
+    below opens in APPEND mode, so restarting the CLI/process only adds
+    new lines to whatever's already there; nothing is ever truncated or
+    replaced just because a new run started.
+
+    Rotates at MIDNIGHT (local time), not by file size -- one file per
+    CALENDAR DAY. Today's activity always lives at the same unchanging
+    path (GRE_LOG_FILE itself, e.g. "rules_engine.log"), so a caller
+    tailing the log doesn't need to know today's date; at midnight the
+    just-finished day's file is renamed with a date suffix (e.g.
+    "rules_engine.log.2026-08-27") and a fresh "rules_engine.log" starts
+    for the new day, so a busy day's history is never partially
+    overwritten or cut off mid-day the way a fixed SIZE-based rotation
+    could (the old 10MB/5-backup scheme could drop same-day history the
+    moment a heavy run pushed past the 5th backup). GRE_LOG_RETENTION_DAYS
+    (default 30) caps how many PAST days are kept before the oldest
+    dated file is deleted -- set it to "0" to keep every day's log
+    forever (no automatic deletion at all) -- so a long-running or
+    frequently-scheduled process still can't silently fill the disk
+    without a deliberate opt-in to unlimited retention.
+
+    This sets the level on rules_engine's own logger namespace plus
+    db.connection_factory's (the one intentionally-shared dependency --
+    see README.md's "Package separation"), and calls
+    logging.basicConfig() ONLY if the root logger has no handlers yet, so
+    it won't clobber a caller's existing logging setup (file, console, or
+    otherwise) if one is already in place -- including a caller that has
+    already called sampling.config.configure_logging() first in the same
+    process, so the two packages' calls compose rather than one silently
+    overriding the other's handler.
     """
     resolved = level or os.getenv("GRE_LOG_LEVEL", "DEBUG")
     if not logging.getLogger().handlers:
         log_dir = Path(os.getenv("GRE_LOG_DIR") or (Path(__file__).resolve().parent.parent / "logs"))
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / os.getenv("GRE_LOG_FILE", "rules_engine.log")
-        handler = RotatingFileHandler(log_path, maxBytes=10 * 1024 * 1024, backupCount=5)
+        try:
+            retention_days = int(os.getenv("GRE_LOG_RETENTION_DAYS", "30"))
+        except ValueError:
+            retention_days = 30
+        handler = TimedRotatingFileHandler(
+            log_path, when="midnight", backupCount=retention_days, encoding="utf-8",
+        )
+        handler.suffix = "%Y-%m-%d"
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         logging.basicConfig(level=resolved, handlers=[handler])
-        logging.getLogger(__name__).info("rules_engine logging to %s (level=%s).", log_path, resolved)
+        logging.getLogger(__name__).info(
+            "rules_engine logging to %s (level=%s, rotating daily at midnight, retention=%s).",
+            log_path, resolved, f"{retention_days} day(s)" if retention_days else "unlimited",
+        )
     logging.getLogger("rules_engine").setLevel(resolved)
     logging.getLogger("db.connection_factory").setLevel(resolved)
 

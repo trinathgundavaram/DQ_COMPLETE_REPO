@@ -313,3 +313,45 @@ def test_bulk_insert_or_skip_chunk_falls_back_on_duplicate():
     assert total == 3   # C1, C2, C3 -- no duplicate row, no lost row
     keys = {r["src_key_value"] for r in execute_query(conn, "SELECT src_key_value FROM gre_exceptions")}
     assert keys == {"claim_id=C1", "claim_id=C2", "claim_id=C3"}
+
+
+# ── log_params: opt-in actual-bind-value logging (metadata queries only) ──
+
+def test_execute_query_log_params_false_logs_count_not_values(caplog):
+    conn = _conn()
+    conn.execute("CREATE TABLE t (id INTEGER, name VARCHAR)")
+    conn.execute("INSERT INTO t VALUES (1, 'SECRET_VALUE')")
+    with caplog.at_level("DEBUG"):
+        execute_query(conn, "SELECT * FROM t WHERE id = ?", [1])
+    debug_lines = [r.message for r in caplog.records if r.levelname == "DEBUG"]
+    assert any("params=1" in m for m in debug_lines)          # count, not the value
+    assert not any("SECRET_VALUE" in m for m in debug_lines)  # bind value never logged
+
+
+def test_execute_query_log_params_true_logs_actual_values(caplog):
+    conn = _conn()
+    conn.execute("CREATE TABLE t (id INTEGER, name VARCHAR)")
+    conn.execute("INSERT INTO t VALUES (1, 'claims_dq')")
+    with caplog.at_level("DEBUG"):
+        execute_query(conn, "SELECT * FROM t WHERE id = ?", [1], log_params=True)
+    debug_lines = [r.message for r in caplog.records if r.levelname == "DEBUG"]
+    assert any("params=[1]" in m for m in debug_lines)
+
+
+def test_execute_dml_log_params_true_logs_actual_values(caplog):
+    conn = _conn()
+    conn.execute("CREATE TABLE t (id INTEGER, name VARCHAR)")
+    with caplog.at_level("DEBUG"):
+        execute_dml(conn, "INSERT INTO t VALUES (?, ?)", [42, "BATCH_2026_08_27"], log_params=True)
+    debug_lines = [r.message for r in caplog.records if r.levelname == "DEBUG"]
+    assert any("BATCH_2026_08_27" in m for m in debug_lines)
+
+
+def test_execute_dml_log_params_false_logs_count_not_values(caplog):
+    conn = _conn()
+    conn.execute("CREATE TABLE t (id INTEGER, name VARCHAR)")
+    with caplog.at_level("DEBUG"):
+        execute_dml(conn, "INSERT INTO t VALUES (?, ?)", [42, "BATCH_2026_08_27"])
+    debug_lines = [r.message for r in caplog.records if r.levelname == "DEBUG"]
+    assert any("params=2" in m for m in debug_lines)
+    assert not any("BATCH_2026_08_27" in m for m in debug_lines)

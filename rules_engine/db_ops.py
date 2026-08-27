@@ -666,6 +666,7 @@ def _deactivate_prior_errors(meta_conn, meta_db: str, rule_id, run_key, current_
             WHERE rule_id = ? AND run_key = ? AND run_id <> ? AND active_ind = 'Y'
             """,
             [rule_id, run_key, current_run_id],
+            log_params=True,
         )
     except Exception as exc:
         logger.error(
@@ -705,6 +706,7 @@ def log_error(meta_conn, meta_db: str, run_id, rule_id, rule_group, run_key,
     """
     try:
         execute_dml(meta_conn, sql,
-                    [run_id, rule_id, rule_group, rule_variant, run_key, error_type, message, detail])
+                    [run_id, rule_id, rule_group, rule_variant, run_key, error_type, message, detail],
+                    log_params=True)
     except Exception as exc:
         logger.error("Failed to write gre_rule_errors row (run_id=%s rule_id=%s): %s", run_id, rule_id, exc)

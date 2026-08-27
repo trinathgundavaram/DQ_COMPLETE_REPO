@@ -300,11 +300,16 @@ What gets logged, by level:
   rows affected by a DML, chunk sizes on bulk writes), from
   `rules_engine/db_ops.py` / `sampling/db_ops.py`'s `execute_query()`,
   `execute_dml()`, `_chunked_executemany()`, `bulk_insert_or_skip()`, and
-  `_run_source_query()`. At the metadata-store call sites that diagnose
-  "why didn't my rules run" issues -- rule discovery, rule loading,
-  `gre_rule_audit` start/finish -- bind parameter VALUES are logged too
-  (`rules_engine/db_ops.py`'s opt-in `log_params=True`; see
-  `rules_engine/README.md`'s "Metadata-query logging" section).
+  `_run_source_query()`. At every metadata-store call site (rule
+  discovery, rule loading, `gre_rule_audit` start/finish, `gre_results`
+  writes/deactivations, `gre_rule_errors` writes/deactivations) bind
+  parameter VALUES are logged too (`rules_engine/db_ops.py`'s opt-in
+  `log_params=True`; see `rules_engine/README.md`'s "Metadata-query
+  logging" section). For a rule's own `rule_syntax` scan and the
+  auto-generated total-record `COUNT(*)` query, there's no separate
+  "params" step at all -- `run_params`/`extra_filters` are TEXT-substituted
+  into the SQL string before it ever runs, so the logged SQL TEXT already
+  shows every substituted value inline.
 
 What never gets logged, at any level: bind parameter values from a query
 run against a SOURCE connection, or any fetched/written row DATA. Only
@@ -315,7 +320,21 @@ instead of content keeps a debug log safe to share for troubleshooting
 without it becoming its own PHI-adjacent data spill. `log_params=True` is
 only ever turned on for metadata-store (`gre_*`) queries, never for a
 source-connection query -- `_run_source_query()` never passes bind params
-at all, so this guarantee holds regardless of the flag.
+at all, so this guarantee holds regardless of the flag. `gre_exceptions`'
+bulk writes are the one metadata-store table excluded from this -- a
+violating record's own key/detail VALUES are real source data, not
+engine bookkeeping, so those bulk writers keep logging counts only,
+unconditionally.
+
+**Log rotation**: each package's log file (`rules_engine.log` /
+`sampling.log`, under `GRE_LOG_DIR`) rotates at MIDNIGHT, not by file
+size -- one file per calendar day, named with a date suffix (e.g.
+`rules_engine.log.2026-08-27`) once that day is over; today's activity
+always lives at the plain, unchanging `GRE_LOG_FILE` path. Restarting the
+process never truncates or overwrites what's already there -- every
+handler opens in append mode. `GRE_LOG_RETENTION_DAYS` (default `30`)
+caps how many past days are kept before the oldest dated file is deleted;
+set it to `0` to keep every day's log forever.
 
 ## Running the tests
 

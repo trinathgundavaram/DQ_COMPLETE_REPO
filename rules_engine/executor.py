@@ -788,6 +788,7 @@ def _deactivate_prior_results(meta_conn, meta_db: str, rule_id, run_key: str, cu
             WHERE rule_id = ? AND run_key = ? AND run_id <> ? AND active_ind = 'Y'
             """,
             [rule_id, run_key, current_run_id],
+            log_params=True,
         )
     except Exception as exc:
         logger.error(
@@ -859,7 +860,7 @@ def _write_result(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str
         total_records, failed_records, failure_pct, threshold_pct_used, threshold_count_used,
         threshold_operator_used, rule.get("severity"), status, error_message, executed_sql,
         source_tieback_sql,
-    ])
+    ], log_params=True)
 
 
 def _write_result_safe(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str, start_time: float,
