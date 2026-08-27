@@ -338,9 +338,12 @@ ON {{META_DB}}.gre_exceptions;
 -- MAX(run_id), which sorts wrong once a run_id's timestamp suffix rolls
 -- past a lexicographic boundary) themselves: the newest run_id's row is
 -- 'Y', every earlier run_id's row for the same (rule_id, run_key) is
--- deactivated to 'N' -- see rules_engine/executor.py::
--- _deactivate_prior_results(), called from _write_result() immediately
--- before this attempt's own row is inserted. Never deletes -- full
+-- deactivated to 'N' -- see rules_engine/runner.py::
+-- _deactivate_all_active_for_run(), called ONCE per run_rule_group()
+-- attempt (before any rule executes), blanket-deactivating every
+-- currently-active row for (rule_group, run_key) here, in
+-- gre_rule_errors, and in gre_exceptions alike -- see
+-- rules_engine/README.md's "Rerunning a run_key" section. Never deletes -- full
 -- attempt history (including superseded ERROR rows) stays on file for
 -- audit; only active_ind flips. This is also how the "same kind of run"
 -- rerun policy applies here exactly as it already did for
@@ -496,11 +499,13 @@ ON {{META_DB}}.gre_rule_audit;
 --
 -- Append-only across reruns of the same run_key under a NEW run_id --
 -- active_ind marks which error(s) belong to the CURRENT run_id for a
--- given (rule_id, run_key) -- see rules_engine/db_ops.py::
--- _deactivate_prior_errors(), called from log_error() immediately before
--- each new error row is inserted, mirroring gre_results' active_ind
--- reconciliation exactly. Never deletes -- full error history stays on
--- file; only active_ind flips.
+-- given (rule_id, run_key) -- see rules_engine/runner.py::
+-- _deactivate_all_active_for_run(), called ONCE per run_rule_group()
+-- attempt (before any rule executes), blanket-deactivating every
+-- currently-active row for (rule_group, run_key) here, in gre_results,
+-- and in gre_exceptions alike -- see rules_engine/README.md's
+-- "Rerunning a run_key" section. Never deletes -- full error history
+-- stays on file; only active_ind flips.
 CREATE MULTISET TABLE {{META_DB}}.gre_rule_errors (
     error_id         BIGINT GENERATED ALWAYS AS IDENTITY,
     run_id           VARCHAR(200),

@@ -147,6 +147,23 @@ to reference the run's tracking value as a literal column filter, pass it
 explicitly via `run_params` under whatever key matches an actual column
 (e.g. `run_params={"batch_id": "BATCH_2026_08_14"}`).
 
+For `rules_engine/` specifically, a `run_params`/`--param` value whose
+key does NOT match a real column (used only for `rule_syntax` text
+substitution, e.g. `RUNTYPE`) belongs in the separate `text_params`/
+`--text-param` instead -- passing it as `run_params` breaks the
+auto-generated total-record count with an "unresolved/unknown column"
+error, since every `run_params` key is assumed to name a real column.
+See [`rules_engine/README.md`](rules_engine/README.md)'s "Text-only
+substitution values: `text_params`" section.
+
+Also for `rules_engine/`: rerunning the same `run_key` blanket-
+deactivates every currently-active `gre_results`/`gre_rule_errors`/
+`gre_exceptions` row for that `(rule_group, run_key)` in one pass before
+the new attempt's rules execute -- nothing from a prior attempt is left
+active, even for a rule no longer part of the current attempt's rule
+set. See [`rules_engine/README.md`](rules_engine/README.md)'s "Rerunning
+a `run_key`" section.
+
 Nothing here needs the two engines to run together or in a particular
 order -- `rules_engine/` and `sampling/` are independent (see each
 package's own README) and neither imports the other. A caller driving both
@@ -353,6 +370,6 @@ Teradata/Postgres/etc. connection is needed.
 | `test_sampling_config.py` | `sampling/config.py` -- identical coverage to `test_rules_engine_config.py`, against sampling's own copy. |
 | `test_sampling_db_ops.py` | `sampling/db_ops.py` -- identical coverage to `test_rules_engine_db_ops.py`, against sampling's own copy, with `count_prior_attempts()` keyed by `sample_config_id` instead. |
 | `test_rules_engine_rules.py` | `rules_engine/rules.py` -- `load_rules()`'s group/act_ind filtering, ordering, and `rule_variant` selection (no filter when omitted, universal-plus-exact-match when passed). |
-| `test_rules_engine_executor.py` | `rules_engine/executor.py` -- threshold evaluation, natural-key building, `execute_rule()` end-to-end, the single-scan/memoized-total big-dataset path, run_params substitution and its fail-fast `PARAM_SUBSTITUTION_ERROR`. |
-| `test_rules_engine_runner.py` | `rules_engine/runner.py` -- checkpoint/resume, `sequencing_mode` (`halt_group` vs. `skip_and_continue`), the shared `total_cache`, `rule_variant` end-to-end, `run_params` threading, `run_by_scope()`'s project/process/rule_group/rule_variant dispatch. |
+| `test_rules_engine_executor.py` | `rules_engine/executor.py` -- threshold evaluation, natural-key building, `execute_rule()` end-to-end, the single-scan/memoized-total big-dataset path, run_params substitution and its fail-fast `PARAM_SUBSTITUTION_ERROR`, and `text_params` substitution without total-count scoping. |
+| `test_rules_engine_runner.py` | `rules_engine/runner.py` -- checkpoint/resume, `sequencing_mode` (`halt_group` vs. `skip_and_continue`), the shared `total_cache`, `rule_variant` end-to-end, `run_params`/`text_params` threading, `run_by_scope()`'s project/process/rule_group/rule_variant dispatch, and the blanket `active_ind`/`etl_is_curr_ind` rerun deactivation. |
 | `test_sampling.py` | `sampling/sampling.py` -- rounding modes, selection methods, recursive stratification, candidate pull (including the `exclusion_sql` run_params fix), `run_sampling()` end-to-end, and a frozen regression fixture proving output still matches the originally-validated UM sample. |

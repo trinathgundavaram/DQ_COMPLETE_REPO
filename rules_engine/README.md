@@ -86,6 +86,44 @@ the string -- the label parts above exist purely so the common questions
 function for any external caller still relying on it, but `run_rule_group()`
 itself no longer uses it internally.
 
+## Rerunning a `run_key`: `active_ind` / `etl_is_curr_ind`
+
+Every rule always re-executes for its `run_key` -- there's no checkpoint/
+resume skip of an already-succeeded rule. Rerunning the same `run_key`
+(deliberately, or resuming after a crash) re-runs the whole group under a
+brand new `run_id`, and `run_rule_group()` blanket-deactivates every
+currently-active row for `(rule_group, run_key)` across `gre_results`,
+`gre_rule_errors`, and `gre_exceptions` -- flipping `active_ind`/
+`etl_is_curr_ind` to `'N'` -- in ONE pass, BEFORE any rule in the new
+attempt executes. Nothing from a prior attempt at the same `run_key` is
+left active by default, for any of the three tables.
+
+This is a single, up-front, orchestration-level pass
+(`rules_engine/runner.py::_deactivate_all_active_for_run()`), not a
+per-rule check made right before each rule writes its own new row -- that
+older design only ever deactivated a rule_id's OWN prior rows at the
+moment that same rule_id executed again, so a rule_id no longer part of
+the current attempt's active set (deactivated in `gre_rules`, removed
+from the group, or narrowed out by a `rule_variant` filter) kept its
+stale `active_ind='Y'`/`etl_is_curr_ind='Y'` rows forever. The blanket
+pass closes that gap: it touches every active row for the `(rule_group,
+run_key)` pair regardless of which rule_id produced it, so a rule that
+simply isn't run again this attempt still gets cleaned up.
+
+Known accepted limitation: the blanket pass scopes by each rule's
+CURRENT `gre_rules.rule_group` value (read off this attempt's loaded
+rules), so a `rule_id` whose `rule_group` was reassigned BETWEEN attempts
+leaves its old rows (filed under the OLD `rule_group`) untouched -- an
+edge case rare enough (`rule_group` reassignment mid-flight) not to
+warrant tracking every `rule_id` that ever touched a `run_key` across
+every historical `rule_group` it was ever tagged with.
+
+Each of the three `UPDATE`s is independently try/excepted and never
+raises -- a failure to deactivate one table's stale rows is logged, but
+never blocks the run itself from proceeding (same "best-effort,
+non-fatal housekeeping" philosophy as the rest of this engine's
+logging/audit writes).
+
 ## Scoping a rule's data: `run_params`
 
 `rule_syntax` may embed any number of `"{key}"` or `"$key"` tokens (freely mixed) -- each run passes a
@@ -125,6 +163,43 @@ reference the run's tracking value as a literal column filter, pass it
 explicitly via `run_params` under whatever key matches an actual column
 (e.g. `run_params={"batch_id": "BATCH_2026_08_14"}`).
 
+## Text-only substitution values: `text_params`
+
+Every `run_params` key is assumed to name a real column, because it
+doubles as a total-record-count filter (see above). A value that's only
+ever needed for `rule_syntax` text substitution -- and doesn't correspond
+to any actual column -- breaks that auto-generated count with an
+"unresolved/unknown column" error from the source database the moment
+it's passed as `run_params`.
+
+`text_params` is the escape hatch: identical `"{key}"`/`"$key"`
+substitution into `rule_syntax`, but a `text_params` key is NEVER folded
+into the total-count `WHERE` clause.
+
+```python
+summary = run_rule_group(
+    "claims_dq", "BATCH_2026_08_14", cf,
+    run_params={"batch_id": "BATCH_2026_08_14"},      # batch_id IS a real column -- scopes the count too
+    text_params={"RUNTYPE": "MNT"},                    # RUNTYPE is not a column -- substitution only
+    extra_filters={"run_ty": "MNT"},                    # run_ty IS the real column -- scope via a filter instead
+)
+```
+
+or from the CLI:
+
+```
+python run_by_process.py rules --process-name UNIVERSE_VALIDATION     --param year=2026 --text-param RUNTYPE=MNT --filter run_ty=MNT
+```
+
+Rule of thumb: if a `run_params`/`--param` key's NAME doesn't match a
+real column on the rule's table, it belongs in `text_params`/
+`--text-param` instead, and the actual scoping column (if any) goes
+through `extra_filters`/`--filter`. `text_params` merges with
+`run_params` for substitution purposes only -- on a key collision,
+`text_params` wins -- and is merged into `gre_rule_audit.run_params`'s
+JSON for audit visibility (there is no separate `gre_rule_audit`
+column for it). It has no reserved/required key, same as `run_params`.
+
 ## Ad-hoc runtime filters: `extra_filters`
 
 `run_params` above is for tokens a rule's author explicitly wrote into
@@ -160,6 +235,11 @@ or from the CLI:
 ```
 python run_by_process.py rules --process-name UNIVERSE_VALIDATION     --param year=2026 --param month=8 --filter run_ty=MNT
 ```
+
+`--param`/`--filter`/`--text-param` (and every other `run_by_process.py`
+flag) are named options, not positional arguments -- pass them in any
+order on the command line, and repeat any of them once per key; the
+same key passed twice to the same flag has the last occurrence win.
 
 `extra_filters` supports more than one filter at once (`{"run_ty": "MNT",
 "region": "EAST"}` -> `AND region = 'EAST' AND run_ty = 'MNT'`, sorted for
@@ -266,9 +346,11 @@ One deliberate limitation: `resolve_env_tokens()` does **not** apply the `GRE_DB
 flag. When `True`, the actual bound parameter values are logged (not just
 a count) -- turned on at every metadata-store call site in this package:
 rule discovery (`discover_rule_groups()`), rule loading (`load_rules()`),
-`gre_rule_audit` start/finish, `gre_results` writes/deactivations
-(`_write_result()`/`_deactivate_prior_results()`), and `gre_rule_errors`
-writes/deactivations (`log_error()`/`_deactivate_prior_errors()`). This is
+`gre_rule_audit` start/finish, `gre_results`/`gre_rule_errors` writes
+(`_write_result()`/`log_error()`), and the blanket rerun deactivation of
+`gre_results`/`gre_rule_errors`/`gre_exceptions`
+(`_deactivate_all_active_for_run()` -- see "Rerunning a `run_key`" above).
+This is
 safe specifically because those call sites only ever bind metadata-store
 values (rule_group, run_key, project_name, executed_sql text, error
 messages, and the like) -- never a raw fetched source/business row value.
