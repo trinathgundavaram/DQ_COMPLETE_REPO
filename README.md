@@ -154,7 +154,12 @@ substitution, e.g. `RUNTYPE`) belongs in the separate `text_params`/
 auto-generated total-record count with an "unresolved/unknown column"
 error, since every `run_params` key is assumed to name a real column.
 See [`rules_engine/README.md`](rules_engine/README.md)'s "Text-only
-substitution values: `text_params`" section.
+substitution values: `text_params`" section. That said, a `run_params`
+key that isn't a real column no longer HARD-FAILS the rule either way --
+the auto-generated total-record count retries once with `run_params`
+dropped (a `WARNING` logged) rather than erroring the whole rule out;
+`text_params` is still the precise, no-fallback-needed way to say so
+up front.
 
 Also for `rules_engine/`: rerunning the same `run_key` blanket-
 deactivates every currently-active `gre_results`/`gre_rule_errors`/
@@ -351,7 +356,15 @@ always lives at the plain, unchanging `GRE_LOG_FILE` path. Restarting the
 process never truncates or overwrites what's already there -- every
 handler opens in append mode. `GRE_LOG_RETENTION_DAYS` (default `30`)
 caps how many past days are kept before the oldest dated file is deleted;
-set it to `0` to keep every day's log forever.
+set it to `0` to keep every day's log forever. Because this package's
+normal usage is a short-lived CLI invocation rather than a long-running
+daemon, `configure_logging()` performs that day-boundary rename itself
+at startup if the existing log file's last-modified date isn't today --
+Python's `TimedRotatingFileHandler` alone only rotates while a single
+process instance stays alive across midnight, which a fresh
+invocation-per-run process never does. See
+[`rules_engine/README.md`](rules_engine/README.md)'s "Log file rotation
+for a short-lived CLI process" section.
 
 ## Running the tests
 

@@ -163,6 +163,20 @@ reference the run's tracking value as a literal column filter, pass it
 explicitly via `run_params` under whatever key matches an actual column
 (e.g. `run_params={"batch_id": "BATCH_2026_08_14"}`).
 
+**A `run_params` key that turns out NOT to be a real column doesn't fail
+the rule.** If the total-count query above fails (e.g. "column not
+found"), it's retried ONCE with `run_params` dropped from the
+denominator entirely (`extra_filters` only, if the rule opted into
+those) -- the rule still produces a real verdict, just against a
+coarser (never narrower, never wrong-in-a-way-that-hides-a-breach)
+denominator, instead of erroring out over an unrelated column-name
+mismatch. A `WARNING` is logged when this fallback kicks in, naming the
+`run_params` key that didn't resolve to a real column. Prefer
+`text_params` (below) for a value you already know isn't a column --
+it skips the failed first attempt and its extra query round trip, and
+keeps the denominator precisely scoped by whichever `run_params` keys
+ARE real columns.
+
 ## Text-only substitution values: `text_params`
 
 Every `run_params` key is assumed to name a real column, because it
@@ -349,7 +363,11 @@ rule discovery (`discover_rule_groups()`), rule loading (`load_rules()`),
 `gre_rule_audit` start/finish, `gre_results`/`gre_rule_errors` writes
 (`_write_result()`/`log_error()`), and the blanket rerun deactivation of
 `gre_results`/`gre_rule_errors`/`gre_exceptions`
-(`_deactivate_all_active_for_run()` -- see "Rerunning a `run_key`" above).
+(`_deactivate_all_active_for_run()` -- see "Rerunning a `run_key`" above),
+attempt-history lookups (`_write_exceptions()`'s existing-row query in
+`rules_engine/executor.py`), and every reporting/drill-down query in
+`rules_engine/reporting.py` (`get_breaches()`, `get_records_for_result()`,
+`get_source_records_for_rule()`, `get_source_records_for_process()`).
 This is
 safe specifically because those call sites only ever bind metadata-store
 values (rule_group, run_key, project_name, executed_sql text, error
@@ -381,6 +399,30 @@ every other write above, a `gre_exceptions` row's own values (`src_key_
 value`, `element_name`, etc.) ARE real source/business data copied off a
 violating record, not metadata-store bookkeeping, so those bulk writers
 keep their existing "row counts only, never values" logging unconditionally.
+
+### Log file rotation for a short-lived CLI process
+
+`TimedRotatingFileHandler` (below) computes its NEXT midnight rollover
+from "now" at construction -- fine for a long-running daemon, but this
+package's normal usage is `run_by_process.py` invoked fresh each time
+(start, run, exit), so a process starting today always computes a
+rollover time later today, which its own brief run never lives long
+enough to reach. Left alone, that means the rollover NEVER fires on its
+own, no matter how many separate days the script gets invoked on --
+everything just keeps appending into the same undated log file forever.
+
+`configure_logging()` closes this gap with a startup catch-up,
+`_rotate_stale_log_at_startup()`: before attaching the handler, it checks
+the existing log file's own last-modified date, and if it isn't today,
+renames it with that date's suffix right then -- exactly the rename a
+live midnight rollover would have performed, just applied retroactively
+at the next process start instead of in real time. A `GRE_LOG_RETENTION_
+DAYS` sweep (`_prune_old_dated_logs()`) runs right after, since the
+manual rename bypasses the handler's own `backupCount` cleanup (that
+only fires from inside its own `doRollover()`). A long-running process
+that DOES stay alive past midnight still gets the handler's normal live
+rollover exactly as before -- this only fills the gap for the
+short-lived-invocation case that mechanism can't reach.
 
 ## Selecting which rules run: `rule_variant`
 
