@@ -171,6 +171,12 @@ CREATE MULTISET TABLE {{META_DB}}.gre_rules (
                                                     -- meaningful only when sequencing_mode='sequential'
     threshold_pct        FLOAT,                    -- % of in-scope records that must fail to breach
     threshold_count      INTEGER,                  -- raw count of failed records that must be exceeded
+                                                    -- BOTH NULL -- no tolerance was ever configured for
+                                                    -- this rule, treated as an effective threshold_count=0:
+                                                    -- ANY failed record breaches the rule, not only a
+                                                    -- 100%-failed universe. See rules_engine/executor.py::
+                                                    -- evaluate_threshold()'s docstring for the full
+                                                    -- rationale.
     threshold_operator   CHAR(3) DEFAULT 'OR',      -- 'OR' | 'AND' -- only relevant if both are set
     severity             VARCHAR(50) DEFAULT 'Data Validation Error',  -- free string, project-defined
     src_key_cols         VARCHAR(500) NOT NULL,    -- comma-separated cols from the rule's own SELECT

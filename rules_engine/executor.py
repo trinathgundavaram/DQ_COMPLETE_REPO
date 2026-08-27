@@ -454,13 +454,30 @@ def evaluate_threshold(
                                    greater-than -- exactly AT the threshold
                                    is still a PASS. Always write a row
                                    (PASS/FAIL/WARN) so trending is possible.
-      3. no threshold configured -> fallback: breach ONLY when
-                                   failed == total (every in-scope record
-                                   failed). This is its OWN inclusive check,
-                                   not "threshold_pct=100 with >" -- pct can
-                                   never exceed 100, so that comparison would
-                                   silently never fire. Write a row only when
-                                   this fallback actually breaches.
+      3. no threshold configured -> fallback: treat both thresholds as
+                                   effectively 0, not 100 -- breach as soon
+                                   as ANY record fails (failed > 0), not
+                                   only when every in-scope record does.
+                                   Leaving threshold_pct/threshold_count
+                                   NULL is meant to mean "no tolerance for
+                                   failure was ever configured for this
+                                   rule," which reads most naturally as
+                                   "breach on the first failure," not
+                                   "breach only once literally everything
+                                   fails." (An earlier version of this
+                                   fallback required failed == total --
+                                   the "threshold_pct=100" reading was
+                                   rejected on its own terms since a
+                                   percentage can never exceed 100 under a
+                                   strict ">" comparison, but requiring
+                                   100% failure to breach turned out to be
+                                   just as surprising a default in
+                                   practice, so the fallback now treats the
+                                   NULLs as 0 instead.) Write a row only
+                                   when this fallback actually breaches --
+                                   a genuinely clean (zero-failure) attempt
+                                   with no threshold configured still
+                                   writes nothing, same as before.
     """
     severity = (severity or "").upper()
     threshold_operator = (threshold_operator or "OR").upper()
@@ -497,8 +514,14 @@ def evaluate_threshold(
             "threshold_operator_used": threshold_operator,
         }
 
-    # No threshold configured -- explicit all-in-scope-failed fallback.
-    breached = failed == total
+    # No threshold configured -- treat threshold_count as an effective 0
+    # (see this function's docstring): ANY failure breaches. threshold_
+    # count_used reports that effective 0 (not None) so gre_results shows
+    # what was actually applied, same as the has_threshold branch above
+    # always reports its real effective values -- a reviewer scanning
+    # gre_results shouldn't have to separately know "NULL here means 0
+    # was applied" out of band.
+    breached = failed > 0
     if not breached:
         return {
             "status": "PASS",
@@ -513,8 +536,8 @@ def evaluate_threshold(
         "status": status,
         "write_result": True,
         "threshold_pct_used": None,
-        "threshold_count_used": None,
-        "threshold_operator_used": None,
+        "threshold_count_used": 0,
+        "threshold_operator_used": threshold_operator,
     }
 
 

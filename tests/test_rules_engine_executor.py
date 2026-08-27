@@ -220,15 +220,31 @@ def test_zero_total_is_pass_no_row():
     assert v["status"] == "PASS" and v["write_result"] is False
 
 
-def test_no_threshold_fallback_requires_every_record_to_fail():
-    # 3 of 4 failed, no threshold configured -> PASS, and NOT written
-    v = evaluate_threshold(4, 3)
-    assert v["status"] == "PASS" and v["write_result"] is False
+def test_no_threshold_fallback_breaches_on_any_single_failure():
+    # No threshold configured means "never any tolerance was set up" --
+    # treated as an effective threshold_count=0, not 100% failure required.
+    # 1 of 4 failed is enough to breach.
+    v = evaluate_threshold(4, 1)
+    assert v["status"] == "FAIL" and v["write_result"] is True
+    assert v["threshold_pct_used"] is None
+    assert v["threshold_count_used"] == 0   # effective value actually applied, reported for auditability
+    assert v["threshold_operator_used"] == "OR"   # the default operator, even though only count is "in play"
 
-    # 4 of 4 failed -> breach, IS written
+    # 4 of 4 failed -> still breaches (a strict superset of "any failure")
     v2 = evaluate_threshold(4, 4)
     assert v2["status"] == "FAIL" and v2["write_result"] is True
-    assert v2["threshold_pct_used"] is None and v2["threshold_count_used"] is None
+
+    # 0 of 4 failed -> genuinely clean, no threshold configured -> PASS,
+    # and still not written (unchanged from before: only a breach writes
+    # a row when no threshold was ever configured).
+    v3 = evaluate_threshold(4, 0)
+    assert v3["status"] == "PASS" and v3["write_result"] is False
+    assert v3["threshold_pct_used"] is None and v3["threshold_count_used"] is None
+
+
+def test_no_threshold_fallback_respects_soft_severity_for_warn():
+    v = evaluate_threshold(4, 1, severity="WARN")
+    assert v["status"] == "WARN" and v["write_result"] is True
 
 
 # ── src key ────────────────────────────────────────────────────────
@@ -427,10 +443,10 @@ def test_execute_rule_deactivates_prior_result_attempts_on_rerun():
     status1 = execute_rule(broken_rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
     assert status1 == "ERROR"
 
-    # RUN2: same run_key, rule now fixed -- succeeds (verdict PASS: no
-    # threshold configured on the default _rule(), and 2/4 failing isn't
-    # a full-universe breach -- see evaluate_threshold()'s no-threshold
-    # fallback).
+    # RUN2: same run_key, rule now fixed -- succeeds (verdict FAIL: no
+    # threshold configured on the default _rule() means the no-threshold
+    # fallback breaches on ANY failure, and 2/4 rows fail here -- see
+    # evaluate_threshold()'s no-threshold fallback).
     fixed_rule = _rule()
     status2 = execute_rule(fixed_rule, _Adapter(conn), conn, "RUN2", "B1", {"batch_id": "B1"}, META_DB)
     assert status2 == "SUCCESS"
@@ -440,7 +456,7 @@ def test_execute_rule_deactivates_prior_result_attempts_on_rerun():
     by_run = {r["run_id"]: r for r in results}
     assert by_run["RUN1"]["status"] == "ERROR"
     assert by_run["RUN1"]["active_ind"] == "N"    # deactivated even though it never produced a verdict
-    assert by_run["RUN2"]["status"] == "PASS"
+    assert by_run["RUN2"]["status"] == "FAIL"
     assert by_run["RUN2"]["active_ind"] == "Y"
 
     active = execute_query(
@@ -609,14 +625,10 @@ def test_execute_rule_batches_are_isolated():
     assert len(b2) == 1   # only C5 is in B2
 
 
-def test_execute_rule_no_threshold_fallback_writes_pass_when_partial_failure():
-    # evaluate_threshold()'s no-threshold fallback only BREACHES when
-    # failed == total; a 2/4 partial failure with no threshold configured
-    # is a non-breaching PASS (write_result=False from evaluate_threshold's
-    # point of view). But gre_results now writes ONE row per attempt
-    # regardless -- preserving gre_log's old always-write behavior so
-    # attempt history/trending is never silently missing a row -- so the
-    # row IS written, just with status="PASS" rather than FAIL/WARN.
+def test_execute_rule_no_threshold_fallback_breaches_on_partial_failure():
+    # evaluate_threshold()'s no-threshold fallback now breaches on ANY
+    # failure (treats threshold_count as an effective 0) -- a 2/4 partial
+    # failure with no threshold configured IS a breach, not a PASS.
     conn = _conn()
     rule = _rule(threshold_pct=None, threshold_count=None)  # 2/4 fail, no threshold
 
@@ -627,12 +639,35 @@ def test_execute_rule_no_threshold_fallback_writes_pass_when_partial_failure():
     exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(exceptions) == 2
 
-    # ...and gre_results gets one attempt-history row, verdict PASS since
-    # the no-threshold fallback only breaches on failed == total.
+    # ...and gre_results gets one attempt-history row, verdict FAIL since
+    # even a single failure now breaches the no-threshold fallback.
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
+    assert len(results) == 1
+    assert results[0]["status"] == "FAIL"
+    assert results[0]["failed_records"] == 2
+    assert results[0]["threshold_count_used"] == 0
+    assert results[0]["threshold_pct_used"] is None
+
+
+def test_execute_rule_no_threshold_fallback_writes_pass_when_zero_failures():
+    # A genuinely clean attempt (0 failures) with no threshold configured
+    # is still a PASS -- gre_results still gets ONE attempt-history row
+    # regardless (via _write_result_safe()'s always-write path), just with
+    # status="PASS" instead of FAIL/WARN.
+    conn = _conn()
+    rule = _rule(
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+                    "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' AND 1 = 0",
+        threshold_pct=None, threshold_count=None,
+    )
+
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    assert status == "SUCCESS"
+
     results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(results) == 1
     assert results[0]["status"] == "PASS"
-    assert results[0]["failed_records"] == 2
+    assert results[0]["failed_records"] == 0
 
 
 def test_execute_rule_sql_error_routes_to_errors_and_logs():
