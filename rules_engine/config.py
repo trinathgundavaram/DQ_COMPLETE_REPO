@@ -299,33 +299,99 @@ def resolve_database_name(authored_name: str) -> str:
             env_var, GRE_ENVIRONMENT,
         )
 
-    # 2. $env / $ENV token substitution -- the scalable default. Matched
-    # CASE-INSENSITIVELY ("$env", "$ENV", "$Env", "$enV", ... all match --
-    # authors typing it by hand shouldn't have to get the casing exact),
-    # with the substituted value's case following whichever casing the
-    # token itself was written in: all-lowercase token -> lowercase value,
-    # all-uppercase token -> uppercase value, anything mixed (e.g. "$Env")
-    # -> Title-case value.
-    if _ENV_TOKEN_RE.search(authored_name):
-        lower_val = _env_token_value()
-        upper_val = lower_val.upper()
-        title_val = lower_val.capitalize()
-
-        def _sub(match: "re.Match") -> str:
-            token = match.group(0)[1:]   # strip the leading "$"
-            if token.isupper():
-                return upper_val
-            if token.islower():
-                return lower_val
-            return title_val
-
-        resolved = _ENV_TOKEN_RE.sub(_sub, authored_name)
-        # Collapse the double underscore left behind when an environment's
-        # value is empty (UAT/PROD by default) -- "QNXT_core__T" -> "QNXT_core_T".
-        return re.sub(r"_{2,}", "_", resolved)
+    # 2. $env / $ENV token substitution -- the scalable default. See
+    # _apply_env_token_substitution() below for the actual matching/
+    # case-preservation logic, shared with resolve_env_tokens() (which
+    # applies the identical substitution to arbitrary SQL text, e.g. a
+    # rule_syntax that embeds several literal database.table references
+    # directly, rather than to a single authored database_name column).
+    substituted = _apply_env_token_substitution(authored_name)
+    if substituted != authored_name:
+        return substituted
 
     # 3. No override, no token -- environment-invariant name, unchanged.
     return authored_name
+
+
+def _apply_env_token_substitution(text: str) -> str:
+    """
+    Core $env/$ENV token substitution -- matched CASE-INSENSITIVELY
+    ("$env", "$ENV", "$Env", "$enV", ... all match, since authors typing
+    it by hand shouldn't have to get the casing exact), with the
+    substituted value's case following whichever casing the token itself
+    was written in: all-lowercase token -> lowercase value, all-uppercase
+    token -> uppercase value, anything mixed (e.g. "$Env") -> Title-case
+    value. Collapses the double underscore left behind when an
+    environment's value is empty (UAT/PROD by default) --
+    "QNXT_core__T" -> "QNXT_core_T".
+
+    Shared by resolve_database_name() (a single authored database_name
+    value) and resolve_env_tokens() (arbitrary text, e.g. a whole
+    rule_syntax SQL string). Returns `text` unchanged -- including
+    None/empty -- when it contains no $env/$ENV token at all, so both
+    callers can run this unconditionally without a separate "does this
+    even have a token" check first.
+    """
+    if not text or not _ENV_TOKEN_RE.search(text):
+        return text
+
+    lower_val = _env_token_value()
+    upper_val = lower_val.upper()
+    title_val = lower_val.capitalize()
+
+    def _sub(match: "re.Match") -> str:
+        token = match.group(0)[1:]   # strip the leading "$"
+        if token.isupper():
+            return upper_val
+        if token.islower():
+            return lower_val
+        return title_val
+
+    resolved = _ENV_TOKEN_RE.sub(_sub, text)
+    return re.sub(r"_{2,}", "_", resolved)
+
+
+def resolve_env_tokens(text: str) -> str:
+    """
+    Resolve every $env/$ENV token in arbitrary SQL text to this process's
+    environment -- the SAME case-insensitive matching, case-preserving
+    substitution resolve_database_name() applies to a single authored
+    database_name value, just not scoped to one column.
+
+    This exists for a rule_syntax that embeds its own literal
+    database.table references directly in the SQL (joins across several
+    source databases, a subquery against a second table, etc.) rather
+    than relying on the engine's auto-generated total-count/tieback SQL
+    (which already resolves database_name for you -- see
+    resolve_database_name()'s docstring). A rule author who cannot avoid
+    writing "$env"/"$ENV" directly into rule_syntax's FROM/JOIN clauses
+    -- e.g. "FROM QNXT_core_$env_T.claims c JOIN QNXT_ref_$env_T.codes r
+    ON ..." -- gets the identical environment-portable behavior
+    database_name already had, without hand-authoring a run_params entry
+    for every database name in the query.
+
+    Called by rules_engine/rules.py::load_rules() on every loaded rule's
+    rule_syntax, right alongside database_name's own resolution, so this
+    always happens BEFORE run_params/extra_filters substitution
+    (rules_engine/executor.py's execute_rule()) -- $env/$ENV tokens never
+    reach _substitute_params()/build_extra_filters_clause() at all, so
+    they can never be mistaken for an unresolved run_params key (the
+    "Unresolved parameter token(s) ['ENV']" failure this replaces).
+
+    Deliberately does NOT apply the GRE_DB_MAP_<AUTHORED_NAME> legacy
+    override (resolve_database_name()'s mechanism 1) -- that override is
+    keyed to one exact, whole authored database_name value, which has no
+    equivalent meaning against a free-form SQL string that can embed many
+    different database names at once. A database needing that legacy,
+    non-token exception mapping keeps using resolve_database_name() for
+    its own database_name column; only the $env/$ENV TOKEN mechanism
+    generalizes to arbitrary embedded text, so that's the one this reuses.
+
+    Returns `text` unchanged (including None/empty, so this is safe to
+    call unconditionally on every rule's rule_syntax) when no $env/$ENV
+    token is present at all.
+    """
+    return _apply_env_token_substitution(text)
 
 
 # ── Parallel rule execution (opt-in; see rules_engine/parallel.py) ────────

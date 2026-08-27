@@ -18,7 +18,7 @@ duplicating it.
 
 import logging
 
-from rules_engine.config import resolve_database_name
+from rules_engine.config import resolve_database_name, resolve_env_tokens
 from rules_engine.db_ops import execute_query
 
 logger = logging.getLogger(__name__)
@@ -101,15 +101,27 @@ def load_rules(meta_conn, meta_db: str, rule_group: str, rule_variant: str = Non
     # Resolve each rule's AUTHORED database_name to whatever this process's
     # environment (GRE_ENVIRONMENT) actually has that source data in -- see
     # rules_engine/config.py::resolve_database_name()'s docstring. A no-op
-    # for any rule whose database_name has no GRE_DB_MAP_* configured, so
-    # this is safe to run unconditionally for every row. Every downstream
-    # consumer of these dicts (db/connection_factory.py's qualified_name(),
-    # rules_engine/executor.py's total-count query and
-    # build_source_tieback_sql()) reads database_name off THESE already-
-    # resolved dicts, so nothing else in the engine needs to know this
-    # resolution happened.
+    # for any rule whose database_name has no $env/$ENV token or
+    # GRE_DB_MAP_* configured, so this is safe to run unconditionally for
+    # every row. Every downstream consumer of these dicts
+    # (db/connection_factory.py's qualified_name(), rules_engine/
+    # executor.py's total-count query and build_source_tieback_sql())
+    # reads database_name off THESE already-resolved dicts, so nothing
+    # else in the engine needs to know this resolution happened.
+    #
+    # rule_syntax gets the SAME $env/$ENV token treatment, separately --
+    # see rules_engine/config.py::resolve_env_tokens()'s docstring. A rule
+    # whose rule_syntax embeds its own literal database.table references
+    # (joins across several source databases, not just the one named in
+    # this row's own database_name column) can write "$env"/"$ENV"
+    # directly into those references and have them resolve the same way,
+    # BEFORE execute_rule() ever runs run_params/extra_filters
+    # substitution on it -- so $env/$ENV never reaches that mechanism and
+    # is never mistaken for an unresolved run_params key. A no-op for any
+    # rule_syntax with no $env/$ENV token at all.
     for row in rows:
         row["database_name"] = resolve_database_name(row.get("database_name"))
+        row["rule_syntax"] = resolve_env_tokens(row.get("rule_syntax"))
 
     logger.info(
         "Loaded %d active rule(s) for rule_group=%s%s.",

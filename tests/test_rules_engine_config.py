@@ -248,3 +248,73 @@ def test_resolve_database_name_mixed_case_token_still_collapses_for_uat_prod(mon
     monkeypatch.setenv("GRE_ENVIRONMENT", "UAT")
     reload_config()
     assert shared_config.resolve_database_name("QNXT_core_$Env_T") == "QNXT_core_T"
+
+
+# ── resolve_env_tokens(): $env/$ENV substitution against arbitrary SQL text ──
+
+def test_resolve_env_tokens_no_token_returns_unchanged(reload_config):
+    reload_config()
+    sql = "SELECT * FROM STATIC_LOOKUP_T.claims WHERE claim_id IS NOT NULL"
+    assert shared_config.resolve_env_tokens(sql) == sql
+
+
+def test_resolve_env_tokens_empty_input_returns_unchanged(reload_config):
+    reload_config()
+    assert shared_config.resolve_env_tokens("") == ""
+    assert shared_config.resolve_env_tokens(None) is None
+
+
+def test_resolve_env_tokens_multiple_database_names_in_one_query(monkeypatch, reload_config):
+    # The exact case this exists for: one rule_syntax joining several
+    # source databases, each carrying its own $env token, resolved in a
+    # single pass -- not just the one database_name column.
+    monkeypatch.setenv("GRE_ENVIRONMENT", "QA")
+    reload_config()
+    sql = (
+        "SELECT c.claim_id FROM QNXT_core_$env_T.claims c "
+        "JOIN QNXT_ref_$env_T.codes r ON c.code_id = r.code_id "
+        "WHERE c.denial_reason IS NULL"
+    )
+    expected = (
+        "SELECT c.claim_id FROM QNXT_core_qa_T.claims c "
+        "JOIN QNXT_ref_qa_T.codes r ON c.code_id = r.code_id "
+        "WHERE c.denial_reason IS NULL"
+    )
+    assert shared_config.resolve_env_tokens(sql) == expected
+
+
+def test_resolve_env_tokens_case_insensitive_and_case_preserving(monkeypatch, reload_config):
+    monkeypatch.setenv("GRE_ENVIRONMENT", "DEV")
+    reload_config()
+    assert shared_config.resolve_env_tokens("FROM QNXT_core_$env_T") == "FROM QNXT_core_dev_T"
+    assert shared_config.resolve_env_tokens("FROM QNXT_core_$ENV_T") == "FROM QNXT_core_DEV_T"
+    assert shared_config.resolve_env_tokens("FROM QNXT_core_$Env_T") == "FROM QNXT_core_Dev_T"
+
+
+def test_resolve_env_tokens_collapses_double_underscore_for_uat_prod(monkeypatch, reload_config):
+    monkeypatch.setenv("GRE_ENVIRONMENT", "UAT")
+    reload_config()
+    sql = "SELECT * FROM QNXT_core_$env_T.claims"
+    assert shared_config.resolve_env_tokens(sql) == "SELECT * FROM QNXT_core_T.claims"
+
+
+def test_resolve_env_tokens_ignores_legacy_db_map_override(monkeypatch, reload_config):
+    # GRE_DB_MAP_ is keyed to one exact, whole authored database_name
+    # value -- it has no meaning against free-form SQL text, so
+    # resolve_env_tokens() only ever applies the $env/$ENV token
+    # mechanism, never the legacy per-database override (unlike
+    # resolve_database_name(), which checks GRE_DB_MAP_ first).
+    monkeypatch.setenv("GRE_ENVIRONMENT", "QA")
+    monkeypatch.setenv("GRE_DB_MAP_QNXT_CORE_$ENV_T", "QA=SHOULD_NOT_BE_USED")
+    reload_config()
+    sql = "SELECT * FROM QNXT_core_$env_T.claims"
+    assert shared_config.resolve_env_tokens(sql) == "SELECT * FROM QNXT_core_qa_T.claims"
+
+
+def test_resolve_env_tokens_does_not_disturb_run_params_style_tokens(reload_config):
+    # $key/{key} run_params tokens (a totally separate substitution
+    # mechanism -- see rules_engine/db_ops.py::_substitute_params()) are
+    # left completely alone; only the literal $env/$ENV token is touched.
+    reload_config()
+    sql = "SELECT * FROM claims WHERE claim_year = {year} AND claim_month = $month"
+    assert shared_config.resolve_env_tokens(sql) == sql

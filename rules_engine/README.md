@@ -232,6 +232,34 @@ SELECT claim_id FROM claims WHERE denial_reason IS NULL AND claim_batch = '{clai
 --                   ^^^^^^ view name = _view_name('claims.csv') = 'claims'
 ```
 
+## Environment-portable rule_syntax: `$env` / `$ENV`
+
+`gre_rules.database_name`'s `$env`/`$ENV` token (see `rules_engine/config.py::resolve_database_name()`) covers the common case: one rule, one source table, named in the dedicated `database_name` column. Some rules can't fit that shape -- `rule_syntax` itself joins across more than one source database, or otherwise embeds a literal `database.table` reference beyond the one `database_name`/`src_tbl_nm` already describe. For that case, `rules_engine/config.py::resolve_env_tokens()` applies the SAME `$env`/`$ENV` token substitution directly to `rule_syntax` text -- `load_rules()` runs every loaded rule's `rule_syntax` through it, right alongside `database_name`'s own resolution, so it's automatic and unconditional (a no-op for any rule_syntax with no token at all):
+
+```sql
+-- Authored once; database_name = 'QNXT_core_$env_T' (resolved separately,
+-- same token, for the engine's own auto-generated total-count/tieback SQL):
+SELECT c.claim_id
+FROM QNXT_core_$env_T.claims c
+JOIN QNXT_ref_$env_T.codes r ON c.code_id = r.code_id
+WHERE c.denial_reason IS NULL
+```
+
+resolves, in QA, to:
+
+```sql
+SELECT c.claim_id
+FROM QNXT_core_qa_T.claims c
+JOIN QNXT_ref_qa_T.codes r ON c.code_id = r.code_id
+WHERE c.denial_reason IS NULL
+```
+
+Same case-insensitive matching, case-preserving substitution, and double-underscore collapse as `database_name`'s token (see `resolve_database_name()`'s docstring for the full mechanics) -- `resolve_env_tokens()` is the identical substitution, just applied to free-form text that can embed several database names at once instead of to one column.
+
+**This runs BEFORE `run_params`/`extra_filters` substitution** (`rules_engine/executor.py::execute_rule()`), at rule-LOAD time rather than at execute time -- so `$env`/`$ENV` never reaches `_substitute_params()`/`build_extra_filters_clause()` at all, and can never be mistaken for a missing `run_params` key. Putting `$env`/`$ENV` in `rule_syntax` used to fail with `Unresolved parameter token(s) ['ENV'] in SQL -- no matching key in the run_params passed to this run` -- that mechanism has no idea what `$env` means, since it only fills in tokens a caller explicitly supplies via `run_params`. `resolve_env_tokens()` closes that gap by resolving `$env`/`$ENV` the same way `database_name` already does, before `rule_syntax` ever reaches `run_params` substitution.
+
+One deliberate limitation: `resolve_env_tokens()` does **not** apply the `GRE_DB_MAP_<AUTHORED_NAME>` legacy override (`resolve_database_name()`'s mechanism 1) -- that override is keyed to one exact, whole authored `database_name` value, which has no equivalent meaning against free-form SQL text embedding several database names. A database needing that legacy, non-token exception mapping keeps using it for its own `database_name` column; `rule_syntax` only ever gets the `$env`/`$ENV` TOKEN mechanism, since that's the one that generalizes to arbitrary embedded text.
+
 ## Metadata-query logging: `log_params`
 
 `db_ops.py::execute_query()`/`execute_dml()` take an opt-in `log_params`
