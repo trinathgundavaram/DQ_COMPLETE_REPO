@@ -2,10 +2,10 @@
 
 A generic, config-driven rule evaluation engine: `gre_rules` rows define a
 negative SQL SELECT per rule (the query returns the rows that VIOLATE the
-rule); the engine runs each active rule for a `rule_group` (optionally
-narrowed further by `rule_variant` -- see below) against a `run_key`,
-writes every violating row to `gre_exceptions`, evaluates a threshold, and
-upserts a `gre_results` verdict row.
+rule); the engine runs each active rule for a `rule_group` (every active
+rule_variant by default, optionally narrowed to one -- see below) against
+a `run_key`, writes every violating row to `gre_exceptions`, evaluates a
+threshold, and upserts a `gre_results` verdict row.
 
 ## Tracking a run: `run_key`
 
@@ -232,20 +232,46 @@ SELECT claim_id FROM claims WHERE denial_reason IS NULL AND claim_batch = '{clai
 --                   ^^^^^^ view name = _view_name('claims.csv') = 'claims'
 ```
 
+## Metadata-query logging: `log_params`
+
+`db_ops.py::execute_query()`/`execute_dml()` take an opt-in `log_params`
+flag. When `True`, the actual bound parameter values are logged (not just
+a count) -- used at the metadata-store call sites that matter most for
+diagnosing "why didn't my rules run" issues: rule discovery
+(`discover_rule_groups()`), rule loading (`load_rules()`), and
+`gre_rule_audit` start/finish writes. This is safe specifically because
+those call sites only ever bind metadata-store values (rule_group,
+run_key, project_name, and the like) -- never source/business data. The
+one place a source connection reaches `execute_query()`/`execute_dml()`
+(`_run_source_query()`, evaluating `rule_syntax` against a source table)
+never passes bind params at all, so `log_params` defaults to `False` and
+is simply never turned on there -- source/business data is never logged,
+regardless of this flag.
+
 ## Selecting which rules run: `rule_variant`
 
-`rule_variant` is one additional, generic level of selection on top of
-`rule_group`/table: within one `rule_group`, a `gre_rules` row with
-`rule_variant IS NULL` always applies; a row with an explicit value only
-applies when the caller's run requests that exact value:
+`rule_variant` is one additional, generic, OPT-IN level of selection on
+top of `rule_group`/table. Not passing it means "don't filter on
+rule_variant at all" -- every active rule in the group runs, regardless
+of what each row's own `rule_variant` is set to. Passing a value narrows
+to rows where `rule_variant` is NULL (universal) OR matches that value
+exactly:
 
 ```python
-# Only universal (rule_variant IS NULL) rules for this group run:
+# Every active rule in the group runs, whatever rule_variant each one has:
 run_rule_group("claims_dq", "BATCH_2026_08_14", cf)
 
-# Universal rules PLUS any rule whose rule_variant == "2026":
+# Narrowed to universal rules PLUS any rule whose rule_variant == "2026":
 run_rule_group("claims_dq", "BATCH_2026_08_14", cf, rule_variant="2026")
 ```
+
+This is deliberately NOT "rule_variant not passed means only the
+universal/NULL rows run" -- that stricter default used to be the
+behavior, and it's a trap: a project that tags its rules with
+`rule_variant` for its own bookkeeping but never intends to filter by it
+would see those rules silently excluded from every ordinary run. Treat
+`rule_variant` as a narrowing a caller reaches for on purpose, not an
+implicit filter that can exclude rules nobody asked to exclude.
 
 This is a single freeform column, not separate hardcoded `year_column`/
 `run_type_column` fields -- a project needing more than one dimension at
@@ -264,9 +290,16 @@ column `load_rules()` filters on. `run_rule_group()` reads them off the
 loaded rules (lowest `seq_no` wins if a group's rows disagree with
 themselves -- logged as a warning, same pattern as its `sequencing_mode`
 consistency check) and stamps them onto `gre_rule_audit` for the run; every
-`gre_exceptions`/`gre_results` row carries its own rule's
-`project_name`/`process_name` too, so any of those tables can be sliced or
-joined by project without a round trip back to `gre_rules`.
+`gre_exceptions`/`gre_results`/`gre_rule_errors` row carries its own rule's
+`project_name`/`process_name` too (and, likewise, its own `rule_group`/
+`rule_variant` -- see "Descriptive/reporting columns" below), so any of
+those tables can be sliced or joined by project, process, rule_group, or
+rule_variant without a round trip back to `gre_rules`.
+
+Note the distinction: `gre_exceptions.rule_variant` etc. is the RULE's own
+`rule_variant` value, not the run's requested `rule_variant` filter (which
+may be `None`, meaning "no filter was applied" -- see `run_by_scope()`
+below for running at any of these levels).
 
 ## Descriptive/reporting columns (rule-catalog vocabulary, audit)
 
@@ -339,23 +372,67 @@ fan-out, not a merged run, and one group erroring doesn't stop the rest.
 
 `run_by_process_name(process_name, run_key, cf, meta_conn=None, meta_db=None,
 project_name=None, ...)` is a thin convenience layer on top of
-`run_all_active_groups()` for the common "run everything this process
-owns" case: it resolves `meta_conn`/`meta_db` from `cf`/`rules_engine.config`
-itself if you don't pass them, and raises `ValueError` if no active
-`rule_group` matches the `process_name` (and `project_name`, if given) --
-almost always a typo, so it fails loudly instead of silently doing
-nothing:
+`run_all_active_groups()` for the "run everything this process owns" case:
+it resolves `meta_conn`/`meta_db` from `cf`/`rules_engine.config` itself if
+you don't pass them, and raises `ValueError` if no active `rule_group`
+matches the `process_name` (and `project_name`, if given) -- almost always
+a typo, so it fails loudly instead of silently doing nothing. It's kept
+for backward compatibility; new code should reach for `run_by_scope()`
+below, which covers this same case plus every other level of scoping.
+
+### One entry point for every scoping level: `run_by_scope()`
+
+`run_by_scope()` is the general-purpose dispatcher: pass whichever of
+`project_name`/`process_name`/`rule_group` you have, and it runs at
+exactly that level. Whatever you leave out means "every value of it," not
+"nothing" -- so you get project level, process level, process+rule_group,
+or one rule_group directly, all through one call, each optionally
+narrowed further by `rule_variant`:
 
 ```python
-from rules_engine.runner import run_by_process_name
+from rules_engine.runner import run_by_scope
 
-outcome = run_by_process_name("UNIVERSE_VALIDATION", "BATCH_2026_08_14", cf)
+# Project level -- every active process (and rule_group) under it:
+outcome = run_by_scope(run_key="BATCH_2026_08_14", cf=cf,
+                        project_name="HEALTHSPRING_UM")
+
+# Process level -- every active rule_group for this process, any project:
+outcome = run_by_scope(run_key="BATCH_2026_08_14", cf=cf,
+                        process_name="UNIVERSE_VALIDATION")
+
+# Process + project together -- narrows to their intersection:
+outcome = run_by_scope(run_key="BATCH_2026_08_14", cf=cf,
+                        project_name="HEALTHSPRING_UM",
+                        process_name="UNIVERSE_VALIDATION")
+
+# rule_group level -- runs exactly that group, skipping discovery entirely
+# (project_name/process_name, if also passed, are then only used for
+# gre_rule_audit bookkeeping, since a rule_group already uniquely
+# identifies which rules run):
+outcome = run_by_scope(run_key="BATCH_2026_08_14", cf=cf, rule_group="ODAG3")
+
+# Any of the above, narrowed further by rule_variant:
+outcome = run_by_scope(run_key="BATCH_2026_08_14", cf=cf,
+                        rule_group="ODAG3", rule_variant="EAST")
+
 for rule_group, summary in outcome["rule_groups"].items():
-    print(rule_group, summary["status"])
+    print(rule_group, summary["status"], summary["succeeded"], summary["errored"])
 ```
 
-The repo root's `run_by_process.py` wraps this in a CLI: `python
-run_by_process.py rules --process-name UNIVERSE_VALIDATION`.
+`run_by_scope()` raises `ValueError` if NONE of `project_name`/
+`process_name`/`rule_group` are given (call `run_all_active_groups()`
+directly for a genuinely unscoped, engine-wide run), and also raises
+`ValueError` when `project_name`/`process_name` are given but match
+nothing -- most likely a typo, not a legitimately empty scope.
+
+The repo root's `run_by_process.py` wraps this in a CLI:
+
+```
+python run_by_process.py rules --project-name HEALTHSPRING_UM
+python run_by_process.py rules --process-name UNIVERSE_VALIDATION
+python run_by_process.py rules --rule-group ODAG3
+python run_by_process.py rules --rule-group ODAG3 --rule-variant EAST
+```
 
 This package is deliberately independent of [`sampling/`](../sampling/README.md)
 -- the two share no code or tables at all (see the repo root README's
@@ -367,12 +444,12 @@ in `rules_engine/` imports from `sampling/`, or vice versa.
 
 | File | What |
 |---|---|
-| `rules.py` | `load_rules()` -- loads active `gre_rules` rows for a rule_group (+ optional `rule_variant` filter), ordered by `seq_no`. |
+| `rules.py` | `load_rules()` -- loads active `gre_rules` rows for a rule_group (every rule_variant by default; optionally narrowed to one), ordered by `seq_no`. |
 | `executor.py` | `execute_rule()` -- runs one rule end-to-end: source prepare (`db_conn.prepare(rule)`), `run_params` substitution, single-scan evaluation (`_scan_violations`), threshold evaluation, `gre_exceptions`/`gre_results` writes. |
-| `runner.py` | `run_rule_group()` -- orchestration entry point: readiness gate, checkpoint/resume, sequencing_mode-aware loop over `execute_rule()`, `gre_rule_audit` start/finish. `discover_rule_groups()`/`run_all_active_groups()` -- multi-group fan-out by project/process (see "Running multiple projects/processes" above). Also the opt-in parallel path (`_run_pending_parallel()`) -- see "Parallel rule execution" below. |
+| `runner.py` | `run_rule_group()` -- orchestration entry point: readiness gate, checkpoint/resume, sequencing_mode-aware loop over `execute_rule()`, `gre_rule_audit` start/finish. `discover_rule_groups()`/`run_all_active_groups()`/`run_by_scope()` -- multi-group fan-out and scoped dispatch by project/process/rule_group (see "Running multiple projects/processes" above). Also the opt-in parallel path (`_run_pending_parallel()`) -- see "Parallel rule execution" below. |
 | `parallel.py` | `ConnectionPool`/`build_pools()`/`close_pools()` -- the bounded per-connection connection pooling the parallel path uses instead of the single shared `cf.get()` connection. |
 | `reporting.py` | `get_breaches()` / `get_records_for_result()` -- thin read-only queries against `gre_results`/`gre_exceptions`. `get_source_records_for_rule()` -- ties `gre_exceptions` back to the live source record (see "Tying exceptions back to source records" below). |
-| `schema.sql` | `gre_rules` (incl. `project_name`/`process_name`), `gre_exceptions`, `gre_results` (one row per rule per execution attempt), `gre_rule_audit`, `gre_rule_errors`. Fully standalone -- no other package's `schema.sql` needs to run first. |
+| `schema.sql` | `gre_rules` (incl. `project_name`/`process_name`), `gre_exceptions`, `gre_results` (one row per rule per execution attempt), `gre_rule_audit`, `gre_rule_errors`. `gre_exceptions`/`gre_results`/`gre_rule_errors` each also carry `rule_group`/`rule_variant`, copied from the rule that produced the row (see "Project/process scoping" above). Fully standalone -- no other package's `schema.sql` needs to run first. |
 | `schema_drop.sql` | Drops the 6 tables above, for the drop-and-recreate redeploy policy (see the repo root README). |
 
 ## Parallel rule execution (opt-in)

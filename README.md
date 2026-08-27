@@ -157,18 +157,23 @@ multi-group fan-out (`run_all_active_groups()`), and
 [`sampling/README.md`](sampling/README.md) for `run_params`-based scoping
 of a sampling pull.
 
-## Running everything one process owns: `run_by_process_name()`
+## Running at whatever level you scope it to: `run_by_scope()`
 
-The common case -- "run every active rule_group/sampling config a given
-process owns, without looking up which ones those are first" -- has a
-dedicated convenience wrapper in each package, resolving `meta_conn`/
-`meta_db` from `cf` automatically:
+For `rules_engine/`, the general-purpose entry point is `run_by_scope()`:
+pass whichever of `project_name`/`process_name`/`rule_group` you have, and
+it runs at exactly that level -- project (every process under it),
+process, process+rule_group, or one rule_group directly, each optionally
+narrowed further by `rule_variant`. Whatever you leave out means "every
+value of it," never "nothing":
 
 ```python
-from rules_engine.runner import run_by_process_name
+from rules_engine.runner import run_by_scope
 from sampling.sampling import run_sampling_for_process_name
 
-outcome = run_by_process_name("UNIVERSE_VALIDATION", run_key, cf)
+# Project level, process level, rule_group level, or any combination --
+# see rules_engine/README.md's "One entry point for every scoping level"
+# section for the full set of examples:
+outcome = run_by_scope(run_key=run_key, cf=cf, process_name="UNIVERSE_VALIDATION")
 for rule_group, summary in outcome["rule_groups"].items():
     print(rule_group, summary["status"])
 
@@ -177,22 +182,31 @@ for config_id, summary in outcome["sampling_configs"].items():
     print(config_id, summary["status"])
 ```
 
-Both accept an optional `project_name=` to narrow further, and raise
-`ValueError` if nothing active matches the `process_name` given (almost
-always a typo, so this fails loudly instead of silently doing nothing).
+`run_by_scope()` raises `ValueError` if none of `project_name`/
+`process_name`/`rule_group` are given, and also if `project_name`/
+`process_name` are given but match nothing active (almost always a typo,
+so this fails loudly instead of silently doing nothing). `sampling/`'s
+`run_sampling_for_process_name()` accepts an optional `project_name=` to
+narrow further, with the same fail-loudly-on-no-match behavior.
+
+(`rules_engine/runner.py` also still has the older, narrower
+`run_by_process_name()` -- process level only -- kept for backward
+compatibility; new code should use `run_by_scope()`.)
 
 **`run_by_process.py`** at the repo root is a thin CLI on top of both, for
 a quick local or scheduled run without writing a script:
 
 ```bash
+python run_by_process.py rules --project-name HEALTHSPRING_UM
 python run_by_process.py rules --process-name UNIVERSE_VALIDATION
 python run_by_process.py rules --process-name UNIVERSE_VALIDATION --project-name HEALTHSPRING_UM --run-key BATCH_2026_08_19
+python run_by_process.py rules --rule-group ODAG3 --rule-variant EAST
 python run_by_process.py sampling --process-name WEEKLY_REVIEW_SAMPLE
 ```
 
 `--run-key` defaults to today's date (`YYYY-MM-DD`) if omitted. Exit code
 is `0` if everything completed, `1` if any group/config errored or the
-`process_name` didn't match anything.
+scope didn't match anything.
 
 ## Redeploying / changing the schema
 
@@ -286,14 +300,22 @@ What gets logged, by level:
   rows affected by a DML, chunk sizes on bulk writes), from
   `rules_engine/db_ops.py` / `sampling/db_ops.py`'s `execute_query()`,
   `execute_dml()`, `_chunked_executemany()`, `bulk_insert_or_skip()`, and
-  `_run_source_query()`.
+  `_run_source_query()`. At the metadata-store call sites that diagnose
+  "why didn't my rules run" issues -- rule discovery, rule loading,
+  `gre_rule_audit` start/finish -- bind parameter VALUES are logged too
+  (`rules_engine/db_ops.py`'s opt-in `log_params=True`; see
+  `rules_engine/README.md`'s "Metadata-query logging" section).
 
-What never gets logged, at any level: bind parameter VALUES, or any
-fetched/written row DATA. Only param/row COUNTS are logged. `rule_syntax`/
-`scope_sql`/`exclusion_sql` run against source tables that can carry real
-case, member, or claim identifiers -- logging shape (what ran, how many
-rows) instead of content keeps a debug log safe to share for
-troubleshooting without it becoming its own PHI-adjacent data spill.
+What never gets logged, at any level: bind parameter values from a query
+run against a SOURCE connection, or any fetched/written row DATA. Only
+param/row COUNTS are logged for those. `rule_syntax`/`scope_sql`/
+`exclusion_sql` run against source tables that can carry real case,
+member, or claim identifiers -- logging shape (what ran, how many rows)
+instead of content keeps a debug log safe to share for troubleshooting
+without it becoming its own PHI-adjacent data spill. `log_params=True` is
+only ever turned on for metadata-store (`gre_*`) queries, never for a
+source-connection query -- `_run_source_query()` never passes bind params
+at all, so this guarantee holds regardless of the flag.
 
 ## Running the tests
 
@@ -311,7 +333,7 @@ Teradata/Postgres/etc. connection is needed.
 | `test_rules_engine_db_ops.py` | `rules_engine/db_ops.py` -- bulk writes with duplicate-key tolerance, `{key}` run_params substitution (`_substitute_params`/`build_run_key`), `count_prior_attempts()` keyed by `rule_group`. |
 | `test_sampling_config.py` | `sampling/config.py` -- identical coverage to `test_rules_engine_config.py`, against sampling's own copy. |
 | `test_sampling_db_ops.py` | `sampling/db_ops.py` -- identical coverage to `test_rules_engine_db_ops.py`, against sampling's own copy, with `count_prior_attempts()` keyed by `sample_config_id` instead. |
-| `test_rules_engine_rules.py` | `rules_engine/rules.py` -- `load_rules()`'s group/act_ind filtering, ordering, and `rule_variant` selection (universal vs. exact-match). |
+| `test_rules_engine_rules.py` | `rules_engine/rules.py` -- `load_rules()`'s group/act_ind filtering, ordering, and `rule_variant` selection (no filter when omitted, universal-plus-exact-match when passed). |
 | `test_rules_engine_executor.py` | `rules_engine/executor.py` -- threshold evaluation, natural-key building, `execute_rule()` end-to-end, the single-scan/memoized-total big-dataset path, run_params substitution and its fail-fast `PARAM_SUBSTITUTION_ERROR`. |
-| `test_rules_engine_runner.py` | `rules_engine/runner.py` -- checkpoint/resume, `sequencing_mode` (`halt_group` vs. `skip_and_continue`), the shared `total_cache`, `rule_variant` end-to-end, `run_params` threading. |
+| `test_rules_engine_runner.py` | `rules_engine/runner.py` -- checkpoint/resume, `sequencing_mode` (`halt_group` vs. `skip_and_continue`), the shared `total_cache`, `rule_variant` end-to-end, `run_params` threading, `run_by_scope()`'s project/process/rule_group/rule_variant dispatch. |
 | `test_sampling.py` | `sampling/sampling.py` -- rounding modes, selection methods, recursive stratification, candidate pull (including the `exclusion_sql` run_params fix), `run_sampling()` end-to-end, and a frozen regression fixture proving output still matches the originally-validated UM sample. |
