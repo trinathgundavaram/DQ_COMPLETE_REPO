@@ -144,7 +144,7 @@ def _start_audit(meta_conn, meta_db: str, run_id: str, rule_group: str, run_key:
     """, [run_id, rule_group, project_name, process_name, run_key, rule_variant,
           json.dumps(run_params, default=str) if run_params else None,
           json.dumps(extra_filters, default=str) if extra_filters else None,
-          datetime.now(), total_rules, triggered_by])
+          datetime.now(), total_rules, triggered_by], log_params=True)
 
 
 def _finish_audit(meta_conn, meta_db: str, run_id: str, status: str,
@@ -153,7 +153,7 @@ def _finish_audit(meta_conn, meta_db: str, run_id: str, status: str,
         UPDATE {meta_db}.gre_rule_audit
         SET ended_at = ?, status = ?, rules_succeeded = ?, rules_errored = ?
         WHERE run_id = ?
-    """, [datetime.now(), status, rules_succeeded, rules_errored, run_id])
+    """, [datetime.now(), status, rules_succeeded, rules_errored, run_id], log_params=True)
 
 
 # ---------------------------------------------------------------------------
@@ -614,7 +614,7 @@ def discover_rule_groups(meta_conn, meta_db: str, project_name: str = None,
         WHERE {' AND '.join(where)}
         ORDER BY rule_group
     """
-    rows = execute_query(meta_conn, sql, params)
+    rows = execute_query(meta_conn, sql, params, log_params=True)
     return [r["rule_group"] for r in rows]
 
 
@@ -760,5 +760,112 @@ def run_by_process_name(
     )
     # Reuses the discover_rule_groups() call above instead of going through
     # run_all_active_groups() (which would re-run that identical query).
+    return _run_rule_groups(rule_groups, meta_conn, meta_db, run_key, cf,
+                             triggered_by, run_params, rule_variant, extra_filters)
+
+
+def run_by_scope(
+    run_key: str = None,
+    cf=None,
+    meta_conn=None,
+    meta_db: str = None,
+    project_name: str = None,
+    process_name: str = None,
+    rule_group: str = None,
+    rule_variant: str = None,
+    triggered_by: str = "SYSTEM",
+    run_params: dict = None,
+    extra_filters: dict = None,
+) -> dict:
+    """
+    One entry point for every level of scoping this engine supports --
+    project, project+process, process, process+rule_group, rule_group
+    alone, or any of those plus rule_variant -- driven entirely by WHICH
+    of project_name/process_name/rule_group/rule_variant you pass.
+    Whichever you leave out is treated as "run for every value of it,"
+    never "run for nothing":
+
+      - rule_group given: runs exactly that one rule_group
+        (run_rule_group()), regardless of whether project_name/
+        process_name were also passed -- a rule_group already uniquely
+        identifies which rules run (project_name/process_name are only
+        used for gre_rule_audit bookkeeping, taken straight off the
+        loaded rules, same as run_rule_group() always does on its own).
+      - rule_group NOT given: discovers every active rule_group matching
+        whichever of project_name/process_name you DID pass (both,
+        either, or neither) and runs each one found -- this is exactly
+        "process level" when only process_name is given, "project level"
+        (every process under it) when only project_name is given, and
+        the narrower intersection when both are given.
+
+    rule_variant, when given, narrows further to that variant (plus any
+    universal/NULL-variant rules) within whatever rule_group(s) end up
+    running. When omitted, NO variant filtering happens at all -- every
+    active rule in scope runs regardless of its own rule_variant. See
+    rules_engine/rules.py::load_rules()'s docstring for the full history
+    of why "not passed" means "don't filter", not "only the universal
+    ones" -- that older, stricter default was the reason a caller with
+    ordinary rule_variant-tagged rules and no intention of using variant
+    scoping would see NO_RULES/0 rules loaded for a group that plainly
+    had active rows.
+
+    Raises ValueError if NONE of project_name/process_name/rule_group are
+    given -- an unscoped, engine-wide run is a real thing
+    (run_all_active_groups() supports it directly), but this entry point
+    exists specifically for a caller who means to scope their run by SOME
+    input, so an accidental all-empty call fails loudly instead of
+    silently running every active rule in the metadata store. Also raises
+    ValueError (via discover_rule_groups() finding nothing, same as
+    run_by_process_name()) when project_name/process_name are given but
+    don't match anything -- most likely a typo, not a legitimately empty
+    scope.
+
+    Returns the same {"rule_groups": {rule_group: run_rule_group()'s own
+    summary dict, ...}} shape as run_all_active_groups()/
+    run_by_process_name(), so a caller (e.g. run_by_process.py's CLI)
+    doesn't need to branch on which level it asked for.
+    """
+    if cf is None:
+        raise RuntimeError("run_by_scope() needs a loaded ConnectionFactory (cf=...).")
+    if not (project_name or process_name or rule_group):
+        raise ValueError(
+            "run_by_scope: at least one of project_name, process_name, or rule_group is "
+            "required -- call run_all_active_groups() directly if an unscoped, engine-wide "
+            "run is actually intended."
+        )
+
+    if not run_key:
+        run_key = _default_run_key()
+        logger.info("run_by_scope: no run_key passed -- defaulting to today's date, run_key=%s.", run_key)
+
+    meta_conn = meta_conn or cf.get(gre_config.get_meta_connection_name())
+    meta_db = meta_db or gre_config.get_meta_db()
+
+    if rule_group:
+        logger.info(
+            "run_by_scope: rule_group=%s given -- running that group directly "
+            "(project_name=%s process_name=%s rule_variant=%s -- project/process are used "
+            "only for audit bookkeeping off the loaded rules, not for discovery).",
+            rule_group, project_name, process_name, rule_variant,
+        )
+        summary = run_rule_group(
+            rule_group, run_key, cf, meta_conn=meta_conn, meta_db=meta_db,
+            triggered_by=triggered_by, run_params=run_params,
+            rule_variant=rule_variant, extra_filters=extra_filters,
+        )
+        return {"rule_groups": {rule_group: summary}}
+
+    rule_groups = discover_rule_groups(meta_conn, meta_db, project_name=project_name,
+                                        process_name=process_name)
+    if not rule_groups:
+        raise ValueError(
+            f"run_by_scope: no active rule_group found for project_name={project_name!r} "
+            f"process_name={process_name!r} -- check gre_rules for a typo, or call "
+            "run_all_active_groups() directly if an empty result is actually expected."
+        )
+    logger.info(
+        "run_by_scope: %d rule_group(s) in scope (project_name=%s process_name=%s) for run_key=%s.",
+        len(rule_groups), project_name, process_name, run_key,
+    )
     return _run_rule_groups(rule_groups, meta_conn, meta_db, run_key, cf,
                              triggered_by, run_params, rule_variant, extra_filters)

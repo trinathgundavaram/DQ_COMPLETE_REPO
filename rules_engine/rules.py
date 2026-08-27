@@ -46,6 +46,20 @@ def load_rules(meta_conn, meta_db: str, rule_group: str, rule_variant: str = Non
     operator. Branching in Python keeps this portable across every source
     dialect this engine already supports.
 
+    rule_variant NOT passed (None, the default) means "don't filter on
+    rule_variant at all" -- every active rule in rule_group runs,
+    regardless of what its own rule_variant happens to be (NULL or any
+    other value). This is deliberately NOT the same as "rule_variant IS
+    NULL": an earlier version of this function treated "no rule_variant
+    passed" as "load only the universal (NULL) rules," which silently
+    dropped every rule that had a rule_variant value set -- a rule_group
+    whose rows all happen to carry a rule_variant (e.g. every rule was
+    authored with one, even if nothing downstream cares) would load ZERO
+    rows for a perfectly ordinary "just run this group" call, with no
+    error, only a confusing NO_RULES. rule_variant is meant as an OPT-IN
+    narrowing a caller reaches for on purpose, not an implicit filter that
+    silently excludes rules the caller never asked to exclude.
+
     seq_no ordering is applied unconditionally here -- it's a cheap, stable
     sort that only matters when sequencing_mode='sequential' for the group,
     and is harmless (a no-op ordering preference) for 'independent' groups.
@@ -69,17 +83,20 @@ def load_rules(meta_conn, meta_db: str, rule_group: str, rule_variant: str = Non
         """
         params = [rule_group, rule_variant]
     else:
+        # No rule_variant filter at all -- every active rule in this
+        # rule_group runs, whatever its own rule_variant is. See the
+        # docstring above for why this is intentionally NOT
+        # "rule_variant IS NULL".
         sql = f"""
             SELECT *
             FROM {meta_db}.gre_rules
             WHERE rule_group   = ?
               AND act_ind      = 1
-              AND rule_variant IS NULL
             ORDER BY seq_no ASC, rule_id ASC
         """
         params = [rule_group]
 
-    rows = execute_query(meta_conn, sql, params)
+    rows = execute_query(meta_conn, sql, params, log_params=True)
 
     # Resolve each rule's AUTHORED database_name to whatever this process's
     # environment (GRE_ENVIRONMENT) actually has that source data in -- see

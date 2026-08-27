@@ -97,7 +97,7 @@ def _conn():
         CREATE TABLE gre_exceptions (
             record_id BIGINT DEFAULT nextval('gre_exceptions_seq'),
             run_id VARCHAR, rule_id INTEGER, database_name VARCHAR, src_tbl_nm VARCHAR,
-            project_name VARCHAR, process_name VARCHAR,
+            project_name VARCHAR, process_name VARCHAR, rule_group VARCHAR, rule_variant VARCHAR,
             element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
             run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
@@ -113,7 +113,7 @@ def _conn():
 
     conn.execute("""
         CREATE TABLE gre_rule_errors (
-            error_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
+            error_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR, rule_variant VARCHAR,
             run_key VARCHAR, error_type VARCHAR, error_message VARCHAR,
             error_detail VARCHAR, active_ind VARCHAR DEFAULT 'Y',
             occurred_at TIMESTAMP DEFAULT current_timestamp,
@@ -127,7 +127,7 @@ def _conn():
     # _write_result()'s docstring for the full rationale.
     conn.execute("""
         CREATE TABLE gre_results (
-            result_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
+            result_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR, rule_variant VARCHAR,
             project_name VARCHAR, process_name VARCHAR, run_key VARCHAR, seq_no INTEGER,
             start_time TIMESTAMP, end_time TIMESTAMP,
             total_records BIGINT, failed_records BIGINT, failure_pct DOUBLE,
@@ -1383,6 +1383,44 @@ def test_execute_rule_copies_rule_name_dgr_nbr_universe_version_onto_exceptions(
         assert exc["rule_nm"] == rule["rule_nm"]
         assert exc["dgr_nbr"] == "CDAG1V22R4"
         assert exc["universe_version"] == "V22"
+
+
+def test_execute_rule_copies_rule_group_and_rule_variant_onto_exceptions_results_and_errors():
+    """
+    rule_group/rule_variant are copied straight from the rule row onto
+    gre_exceptions and gre_results (rule_variant only -- gre_results
+    already had rule_group), and onto gre_rule_errors on an error path --
+    purely descriptive, so any of these three tables can be
+    filtered/reported on by rule_group or rule_variant without a join
+    back to gre_rules (which may have since changed). This is the RULE's
+    OWN rule_variant value, not the run's requested rule_variant filter
+    (see rules_engine/runner.py::run_by_scope()'s docstring for that
+    distinction).
+    """
+    conn = _conn()
+    rule = _rule(rule_group="claims_dq", rule_variant="2026")
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    assert status == "SUCCESS"
+
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1")
+    assert len(exceptions) == 2
+    for exc in exceptions:
+        assert exc["rule_group"] == "claims_dq"
+        assert exc["rule_variant"] == "2026"
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1")
+    assert len(results) == 1
+    assert results[0]["rule_variant"] == "2026"
+
+    # Error path: gre_rule_errors also carries this rule's own rule_variant.
+    broken_rule = _rule(rule_group="claims_dq", rule_variant="2026", rule_id=2,
+                         rule_syntax="SELECT * FROM no_such_table WHERE batch_id = '{batch_id}'")
+    status2 = execute_rule(broken_rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+    assert status2 == "ERROR"
+
+    errors = execute_query(conn, "SELECT * FROM gre_rule_errors WHERE rule_id = 2")
+    assert len(errors) == 1
+    assert errors[0]["rule_variant"] == "2026"
 
 
 def test_execute_rule_dgr_nbr_and_universe_version_null_when_rule_doesnt_set_them():

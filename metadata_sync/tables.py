@@ -54,12 +54,12 @@ GRE_EXCEPTIONS = {
     "mode": "incremental",
     "watermark_col": "COALESCE(last_updated_datetime, load_datetime)",
     "columns": [
-        "record_id", "run_id", "run_key", "rule_id", "rule_nm", "database_name",
-        "src_tbl_nm", "project_name", "process_name", "element_name", "source_name",
-        "issue_desc", "src_key_value", "dgr_nbr", "universe_version", "run_type",
-        "batch_schedule", "exception_flag", "exception_approver", "etl_is_curr_ind",
-        "etl_load_dt", "etl_last_updt_dt", "load_datetime", "last_updated_by",
-        "last_updated_datetime",
+        "record_id", "run_id", "run_key", "rule_id", "rule_nm", "rule_group",
+        "rule_variant", "database_name", "src_tbl_nm", "project_name", "process_name",
+        "element_name", "source_name", "issue_desc", "src_key_value", "dgr_nbr",
+        "universe_version", "run_type", "batch_schedule", "exception_flag",
+        "exception_approver", "etl_is_curr_ind", "etl_load_dt", "etl_last_updt_dt",
+        "load_datetime", "last_updated_by", "last_updated_datetime",
     ],
 }
 
@@ -76,11 +76,11 @@ GRE_RESULTS = {
     "mode": "incremental",
     "watermark_col": "COALESCE(last_updated_datetime, load_datetime)",
     "columns": [
-        "result_id", "run_id", "rule_id", "rule_group", "project_name", "process_name",
-        "run_key", "seq_no", "start_time", "end_time", "total_records", "failed_records",
-        "failure_pct", "threshold_pct_used", "threshold_count_used", "threshold_operator_used",
-        "severity", "status", "error_message", "executed_sql", "source_tieback_sql", "active_ind",
-        "load_datetime", "last_updated_datetime",
+        "result_id", "run_id", "rule_id", "rule_group", "rule_variant", "project_name",
+        "process_name", "run_key", "seq_no", "start_time", "end_time", "total_records",
+        "failed_records", "failure_pct", "threshold_pct_used", "threshold_count_used",
+        "threshold_operator_used", "severity", "status", "error_message", "executed_sql",
+        "source_tieback_sql", "active_ind", "load_datetime", "last_updated_datetime",
     ],
 }
 
@@ -137,8 +137,9 @@ GRE_RULE_ERRORS = {
     # occurred_at, so watermark on whichever timestamp actually moved.
     "watermark_col": "COALESCE(last_updated_datetime, occurred_at)",
     "columns": [
-        "error_id", "run_id", "rule_id", "rule_group", "run_key", "error_type",
-        "error_message", "error_detail", "active_ind", "occurred_at", "last_updated_datetime",
+        "error_id", "run_id", "rule_id", "rule_group", "rule_variant", "run_key",
+        "error_type", "error_message", "error_detail", "active_ind", "occurred_at",
+        "last_updated_datetime",
     ],
 }
 

@@ -1,8 +1,10 @@
 """
 rules_engine/rules.py tests: load_rules() -- active-flag/rule_group
-filtering, seq_no/rule_id ordering, and the rule_variant selection level
-(NULL = universal, non-NULL = only when explicitly requested). No live DB
-connection required -- DuckDB stands in for the gre_ metadata store.
+filtering, seq_no/rule_id ordering, and the rule_variant selection level.
+rule_variant NOT passed means "no filter at all" (every active rule
+regardless of its own rule_variant); rule_variant passed means "universal
+(NULL) plus that exact value." No live DB connection required -- DuckDB
+stands in for the gre_ metadata store.
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -60,13 +62,17 @@ def test_load_rules_orders_by_seq_no_then_rule_id():
     assert [r["rule_id"] for r in rows] == [2, 1, 3]
 
 
-def test_load_rules_no_variant_requested_loads_only_universal_rules():
+def test_load_rules_no_variant_requested_loads_every_variant():
+    # NOT passing rule_variant means "don't filter on it at all" -- every
+    # active rule loads, universal or variant-tagged alike. See
+    # load_rules()'s docstring for why this is deliberately NOT the same
+    # as "rule_variant IS NULL".
     conn = _conn()
     _insert(conn, 1, rule_variant=None)
     _insert(conn, 2, rule_variant="2026")
 
     rows = load_rules(conn, META_DB, "claims_dq")
-    assert [r["rule_id"] for r in rows] == [1]
+    assert {r["rule_id"] for r in rows} == {1, 2}
 
 
 def test_load_rules_variant_requested_loads_universal_plus_matching():

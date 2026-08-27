@@ -2,22 +2,39 @@
 """
 run_by_process.py
 ------------------
-CLI wrapper around rules_engine.runner.run_by_process_name() and
-sampling.sampling.run_sampling_for_process_name() -- runs every active
-rule_group (or sampling config) scoped to one process_name, without
-having to write a one-off script each time.
+CLI wrapper around rules_engine.runner.run_by_scope() and
+sampling.sampling.run_sampling_for_process_name() -- lets you run at
+whichever level you scope it to just by which inputs you pass:
+project level (every process under it), process level, process +
+rule_group, or one rule_group directly (optionally narrowed further by
+rule_variant) -- without having to write a one-off script each time.
+Whatever you don't pass runs for every value at that level; it never
+means "run nothing" (see rules_engine.runner.run_by_scope()'s
+docstring for the full rationale).
 
 Usage
 -----
-    # Every active rule_group whose gre_rules.process_name matches:
+    # Project level -- every active process (and rule_group) under it:
+    python run_by_process.py rules --project-name HEALTHSPRING_UM
+
+    # Process level -- every active rule_group whose gre_rules.process_name matches:
     python run_by_process.py rules --process-name UNIVERSE_VALIDATION
 
     # Narrowed to one project too:
-    python run_by_process.py rules --process-name UNIVERSE_VALIDATION \\
+    python run_by_process.py rules --process-name UNIVERSE_VALIDATION \
         --project-name HEALTHSPRING_UM
 
+    # rule_group level -- runs exactly that group, skipping discovery:
+    python run_by_process.py rules --rule-group ODAG3
+
+    # rule_group + rule_variant -- narrows further to that variant
+    # (plus any universal/NULL-variant rules) within the group; OMITTING
+    # --rule-variant runs every active rule in scope regardless of its
+    # own rule_variant -- it does NOT mean "universal rules only":
+    python run_by_process.py rules --rule-group ODAG3 --rule-variant EAST
+
     # A specific run_key (defaults to today's date, YYYY-MM-DD, if omitted):
-    python run_by_process.py rules --process-name UNIVERSE_VALIDATION \\
+    python run_by_process.py rules --process-name UNIVERSE_VALIDATION \
         --run-key BATCH_2026_08_19
 
     # Same idea for sampling (gre_sampling_config.process_name):
@@ -102,7 +119,7 @@ def _parse_params(pairs) -> dict:
 def _run_rules(args):
     from rules_engine.config import configure_logging
     from rules_engine.db_ops import default_run_key
-    from rules_engine.runner import run_by_process_name
+    from rules_engine.runner import run_by_scope
 
     try:
         run_params = _parse_params(args.param)
@@ -111,21 +128,33 @@ def _run_rules(args):
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
+    if not (args.project_name or args.process_name or args.rule_group):
+        print("ERROR: pass at least one of --project-name, --process-name, --rule-group.",
+              file=sys.stderr)
+        return 1
+
     configure_logging(args.log_level)
     cf = build_and_load_connection_factory()
-    # run_by_process_name() itself defaults run_key to today's date (and
-    # logs that it did) when None is passed -- default_run_key() here is
-    # ONLY so this print line can show the actual value about to be used,
-    # not a second, independent default computation.
+    # run_by_scope() itself defaults run_key to today's date (and logs
+    # that it did) when None is passed -- default_run_key() here is ONLY
+    # so this print line can show the actual value about to be used, not
+    # a second, independent default computation.
     run_key = args.run_key or default_run_key()
-    print(f"Running rules_engine for process_name={args.process_name!r} "
-          f"project_name={args.project_name!r} run_key={run_key!r} "
+    print(f"Running rules_engine for project_name={args.project_name!r} "
+          f"process_name={args.process_name!r} rule_group={args.rule_group!r} "
+          f"rule_variant={args.rule_variant!r} run_key={run_key!r} "
           f"run_params={run_params!r} extra_filters={extra_filters!r} ...")
+    if not args.rule_variant:
+        print("  (no --rule-variant passed -- every active rule in scope runs, "
+              "regardless of its own rule_variant)")
 
     try:
-        outcome = run_by_process_name(
-            args.process_name, run_key, cf,
+        outcome = run_by_scope(
+            run_key=run_key, cf=cf,
             project_name=args.project_name,
+            process_name=args.process_name,
+            rule_group=args.rule_group,
+            rule_variant=args.rule_variant,
             run_params=run_params,
             extra_filters=extra_filters,
         )
@@ -193,12 +222,30 @@ def main():
     subparsers = parser.add_subparsers(dest="engine", required=True)
 
     rules_parser = subparsers.add_parser(
-        "rules", help="Run every active rule_group for a process_name (rules_engine).",
+        "rules", help="Run active rules at whatever level you scope it to: project, "
+                      "process, rule_group, and optionally rule_variant (rules_engine).",
     )
-    rules_parser.add_argument("--process-name", required=True,
-                              help="gre_rules.process_name to run every active rule_group for.")
     rules_parser.add_argument("--project-name", default=None,
-                              help="Optionally narrow further to one project_name.")
+                              help="gre_rules.project_name. Alone, runs every active rule_group "
+                                   "for EVERY process under this project (project level). "
+                                   "Combine with --process-name to narrow to one process, or with "
+                                   "--rule-group to run one specific group.")
+    rules_parser.add_argument("--process-name", default=None,
+                              help="gre_rules.process_name. Alone, runs every active rule_group "
+                                   "for this process across every project (process level). "
+                                   "Combine with --project-name to narrow further, or with "
+                                   "--rule-group to run one specific group.")
+    rules_parser.add_argument("--rule-group", default=None,
+                              help="Run exactly this one gre_rules.rule_group, skipping "
+                                   "project/process discovery entirely (rule_group level). "
+                                   "May be passed alone or alongside --project-name/"
+                                   "--process-name (those are then only used for bookkeeping, "
+                                   "since a rule_group already uniquely identifies its rules).")
+    rules_parser.add_argument("--rule-variant", default=None,
+                              help="Optionally narrow further to rules whose gre_rules."
+                                   "rule_variant is NULL (universal) or exactly this value. "
+                                   "OMITTING this runs every active rule in scope regardless of "
+                                   "its rule_variant -- it does NOT mean 'universal rules only'.")
     rules_parser.add_argument("--run-key", default=None,
                               help="Tracking/idempotency identifier for this run. "
                                    "Defaults to today's date (YYYY-MM-DD) if omitted.")

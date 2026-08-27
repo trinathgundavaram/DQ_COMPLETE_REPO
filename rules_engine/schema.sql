@@ -259,6 +259,11 @@ CREATE MULTISET TABLE {{META_DB}}.gre_exceptions (
     -- supplies those exact keys for this run, else NULL -- see
     -- rules_engine/executor.py::_write_exceptions().
     rule_nm               VARCHAR(500),                 -- copied from gre_rules.rule_nm
+    rule_group            VARCHAR(100),                 -- copied from gre_rules.rule_group
+    rule_variant          VARCHAR(100),                 -- copied from gre_rules.rule_variant (this
+                                                    -- RULE's own value, NOT the run's requested
+                                                    -- rule_variant filter -- see rules_engine/
+                                                    -- runner.py::run_by_scope()'s docstring)
     -- ── Source/scope columns below -- where this finding came from.
     database_name         VARCHAR(200),                 -- copied from gre_rules.database_name
     src_tbl_nm            VARCHAR(200),
@@ -347,6 +352,10 @@ CREATE MULTISET TABLE {{META_DB}}.gre_results (
     run_id                     VARCHAR(200) NOT NULL,
     rule_id                    INTEGER NOT NULL,
     rule_group                 VARCHAR(100),
+    rule_variant                VARCHAR(100),         -- this RULE's own gre_rules.rule_variant,
+                                                        -- NOT the run's requested rule_variant filter
+                                                        -- -- see rules_engine/runner.py::
+                                                        -- run_by_scope()'s docstring
     project_name                VARCHAR(100),         -- copied from gre_rules.project_name
     process_name                VARCHAR(100),         -- copied from gre_rules.process_name
     run_key                    VARCHAR(100) NOT NULL,
@@ -497,6 +506,8 @@ CREATE MULTISET TABLE {{META_DB}}.gre_rule_errors (
     run_id           VARCHAR(200),
     rule_id          INTEGER NOT NULL,
     rule_group       VARCHAR(100),
+    rule_variant     VARCHAR(100),         -- the erroring rule's own gre_rules.rule_variant --
+                                            -- see rules_engine/runner.py::run_by_scope()'s docstring
     run_key          VARCHAR(100),
     error_type       VARCHAR(50),          -- e.g. SQL_SYNTAX | CONNECTION | RUNTIME | PULL_FAILURE
     error_message    VARCHAR(2000),

@@ -86,7 +86,7 @@ def _log_error(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str,
                 error_type: str, message: str, detail: str = None) -> None:
     """Rule-dict convenience wrapper around rules_engine/db_ops.py::log_error(), for gre_rules-keyed callers."""
     log_error(meta_conn, meta_db, run_id, rule.get("rule_id"), rule.get("rule_group"),
-              run_key, error_type, message, detail)
+              run_key, error_type, message, detail, rule_variant=rule.get("rule_variant"))
 
 
 # ---------------------------------------------------------------------------
@@ -697,6 +697,8 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
                 rule.get("src_tbl_nm"),
                 rule.get("project_name"),
                 rule.get("process_name"),
+                rule.get("rule_group"),
+                rule.get("rule_variant"),
                 rule.get("element_name"),
                 rule.get("sql_dialect"),
                 issue_desc,
@@ -711,12 +713,19 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
         elif existing_row["etl_is_curr_ind"] != "Y":
             to_reactivate.append([run_id, run_key, existing_row["record_id"]])
 
+    # rule_group/rule_variant are copied straight from `rule` (gre_rules),
+    # same as project_name/process_name -- purely descriptive, so a
+    # gre_exceptions row can be filtered/reported on by rule_group or
+    # rule_variant without a join back to gre_rules (which may have since
+    # changed or been deactivated). See run_by_scope()'s docstring
+    # (rules_engine/runner.py) for why rule_variant on the RUN's request
+    # is a separate thing from this RULE's own rule_variant value.
     insert_sql = f"""
         INSERT INTO {meta_db}.gre_exceptions (
             run_id, rule_id, database_name, src_tbl_nm, project_name, process_name,
-            element_name, source_name, issue_desc, run_key, src_key_value,
-            rule_nm, dgr_nbr, universe_version, run_type, batch_schedule
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            rule_group, rule_variant, element_name, source_name, issue_desc, run_key,
+            src_key_value, rule_nm, dgr_nbr, universe_version, run_type, batch_schedule
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     inserted = bulk_insert_or_skip(meta_conn, insert_sql, to_insert) if to_insert else 0
 
@@ -837,14 +846,15 @@ def _write_result(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str
 
     sql = f"""
         INSERT INTO {meta_db}.gre_results (
-            run_id, rule_id, rule_group, project_name, process_name, run_key, seq_no,
+            run_id, rule_id, rule_group, rule_variant, project_name, process_name, run_key, seq_no,
             start_time, end_time, total_records, failed_records, failure_pct,
             threshold_pct_used, threshold_count_used, threshold_operator_used,
             severity, status, error_message, executed_sql, source_tieback_sql, active_ind
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Y')
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Y')
     """
     execute_dml(meta_conn, sql, [
-        run_id, rule_id, rule.get("rule_group"), rule.get("project_name"), rule.get("process_name"),
+        run_id, rule_id, rule.get("rule_group"), rule.get("rule_variant"),
+        rule.get("project_name"), rule.get("process_name"),
         run_key, rule.get("seq_no"), datetime.fromtimestamp(start_time), datetime.now(),
         total_records, failed_records, failure_pct, threshold_pct_used, threshold_count_used,
         threshold_operator_used, rule.get("severity"), status, error_message, executed_sql,

@@ -102,9 +102,30 @@ except ImportError:
 # Low-level DB helpers
 # ---------------------------------------------------------------------------
 
-def execute_query(conn, query: str, params=None) -> list:
-    """Run a SELECT and return rows as list-of-dicts (column names lowercased)."""
-    logger.debug("execute_query: %s | params=%d", _one_line(query), len(params) if params else 0)
+def execute_query(conn, query: str, params=None, log_params: bool = False) -> list:
+    """
+    Run a SELECT and return rows as list-of-dicts (column names lowercased).
+
+    log_params : when True, the actual bound parameter VALUES are logged
+        alongside the SQL text, not just a count. Still opt-in and
+        defaults to False so this never silently changes for a caller
+        this module doesn't control -- but every call site IN THIS FILE
+        and every other rules_engine/*.py caller that passes params
+        always runs against meta_conn (a gre_* metadata table) with
+        engine-authored values (rule_group names, run_keys, rule_ids,
+        etc.), NEVER against a source connection -- _run_source_query()
+        below, the one place a source (business-data) connection reaches
+        this function, never passes params at all. Metadata-query callers
+        pass log_params=True explicitly so the SQL text AND the exact
+        values used to look something up (e.g. "why did load_rules()
+        return 0 rows for this rule_group?") are both in the log, without
+        weakening the "never log source/business data" guarantee this
+        module documents above for any future source-connection caller.
+    """
+    if log_params:
+        logger.debug("execute_query: %s | params=%r", _one_line(query), params or [])
+    else:
+        logger.debug("execute_query: %s | params=%d", _one_line(query), len(params) if params else 0)
     cursor = conn.cursor()
     try:
         if params is not None:
@@ -122,9 +143,16 @@ def execute_query(conn, query: str, params=None) -> list:
         cursor.close()
 
 
-def execute_dml(conn, query: str, params=None):
-    """Execute one DML statement and commit immediately -- every call is its own transaction."""
-    logger.debug("execute_dml: %s | params=%d", _one_line(query), len(params) if params else 0)
+def execute_dml(conn, query: str, params=None, log_params: bool = False):
+    """
+    Execute one DML statement and commit immediately -- every call is its
+    own transaction. See execute_query()'s docstring for log_params --
+    same opt-in, same "metadata calls only" guarantee.
+    """
+    if log_params:
+        logger.debug("execute_dml: %s | params=%r", _one_line(query), params or [])
+    else:
+        logger.debug("execute_dml: %s | params=%d", _one_line(query), len(params) if params else 0)
     cursor = conn.cursor()
     try:
         if params is not None:
@@ -591,7 +619,7 @@ def count_prior_attempts(meta_conn, meta_db: str, run_key, rule_group: str) -> i
     this number.
     """
     sql = f"SELECT COUNT(*) AS cnt FROM {meta_db}.gre_rule_audit WHERE run_key = ? AND rule_group = ?"
-    rows = execute_query(meta_conn, sql, [run_key, rule_group])
+    rows = execute_query(meta_conn, sql, [run_key, rule_group], log_params=True)
     return int(rows[0]["cnt"]) if rows else 0
 
 
@@ -647,7 +675,7 @@ def _deactivate_prior_errors(meta_conn, meta_db: str, rule_id, run_key, current_
 
 
 def log_error(meta_conn, meta_db: str, run_id, rule_id, rule_group, run_key,
-              error_type: str, message: str, detail: str = None) -> None:
+              error_type: str, message: str, detail: str = None, rule_variant=None) -> None:
     """
     Insert one gre_rule_errors row, after deactivating any row left active
     for this (rule_id, run_key) from an earlier run_id -- see
@@ -655,6 +683,12 @@ def log_error(meta_conn, meta_db: str, run_id, rule_id, rule_group, run_key,
     with active_ind='Y': it belongs to the run_id currently executing,
     which is by definition the newest one for this run_key. Never raises
     -- an errors-table failure must not mask the real error.
+
+    rule_variant : the ERRORING RULE's OWN gre_rules.rule_variant (NOT the
+        run's requested rule_variant filter, which may be None/"run every
+        variant" -- see run_by_scope()/load_rules()'s docstrings) --
+        purely descriptive, so an error can be filtered/reported on by
+        variant the same way gre_exceptions/gre_results now can.
 
     This is the ONE gre_rule_errors write path for this package --
     rule execution goes through this via rules_engine/executor.py's
@@ -665,10 +699,12 @@ def log_error(meta_conn, meta_db: str, run_id, rule_id, rule_group, run_key,
 
     sql = f"""
         INSERT INTO {meta_db}.gre_rule_errors (
-            run_id, rule_id, rule_group, run_key, error_type, error_message, error_detail, active_ind
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'Y')
+            run_id, rule_id, rule_group, rule_variant, run_key, error_type,
+            error_message, error_detail, active_ind
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Y')
     """
     try:
-        execute_dml(meta_conn, sql, [run_id, rule_id, rule_group, run_key, error_type, message, detail])
+        execute_dml(meta_conn, sql,
+                    [run_id, rule_id, rule_group, rule_variant, run_key, error_type, message, detail])
     except Exception as exc:
         logger.error("Failed to write gre_rule_errors row (run_id=%s rule_id=%s): %s", run_id, rule_id, exc)

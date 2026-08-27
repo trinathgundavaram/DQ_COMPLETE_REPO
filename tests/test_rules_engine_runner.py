@@ -14,6 +14,7 @@ import pytest
 import rules_engine.executor as rules_engine_executor
 from rules_engine.runner import (
     run_rule_group, discover_rule_groups, run_all_active_groups, run_by_process_name,
+    run_by_scope,
     generate_run_id,
 )
 from rules_engine.db_ops import execute_query
@@ -117,7 +118,7 @@ def _conn():
     conn.execute("""
         CREATE TABLE gre_exceptions (
             record_id BIGINT, run_id VARCHAR, rule_id INTEGER, database_name VARCHAR, src_tbl_nm VARCHAR,
-            project_name VARCHAR, process_name VARCHAR,
+            project_name VARCHAR, process_name VARCHAR, rule_group VARCHAR, rule_variant VARCHAR,
             element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
             run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
@@ -133,7 +134,7 @@ def _conn():
 
     conn.execute("""
         CREATE TABLE gre_rule_errors (
-            error_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
+            error_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR, rule_variant VARCHAR,
             run_key VARCHAR, error_type VARCHAR, error_message VARCHAR,
             error_detail VARCHAR, active_ind VARCHAR DEFAULT 'Y',
             occurred_at TIMESTAMP DEFAULT current_timestamp,
@@ -147,7 +148,7 @@ def _conn():
     # docstring for the full rationale.
     conn.execute("""
         CREATE TABLE gre_results (
-            result_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR,
+            result_id BIGINT, run_id VARCHAR, rule_id INTEGER, rule_group VARCHAR, rule_variant VARCHAR,
             project_name VARCHAR, process_name VARCHAR, run_key VARCHAR, seq_no INTEGER,
             start_time TIMESTAMP, end_time TIMESTAMP,
             total_records BIGINT, failed_records BIGINT, failure_pct DOUBLE,
@@ -410,7 +411,18 @@ def test_shared_total_cache_avoids_redundant_count_queries_across_rules(monkeypa
 
 # ── rule_variant (additional level on top of rule_group/table) ──────────
 
-def test_rule_variant_none_requested_runs_only_universal_rules():
+def test_rule_variant_none_requested_runs_every_variant():
+    """
+    rule_variant NOT passed means "don't filter on rule_variant at all" --
+    every active rule in the group runs regardless of its own
+    rule_variant, universal (NULL) or not. This is a deliberate behavior
+    change from an earlier version of load_rules() that treated "not
+    passed" as "only the universal (NULL) rules" -- that stricter default
+    silently dropped every variant-tagged rule for a caller who never
+    intended to use variant scoping at all, producing a confusing
+    NO_RULES/0-rules-loaded result for a rule_group that plainly had
+    active rows. See rules_engine/rules.py::load_rules()'s docstring.
+    """
     conn = _conn()
     cf = _FakeConnectionFactory(conn)
     _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_variant=None)      # universal
@@ -419,9 +431,8 @@ def test_rule_variant_none_requested_runs_only_universal_rules():
     summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB)
 
     assert summary["status"] == "COMPLETED"
-    assert summary["total_rules"] == 1
-    assert 1 in summary["results"]
-    assert 2 not in summary["results"]   # variant-specific rule not requested -> not loaded/run
+    assert summary["total_rules"] == 2
+    assert set(summary["results"].keys()) == {1, 2}   # both run -- no variant filter applied at all
 
 
 def test_rule_variant_requested_runs_universal_plus_matching_variant():
@@ -856,3 +867,123 @@ def test_run_by_process_name_raises_clearly_when_no_match():
 
     with pytest.raises(ValueError, match="NO_SUCH_PROCESS"):
         run_by_process_name("NO_SUCH_PROCESS", "B1", cf, meta_conn=conn, meta_db=META_DB)
+
+
+# ── run_by_scope(): one entry point for every level (project / process /
+# rule_group / rule_variant), driven by which inputs are actually passed ──
+
+def test_run_by_scope_rule_group_level_runs_that_group_directly():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="PROC_A")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=10, rule_group="group_b",
+                 project_name="PROJECT_A", process_name="PROC_A")
+
+    outcome = run_by_scope(run_key="B1", cf=cf, meta_conn=conn, meta_db=META_DB,
+                            rule_group="group_a", run_params={"batch_id": "B1"})
+
+    assert set(outcome["rule_groups"].keys()) == {"group_a"}
+    assert outcome["rule_groups"]["group_a"]["status"] == "COMPLETED"
+
+
+def test_run_by_scope_process_level_runs_every_group_under_it():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="UNIVERSE_VALIDATION")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=10, rule_group="group_b",
+                 project_name="PROJECT_B", process_name="UNIVERSE_VALIDATION")
+    _insert_rule(conn, 3, _MISSING_REASON_SQL, seq_no=10, rule_group="group_c",
+                 project_name="PROJECT_A", process_name="OTHER_PROCESS")
+
+    outcome = run_by_scope(run_key="B1", cf=cf, meta_conn=conn, meta_db=META_DB,
+                            process_name="UNIVERSE_VALIDATION", run_params={"batch_id": "B1"})
+
+    assert set(outcome["rule_groups"].keys()) == {"group_a", "group_b"}
+
+
+def test_run_by_scope_project_level_runs_every_process_under_it():
+    """
+    Project level -- only project_name given -- must run every process
+    (and every rule_group under each of them), not just one process.
+    """
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="PROC_1")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=10, rule_group="group_b",
+                 project_name="PROJECT_A", process_name="PROC_2")
+    _insert_rule(conn, 3, _MISSING_REASON_SQL, seq_no=10, rule_group="group_c",
+                 project_name="PROJECT_B", process_name="PROC_1")
+
+    outcome = run_by_scope(run_key="B1", cf=cf, meta_conn=conn, meta_db=META_DB,
+                            project_name="PROJECT_A", run_params={"batch_id": "B1"})
+
+    # Both PROC_1 and PROC_2 under PROJECT_A ran; PROJECT_B's group did not.
+    assert set(outcome["rule_groups"].keys()) == {"group_a", "group_b"}
+
+
+def test_run_by_scope_project_and_process_level_narrows_further():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="PROC_1")
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=10, rule_group="group_b",
+                 project_name="PROJECT_A", process_name="PROC_2")
+
+    outcome = run_by_scope(run_key="B1", cf=cf, meta_conn=conn, meta_db=META_DB,
+                            project_name="PROJECT_A", process_name="PROC_1",
+                            run_params={"batch_id": "B1"})
+
+    assert set(outcome["rule_groups"].keys()) == {"group_a"}
+
+
+def test_run_by_scope_rule_variant_narrows_within_whatever_level_is_run():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="PROC_A", rule_variant=None)
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="PROC_A", rule_variant="2026")
+    _insert_rule(conn, 3, _MISSING_REASON_SQL, seq_no=30, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="PROC_A", rule_variant="2025")
+
+    # process level + rule_variant="2026" -> universal (1) + matching variant (2), not 2025's (3)
+    outcome = run_by_scope(run_key="B1", cf=cf, meta_conn=conn, meta_db=META_DB,
+                            process_name="PROC_A", rule_variant="2026",
+                            run_params={"batch_id": "B1"})
+
+    assert outcome["rule_groups"]["group_a"]["total_rules"] == 2
+    assert set(outcome["rule_groups"]["group_a"]["results"].keys()) == {1, 2}
+
+
+def test_run_by_scope_no_rule_variant_runs_every_variant_at_any_level():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="PROC_A", rule_variant=None)
+    _insert_rule(conn, 2, _MISSING_REASON_SQL, seq_no=20, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="PROC_A", rule_variant="2026")
+
+    outcome = run_by_scope(run_key="B1", cf=cf, meta_conn=conn, meta_db=META_DB,
+                            project_name="PROJECT_A", run_params={"batch_id": "B1"})
+
+    assert outcome["rule_groups"]["group_a"]["total_rules"] == 2   # both -- no variant filter at all
+
+
+def test_run_by_scope_requires_at_least_one_scoping_input():
+    cf = _FakeConnectionFactory(_conn())
+    with pytest.raises(ValueError, match="at least one"):
+        run_by_scope(run_key="B1", cf=cf)
+
+
+def test_run_by_scope_raises_clearly_when_scope_matches_nothing():
+    conn = _conn()
+    cf = _FakeConnectionFactory(conn)
+    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10, rule_group="group_a",
+                 project_name="PROJECT_A", process_name="PROC_A")
+
+    with pytest.raises(ValueError, match="NO_SUCH_PROCESS"):
+        run_by_scope(run_key="B1", cf=cf, meta_conn=conn, meta_db=META_DB,
+                     process_name="NO_SUCH_PROCESS")
