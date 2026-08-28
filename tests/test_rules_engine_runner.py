@@ -869,6 +869,94 @@ def test_run_rule_group_valid_extra_filters_applies_to_every_rule_by_default():
     assert "run_ty = 'MNT'" in results[0]["executed_sql"]
 
 
+class _CountingSourceFactory(_FakeConnectionFactory):
+    """
+    Like _FakeConnectionFactory, but every cf.get(...) call hands back the
+    SAME wrapped adapter instance, and that adapter counts every
+    .cursor() call (one per distinct query issued through it) -- lets a
+    test assert exactly how many source-side queries a whole
+    run_rule_group() call issued, not just how many connections it built.
+    """
+    def __init__(self, conn):
+        super().__init__(conn)
+        self.cursor_calls = 0
+
+    def cursor(self):
+        self.cursor_calls += 1
+        return self._conn.cursor()
+
+    def commit(self):
+        self._conn.commit()
+
+    def prepare(self, rule: dict) -> None:
+        pass
+
+    def qualified_name(self, rule: dict) -> str:
+        return f"{rule['database_name']}.{rule['src_tbl_nm']}"
+
+    def get(self, name):
+        return self
+
+
+def test_run_rule_group_multiple_rules_sharing_failing_total_count_key_only_query_source_once():
+    # Integration-level version of executor.py's
+    # test_compute_total_caches_failure_avoiding_redundant_source_queries,
+    # exercised through run_rule_group() itself: several rules in the SAME
+    # group share an identical table + run_params (RUNTYPE isn't a real
+    # column, so the auto-generated total-count query fails for all of
+    # them), so every rule falls back to the run_params-less denominator --
+    # but the underlying doomed total-count query should only ever reach
+    # the source database ONCE for the whole run (via the shared
+    # total_cache threaded through by run_rule_group()), not once per rule
+    # sharing the key. Direct fix for the user's report: "Same query run
+    # for every rule... Why does it have to run for every rule multiple
+    # times."
+    #
+    # Proven here without hardcoding an exact query count (which would be
+    # brittle against unrelated internal changes) by comparing the
+    # PER-RULE marginal cost of a 1-rule run vs a 4-rule run: each
+    # additional rule still needs its own scan query and its own
+    # fallback total-count query, but -- with the failing total-count
+    # query cached after the first rule -- none of rules 2-4 pay for a
+    # SECOND failing round trip the way they would without the fix. So
+    # the marginal cost per rule after the first must be strictly LESS
+    # than the first rule's own total cost (which includes the one real
+    # failing round trip nothing else amortizes).
+    def _make(rule_count):
+        conn = _conn()
+        cf = _CountingSourceFactory(conn)
+        for i in range(1, rule_count + 1):
+            _insert_rule(conn, i, _MISSING_REASON_SQL, seq_no=i * 10)
+        summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB,
+                       run_params={"RUNTYPE": "MNT"})   # RUNTYPE: not a real column
+        assert summary["status"] == "COMPLETED"
+        assert summary["succeeded"] == rule_count
+        results = execute_query(
+            conn, f"SELECT * FROM gre_results WHERE rule_id <= {rule_count} ORDER BY rule_id"
+        )
+        assert len(results) == rule_count
+        for r in results:
+            # Not asserting SUCCESS specifically -- _MISSING_REASON_SQL has
+            # no threshold set, so any denial_reason IS NULL row makes the
+            # rule FAIL on its own violations; that's irrelevant here. The
+            # only thing under test is that the total-count fallback
+            # itself worked (never ERROR) and used the correct, shared
+            # denominator.
+            assert r["status"] in ("SUCCESS", "FAIL")
+            assert r["total_records"] == 4   # fell back to the whole-table denominator
+        return cf.cursor_calls
+
+    calls_for_1_rule = _make(1)
+    calls_for_4_rules = _make(4)
+
+    marginal_cost_per_extra_rule = (calls_for_4_rules - calls_for_1_rule) / 3
+    # Without failure-caching, each of the 3 extra rules would ALSO pay
+    # for its own failing total-count round trip -- pushing its marginal
+    # cost up to (or past) the first rule's full cost. With caching, only
+    # rule 1 ever pays for that failing query.
+    assert marginal_cost_per_extra_rule < calls_for_1_rule
+
+
 # ── project_name/process_name propagation ─────────────────────────────────
 
 def test_gre_rule_audit_carries_project_and_process_name_from_rules():

@@ -1281,6 +1281,45 @@ def test_execute_rule_total_count_still_errors_when_fallback_also_fails(monkeypa
     assert "simulated total-count failure" in errors[0]["error_message"]
 
 
+def test_compute_total_caches_failure_avoiding_redundant_source_queries():
+    # Reproduces the reported production scenario: many rules in a group
+    # share the identical (sql_dialect, total-count query) key, and that
+    # query FAILS (e.g. a run_params key like RUNTYPE that isn't a real
+    # column on the table). Before this fix, total_cache only memoized
+    # SUCCESSFUL results -- a failing query was re-issued against the
+    # source database, and re-failed, once per rule sharing that key, even
+    # though every one of those round trips was guaranteed to fail
+    # identically. total_cache now caches the failure too: the first call
+    # issues one real query (and one real cursor()/network round trip);
+    # every subsequent call with the identical cache key re-raises the
+    # SAME cached exception immediately, with NO additional query.
+    conn = _conn()
+    wrapped_db = _CursorCountingWrapper(conn)
+    rule = _rule(
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+                 "WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
+    )
+    run_params = {"batch_id": "B1", "RUNTYPE": "MNT"}   # RUNTYPE: not a real column
+    total_cache = {}
+
+    with pytest.raises(Exception):
+        _compute_total(wrapped_db, rule, run_params, total_cache=total_cache)
+    assert wrapped_db.cursor_calls == 1   # one real round trip for the first, failing call
+
+    # Second call, identical rule/run_params -> identical cache_key. Must
+    # raise the cached exception WITHOUT issuing a second source query.
+    with pytest.raises(Exception):
+        _compute_total(wrapped_db, rule, run_params, total_cache=total_cache)
+    assert wrapped_db.cursor_calls == 1   # unchanged -- served from the cached failure
+
+    # A third, unrelated rule sharing the same table+run_params also hits
+    # the cache, not the source.
+    other_rule = _rule(rule_id=2)
+    with pytest.raises(Exception):
+        _compute_total(wrapped_db, other_rule, run_params, total_cache=total_cache)
+    assert wrapped_db.cursor_calls == 1
+
+
 def test_execute_rule_text_params_substitute_without_scoping_total_count():
     # The fix: the SAME RUNTYPE value, passed via text_params instead of
     # run_params, still substitutes into rule_syntax ("{RUNTYPE}" resolves

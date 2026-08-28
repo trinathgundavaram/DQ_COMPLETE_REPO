@@ -823,10 +823,25 @@ Optimizations that matter once a rule matches millions of rows (see
   what's fetched *over the wire* per batch -- the driver still returns
   every selected column for the `GRE_EXCEPTION_CHUNK` rows in flight at
   any one moment -- only what's kept afterward.
-- **Memoized total counts** (`_compute_total`'s `total_cache`): rules in
-  the same group that ask the identical "how many rows are in this batch"
-  question share one `COUNT(*)` result for the whole `run_rule_group()`
-  call, threaded through via `total_cache`.
+- **Memoized total counts, failures included** (`_compute_total`'s
+  `total_cache`): rules in the same group that ask the identical "how many
+  rows are in this batch" question share one `COUNT(*)` result for the
+  whole `run_rule_group()` call, threaded through via `total_cache`. This
+  is memoized whether the query SUCCEEDS or FAILS -- e.g. a `run_params`
+  key that doesn't name a real column (see "text_params" above) makes
+  this query fail identically for every rule sharing that table +
+  run_params. Without caching the failure, each of those rules would
+  independently re-issue the identical, already-known-to-fail query
+  against the source database -- one full network round trip per rule,
+  all doomed to the same outcome -- before falling back to a
+  run_params-less denominator. The first failure is cached (as a
+  `_CachedTotalFailure` sentinel wrapping the exception); every
+  subsequent rule with the identical `(sql_dialect, query text)` key
+  re-raises the SAME cached exception immediately, with no additional
+  round trip, and the existing run_params-less fallback proceeds exactly
+  as before. Purely a within-run performance fix -- it changes nothing
+  about WHICH rules fall back or what they fall back to, only how many
+  times the source database is asked the same already-answered question.
 - **Chunked bulk writes**: both `_scan_violations`'s reads and
   `_write_exceptions`'s writes go through `GRE_EXCEPTION_CHUNK`-sized
   batches (`bulk_insert_or_skip`/`bulk_execute`), never one row per

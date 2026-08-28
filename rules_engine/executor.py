@@ -880,6 +880,19 @@ def _build_total_query(table_ref: str, run_params: dict) -> str:
     return _substitute_params(template, run_params)
 
 
+class _CachedTotalFailure:
+    """
+    Sentinel wrapper stored in total_cache when _compute_total()'s own
+    query FAILED (as opposed to succeeded with an int total) -- see
+    _compute_total()'s docstring for why caching a failure matters just
+    as much as caching a success.
+    """
+    __slots__ = ("exc",)
+
+    def __init__(self, exc: Exception):
+        self.exc = exc
+
+
 def _compute_total(db_conn, rule: dict, run_params: dict, total_cache: dict = None) -> int:
     """
     total_records = COUNT(*) FROM the rule's table (db_conn.qualified_name(rule)),
@@ -898,14 +911,39 @@ def _compute_total(db_conn, rule: dict, run_params: dict, total_cache: dict = No
     already relies on). Callers that don't pass a cache (e.g. direct
     execute_rule() calls in tests) get the old always-fresh-query
     behavior unchanged.
+
+    FAILURES are memoized too, not just successes -- e.g. a run_params
+    key that isn't a real column (the exact scenario text_params exists
+    to avoid, see execute_rule()'s docstring) makes this query fail for
+    EVERY rule sharing that table + run_params, not just one. Without
+    this, each of those rules would independently re-run the identical,
+    already-known-to-fail COUNT(*) against the source database -- one
+    full network round trip per rule, all doomed to the same outcome --
+    before STEP 2's caller falls back to run_params-less scoping. Caching
+    the failure the first time it happens means every subsequent rule
+    with the identical (sql_dialect, query text) key raises the SAME
+    cached exception immediately, with no additional round trip, and
+    STEP 2's fallback proceeds exactly as before. This is purely a
+    within-run performance fix -- it changes nothing about WHICH rules
+    fall back or what they fall back to, only how many times the source
+    database is asked the same already-answered question.
     """
     query = _build_total_query(db_conn.qualified_name(rule), run_params)
 
     cache_key = (rule.get("sql_dialect"), query)
     if total_cache is not None and cache_key in total_cache:
-        return total_cache[cache_key]
+        cached = total_cache[cache_key]
+        if isinstance(cached, _CachedTotalFailure):
+            raise cached.exc
+        return cached
 
-    rows = _run_source_query(db_conn, query)
+    try:
+        rows = _run_source_query(db_conn, query)
+    except Exception as exc:
+        if total_cache is not None:
+            total_cache[cache_key] = _CachedTotalFailure(exc)
+        raise
+
     if not rows:
         total = 0
     else:
