@@ -836,6 +836,18 @@ def run_all_active_groups(
         run_key = _default_run_key()
         logger.info("run_all_active_groups: no run_key passed -- defaulting to today's date, run_key=%s.", run_key)
 
+    # Same guard as run_by_process_name()/run_by_scope() -- this function
+    # takes meta_conn as a plain positional argument rather than resolving
+    # it itself, so a caller passing through a None they got from
+    # cf.get() (e.g. a failed metadata connection) hits the same
+    # confusing AttributeError deep inside db_ops.py without this check.
+    if meta_conn is None:
+        raise RuntimeError(
+            f"Metadata connection '{gre_config.get_meta_connection_name()}' unavailable -- "
+            "check its credentials/env vars (see the log above for the specific connection "
+            "error) before retrying."
+        )
+
     rule_groups = discover_rule_groups(meta_conn, meta_db, project_name=project_name,
                                         process_name=process_name)
     logger.info(
@@ -935,6 +947,23 @@ def run_by_process_name(
 
     meta_conn = meta_conn or cf.get(gre_config.get_meta_connection_name())
     meta_db = meta_db or gre_config.get_meta_db()
+    # cf.get() returns None (never raises) when that connection's own
+    # env/credentials failed to build -- ConnectionFactory.load() logs a
+    # WARNING and moves on rather than stopping the whole process (see
+    # 1.4's "A source type with missing/bad credentials doesn't stop the
+    # whole run" note). Without this check, a None meta_conn silently
+    # reaches discover_rule_groups() -> execute_query() -> conn.cursor(),
+    # crashing with a confusing "'NoneType' object has no attribute
+    # 'cursor'" instead of naming the actual problem: the metadata
+    # connection itself never came up. run_rule_group() already guards
+    # this identically -- mirrored here since this function resolves
+    # meta_conn itself, before ever reaching that guard.
+    if meta_conn is None:
+        raise RuntimeError(
+            f"Metadata connection '{gre_config.get_meta_connection_name()}' unavailable -- "
+            "check its credentials/env vars (see the log above for the specific connection "
+            "error) before retrying."
+        )
 
     rule_groups = discover_rule_groups(meta_conn, meta_db, project_name=project_name,
                                         process_name=process_name)
@@ -1031,6 +1060,20 @@ def run_by_scope(
 
     meta_conn = meta_conn or cf.get(gre_config.get_meta_connection_name())
     meta_db = meta_db or gre_config.get_meta_db()
+    # Same guard as run_by_process_name() above -- cf.get() returns None
+    # rather than raising when the metadata connection's own credentials
+    # failed to build, and the rule_group-less path below (discover_rule_groups())
+    # has no other check before using meta_conn. Check it once here so
+    # BOTH the direct-rule_group path (which also passes meta_conn into
+    # run_rule_group(), itself already guarded) and the discovery path
+    # fail with the same clear message instead of an AttributeError deep
+    # inside db_ops.py.
+    if meta_conn is None:
+        raise RuntimeError(
+            f"Metadata connection '{gre_config.get_meta_connection_name()}' unavailable -- "
+            "check its credentials/env vars (see the log above for the specific connection "
+            "error) before retrying."
+        )
 
     if rule_group:
         logger.info(
