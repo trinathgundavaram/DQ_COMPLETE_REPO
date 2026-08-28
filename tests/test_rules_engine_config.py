@@ -320,7 +320,8 @@ def test_resolve_env_tokens_does_not_disturb_run_params_style_tokens(reload_conf
     assert shared_config.resolve_env_tokens(sql) == sql
 
 
-# ── configure_logging(): daily (not size-based) rotation, append-not-overwrite ──
+# ── configure_logging(): one uniquely-named log file per RUN, not a shared
+# daily-rotated file ──
 #
 # configure_logging() only installs its own handler when the root logger
 # has none yet ("won't clobber a caller's existing setup"); pytest's own
@@ -350,11 +351,9 @@ def isolated_logging():
     root.setLevel(saved_level)
 
 
-def test_configure_logging_uses_timed_daily_rotation_not_size(tmp_path, monkeypatch, reload_config, isolated_logging):
-    from logging.handlers import TimedRotatingFileHandler
-
+def test_configure_logging_creates_a_plain_file_handler_not_rotating(tmp_path, monkeypatch, reload_config, isolated_logging):
     monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
-    monkeypatch.setenv("GRE_LOG_FILE", "rules_engine.log")
+    monkeypatch.delenv("GRE_LOG_FILE", raising=False)
     reload_config()
 
     logging.getLogger().handlers = []
@@ -363,188 +362,206 @@ def test_configure_logging_uses_timed_daily_rotation_not_size(tmp_path, monkeypa
     root = logging.getLogger()
     assert len(root.handlers) == 1
     handler = root.handlers[0]
-    assert isinstance(handler, TimedRotatingFileHandler)
-    assert handler.when.upper() == "MIDNIGHT"
-    assert handler.suffix == "%Y-%m-%d"
-    assert (tmp_path / "rules_engine.log").exists()
+    assert isinstance(handler, logging.FileHandler)
+    assert not isinstance(handler, __import__("logging.handlers", fromlist=["TimedRotatingFileHandler"]).TimedRotatingFileHandler)
+    created = list(tmp_path.glob("rules_engine_*.log"))
+    assert len(created) == 1
 
 
-def test_configure_logging_default_retention_is_30_days(tmp_path, monkeypatch, reload_config, isolated_logging):
+def test_configure_logging_two_calls_in_the_same_process_get_two_distinct_files(tmp_path, monkeypatch, reload_config, isolated_logging):
+    # The core of this change: every configure_logging() call gets its OWN
+    # log file -- never shared with, or appended to by, a different
+    # invocation. Simulated here as two separate "runs" against the same
+    # log dir (root.handlers cleared between them, same as two separate
+    # process invocations would each see an empty root logger).
     monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
-    monkeypatch.delenv("GRE_LOG_RETENTION_DAYS", raising=False)
+    reload_config()
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
+    first_files = set(tmp_path.glob("rules_engine_*.log"))
+    for h in logging.getLogger().handlers:
+        h.close()
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
+    second_files = set(tmp_path.glob("rules_engine_*.log"))
+
+    assert len(first_files) == 1
+    assert len(second_files) == 2   # first file still present, plus the new one
+    assert first_files < second_files   # first file untouched, not reused/renamed
+
+
+def test_configure_logging_base_name_from_env_strips_dot_log_suffix(tmp_path, monkeypatch, reload_config, isolated_logging):
+    # An old-style GRE_LOG_FILE=rules_engine.log value (the exact literal
+    # filename under the previous shared-file design) must still produce
+    # a clean "rules_engine_<timestamp>_<pid>.log" name, not
+    # "rules_engine.log_<timestamp>_<pid>.log".
+    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("GRE_LOG_FILE", "rules_engine.log")
     reload_config()
 
     logging.getLogger().handlers = []
     shared_config.configure_logging()
 
-    assert logging.getLogger().handlers[0].backupCount == 30
+    created = list(tmp_path.glob("rules_engine_*.log"))
+    assert len(created) == 1
+    assert ".log_" not in created[0].name
 
 
-def test_configure_logging_retention_env_override(tmp_path, monkeypatch, reload_config, isolated_logging):
+def test_configure_logging_custom_base_name_used_as_prefix(tmp_path, monkeypatch, reload_config, isolated_logging):
     monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
-    monkeypatch.setenv("GRE_LOG_RETENTION_DAYS", "90")
+    monkeypatch.setenv("GRE_LOG_FILE", "my_custom_run")
     reload_config()
 
     logging.getLogger().handlers = []
     shared_config.configure_logging()
 
-    assert logging.getLogger().handlers[0].backupCount == 90
+    assert list(tmp_path.glob("my_custom_run_*.log"))
+    assert not list(tmp_path.glob("rules_engine_*.log"))
 
 
-def test_configure_logging_retention_zero_means_keep_forever(tmp_path, monkeypatch, reload_config, isolated_logging):
-    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
-    monkeypatch.setenv("GRE_LOG_RETENTION_DAYS", "0")
-    reload_config()
-
-    logging.getLogger().handlers = []
-    shared_config.configure_logging()
-
-    # backupCount=0 is TimedRotatingFileHandler's own "never delete old
-    # rotated files" setting -- confirms "0" is passed through, not
-    # silently coerced to some other default.
-    assert logging.getLogger().handlers[0].backupCount == 0
-
-
-def test_configure_logging_malformed_retention_falls_back_to_default(tmp_path, monkeypatch, reload_config, isolated_logging):
-    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
-    monkeypatch.setenv("GRE_LOG_RETENTION_DAYS", "not-a-number")
-    reload_config()
-
-    logging.getLogger().handlers = []
-    shared_config.configure_logging()
-
-    assert logging.getLogger().handlers[0].backupCount == 30
+def test_build_run_log_path_embeds_timestamp_and_pid(tmp_path):
+    path = shared_config._build_run_log_path(tmp_path, "rules_engine")
+    assert path.parent == tmp_path
+    assert path.name.startswith("rules_engine_")
+    assert path.name.endswith(".log")
+    # "<base>_<8-digit-date>_<6-digit-time>_<6-digit-micros>_<pid>.log"
+    stem = path.stem[len("rules_engine_"):]
+    parts = stem.split("_")
+    assert len(parts) == 4
+    date_part, time_part, micros_part, pid_part = parts
+    assert len(date_part) == 8 and date_part.isdigit()
+    assert len(time_part) == 6 and time_part.isdigit()
+    assert len(micros_part) == 6 and micros_part.isdigit()
+    assert pid_part.isdigit()
 
 
-def test_rotate_stale_log_at_startup_renames_yesterdays_file(tmp_path):
-    """
-    Direct unit test of the manual catch-up TimedRotatingFileHandler's own
-    timer can never perform for a short-lived process (see the function's
-    docstring): a log file last written YESTERDAY gets renamed with
-    yesterday's date suffix, so a fresh process starting today doesn't
-    just keep appending into the same undated file forever.
-    """
-    import os
-    import time
+def test_base_log_name_default_when_env_unset(monkeypatch):
+    monkeypatch.delenv("GRE_LOG_FILE", raising=False)
+    assert shared_config._base_log_name("rules_engine") == "rules_engine"
+
+
+def test_base_log_name_strips_dot_log_suffix(monkeypatch):
+    monkeypatch.setenv("GRE_LOG_FILE", "rules_engine.log")
+    assert shared_config._base_log_name("rules_engine") == "rules_engine"
+
+
+def test_base_log_name_strips_dot_log_case_insensitively(monkeypatch):
+    monkeypatch.setenv("GRE_LOG_FILE", "MyLog.LOG")
+    assert shared_config._base_log_name("rules_engine") == "MyLog"
+
+
+def test_base_log_name_no_suffix_passed_through_unchanged(monkeypatch):
+    monkeypatch.setenv("GRE_LOG_FILE", "custom_prefix")
+    assert shared_config._base_log_name("rules_engine") == "custom_prefix"
+
+
+def test_prune_old_run_logs_deletes_beyond_retention_keeps_within(tmp_path):
     from datetime import datetime, timedelta
 
-    log_path = tmp_path / "rules_engine.log"
-    log_path.write_text("yesterday's activity\n")
-    yesterday = datetime.now().date() - timedelta(days=1)
-    stale_time = time.mktime(yesterday.timetuple())
-    os.utime(log_path, (stale_time, stale_time))
+    old_stamp = (datetime.now() - timedelta(days=45)).strftime("%Y%m%d_%H%M%S_%f")
+    recent_stamp = (datetime.now() - timedelta(days=5)).strftime("%Y%m%d_%H%M%S_%f")
+    old_file = tmp_path / f"rules_engine_{old_stamp}_1234.log"
+    recent_file = tmp_path / f"rules_engine_{recent_stamp}_5678.log"
+    old_file.write_text("old run")
+    recent_file.write_text("recent run")
 
-    shared_config._rotate_stale_log_at_startup(log_path, retention_days=30)
-
-    dated_path = tmp_path / f"rules_engine.log.{yesterday.isoformat()}"
-    assert not log_path.exists()
-    assert dated_path.exists()
-    assert dated_path.read_text() == "yesterday's activity\n"
-
-
-def test_rotate_stale_log_at_startup_leaves_todays_file_alone(tmp_path):
-    log_path = tmp_path / "rules_engine.log"
-    log_path.write_text("today's activity so far\n")   # mtime is "now" by default
-
-    shared_config._rotate_stale_log_at_startup(log_path, retention_days=30)
-
-    assert log_path.exists()
-    assert log_path.read_text() == "today's activity so far\n"
-    assert list(tmp_path.glob("rules_engine.log.*")) == []
-
-
-def test_rotate_stale_log_at_startup_no_file_is_a_no_op(tmp_path):
-    # First-ever run on a fresh machine/log dir -- nothing to rotate.
-    shared_config._rotate_stale_log_at_startup(tmp_path / "rules_engine.log", retention_days=30)
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_rotate_stale_log_at_startup_avoids_overwriting_existing_dated_file(tmp_path):
-    import os
-    import time
-    from datetime import datetime, timedelta
-
-    log_path = tmp_path / "rules_engine.log"
-    log_path.write_text("second stale file from the same day\n")
-    yesterday = datetime.now().date() - timedelta(days=1)
-    stale_time = time.mktime(yesterday.timetuple())
-    os.utime(log_path, (stale_time, stale_time))
-
-    already_there = tmp_path / f"rules_engine.log.{yesterday.isoformat()}"
-    already_there.write_text("first dated file from that same day\n")
-
-    shared_config._rotate_stale_log_at_startup(log_path, retention_days=30)
-
-    # Original dated file untouched, new content landed under a ".2" suffix
-    # instead of clobbering it.
-    assert already_there.read_text() == "first dated file from that same day\n"
-    collision_path = tmp_path / f"rules_engine.log.{yesterday.isoformat()}.2"
-    assert collision_path.exists()
-    assert collision_path.read_text() == "second stale file from the same day\n"
-
-
-def test_prune_old_dated_logs_deletes_beyond_retention_keeps_within(tmp_path):
-    from datetime import datetime, timedelta
-
-    log_path = tmp_path / "rules_engine.log"
-    old_date = (datetime.now().date() - timedelta(days=45)).isoformat()
-    recent_date = (datetime.now().date() - timedelta(days=5)).isoformat()
-    old_file = tmp_path / f"rules_engine.log.{old_date}"
-    recent_file = tmp_path / f"rules_engine.log.{recent_date}"
-    old_file.write_text("old")
-    recent_file.write_text("recent")
-
-    shared_config._prune_old_dated_logs(log_path, retention_days=30)
+    shared_config._prune_old_run_logs(tmp_path, "rules_engine", retention_days=30)
 
     assert not old_file.exists()
     assert recent_file.exists()
 
 
-def test_configure_logging_rotates_a_stale_log_before_attaching_handler(tmp_path, monkeypatch, reload_config, isolated_logging):
-    # End-to-end: configure_logging() itself (not just the helper directly)
-    # performs the startup catch-up rotation before opening today's file.
-    import os
-    import time
+def test_prune_old_run_logs_zero_retention_keeps_everything(tmp_path):
+    from datetime import datetime, timedelta
+
+    old_stamp = (datetime.now() - timedelta(days=400)).strftime("%Y%m%d_%H%M%S_%f")
+    old_file = tmp_path / f"rules_engine_{old_stamp}_1234.log"
+    old_file.write_text("ancient run")
+
+    shared_config._prune_old_run_logs(tmp_path, "rules_engine", retention_days=0)
+
+    assert old_file.exists()
+
+
+def test_prune_old_run_logs_ignores_files_not_matching_our_pattern(tmp_path):
+    unrelated = tmp_path / "rules_engine_notes.txt"
+    unrelated.write_text("not a log file at all")
+    also_unrelated = tmp_path / "rules_engine_.log"   # empty stem, not one of ours
+    also_unrelated.write_text("")
+
+    shared_config._prune_old_run_logs(tmp_path, "rules_engine", retention_days=1)
+
+    assert unrelated.exists()
+    assert also_unrelated.exists()
+
+
+def test_configure_logging_prunes_old_run_logs_before_creating_new_one(tmp_path, monkeypatch, reload_config, isolated_logging):
     from datetime import datetime, timedelta
 
     monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
-    monkeypatch.setenv("GRE_LOG_FILE", "rules_engine.log")
+    monkeypatch.setenv("GRE_LOG_RETENTION_DAYS", "30")
     reload_config()
 
-    log_path = tmp_path / "rules_engine.log"
-    log_path.write_text("stale content from a prior day's process\n")
-    yesterday = datetime.now().date() - timedelta(days=1)
-    stale_time = time.mktime(yesterday.timetuple())
-    os.utime(log_path, (stale_time, stale_time))
+    old_stamp = (datetime.now() - timedelta(days=90)).strftime("%Y%m%d_%H%M%S_%f")
+    old_file = tmp_path / f"rules_engine_{old_stamp}_9999.log"
+    old_file.write_text("a run from 90 days ago")
 
     logging.getLogger().handlers = []
     shared_config.configure_logging()
 
-    dated_path = tmp_path / f"rules_engine.log.{yesterday.isoformat()}"
-    assert dated_path.exists()
-    assert dated_path.read_text() == "stale content from a prior day's process\n"
-    # Today's log_path is fresh (handler re-created it in append mode after
-    # the rename moved the stale content out of the way).
-    assert log_path.exists()
-    assert "stale content" not in log_path.read_text()
+    assert not old_file.exists()
+    assert list(tmp_path.glob("rules_engine_*.log"))   # this run's own fresh file
 
 
-def test_configure_logging_appends_across_calls_never_truncates(tmp_path, monkeypatch, reload_config, isolated_logging):
-    # Restarting/reconfiguring should never wipe what's already in the log
-    # file -- everything opens in append mode.
+def test_configure_logging_retention_zero_means_keep_forever_end_to_end(tmp_path, monkeypatch, reload_config, isolated_logging):
+    from datetime import datetime, timedelta
+
     monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
-    monkeypatch.setenv("GRE_LOG_FILE", "rules_engine.log")
+    monkeypatch.setenv("GRE_LOG_RETENTION_DAYS", "0")
     reload_config()
 
-    log_path = tmp_path / "rules_engine.log"
-    log_path.write_text("PRE-EXISTING LINE FROM AN EARLIER RUN\n")
+    old_stamp = (datetime.now() - timedelta(days=400)).strftime("%Y%m%d_%H%M%S_%f")
+    old_file = tmp_path / f"rules_engine_{old_stamp}_9999.log"
+    old_file.write_text("a very old run")
 
     logging.getLogger().handlers = []
     shared_config.configure_logging()
-    logging.getLogger("rules_engine").info("fresh line from this run")
+
+    assert old_file.exists()
+
+
+def test_configure_logging_malformed_retention_falls_back_to_default(tmp_path, monkeypatch, reload_config, isolated_logging):
+    from datetime import datetime, timedelta
+
+    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("GRE_LOG_RETENTION_DAYS", "not-a-number")
+    reload_config()
+
+    old_stamp = (datetime.now() - timedelta(days=45)).strftime("%Y%m%d_%H%M%S_%f")
+    old_file = tmp_path / f"rules_engine_{old_stamp}_9999.log"
+    old_file.write_text("older than the 30-day default fallback")
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
+
+    # A malformed GRE_LOG_RETENTION_DAYS falls back to the 30-day default,
+    # not "unlimited" -- a 45-day-old file still gets pruned.
+    assert not old_file.exists()
+
+
+def test_configure_logging_writes_a_log_line_naming_this_runs_file(tmp_path, monkeypatch, reload_config, isolated_logging):
+    monkeypatch.setenv("GRE_LOG_DIR", str(tmp_path))
+    reload_config()
+
+    logging.getLogger().handlers = []
+    shared_config.configure_logging()
     for h in logging.getLogger().handlers:
         h.flush()
 
-    content = log_path.read_text()
-    assert "PRE-EXISTING LINE FROM AN EARLIER RUN" in content
-    assert "fresh line from this run" in content
+    created = list(tmp_path.glob("rules_engine_*.log"))
+    assert len(created) == 1
+    content = created[0].read_text()
+    assert "one file per run" in content
+    assert str(created[0]) in content or created[0].name in content

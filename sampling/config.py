@@ -58,7 +58,6 @@ concurrent sampling runs ever be added.
 import logging
 import os
 from datetime import datetime, timedelta
-from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Callable, Dict
 
@@ -71,56 +70,76 @@ except ImportError:
     _DOTENV_AVAILABLE = False
 
 
-def _rotate_stale_log_at_startup(log_path: Path, retention_days: int) -> None:
+def _base_log_name(default: str) -> str:
     """
-    Manually perform the rename TimedRotatingFileHandler's own doRollover()
-    would have done, for a day boundary its internal timer never got to
-    see live -- see rules_engine/config.py's identical function for the
-    full rationale (byte-for-byte mirrored here, same repo convention as
-    the rest of this file).
+    Resolve GRE_LOG_FILE into a base FILENAME PREFIX, not a literal
+    filename. Historically GRE_LOG_FILE named the exact shared file
+    (e.g. "rules_engine.log") that every run appended into; now every
+    run gets its OWN uniquely-timestamped file (see configure_logging()'s
+    docstring for why), so a literal ".log" suffix in an old-style
+    GRE_LOG_FILE value would otherwise end up embedded mid-filename
+    (e.g. "rules_engine.log_20260828_...log") -- strip it if present so
+    an existing GRE_LOG_FILE=rules_engine.log setting still produces a
+    clean "rules_engine_20260828_....log" name instead of a confusing
+    double extension.
     """
-    if not log_path.exists():
-        return
-    try:
-        last_modified = datetime.fromtimestamp(log_path.stat().st_mtime).date()
-    except OSError:
-        return
-    if last_modified == datetime.now().date():
-        return
-
-    dated_path = log_path.with_name(f"{log_path.name}.{last_modified.isoformat()}")
-    suffix_n = 2
-    while dated_path.exists():
-        dated_path = log_path.with_name(f"{log_path.name}.{last_modified.isoformat()}.{suffix_n}")
-        suffix_n += 1
-
-    try:
-        log_path.rename(dated_path)
-    except OSError as exc:
-        logging.getLogger(__name__).warning(
-            "Could not rotate stale log %s (last written %s) to %s at startup: %s -- "
-            "continuing to append new entries to the existing file instead.",
-            log_path, last_modified, dated_path, exc,
-        )
-        return
-
-    if retention_days:
-        _prune_old_dated_logs(log_path, retention_days)
+    name = os.getenv("GRE_LOG_FILE", default)
+    if name.lower().endswith(".log"):
+        name = name[: -len(".log")]
+    return name or default
 
 
-def _prune_old_dated_logs(log_path: Path, retention_days: int) -> None:
+def _build_run_log_path(log_dir: Path, base_name: str) -> Path:
     """
-    Delete dated backups older than retention_days -- see
-    rules_engine/config.py's identical function for the full rationale.
+    A fresh, unique log file PATH for this process invocation --
+    "<base_name>_<YYYYMMDD_HHMMSS_ffffff>_<pid>.log". Every call to
+    configure_logging() (i.e. every run of this normally short-lived,
+    invoked-fresh-per-run CLI package) gets its OWN file, never shared
+    with or appended to by any other invocation -- see
+    configure_logging()'s docstring for why this replaced the old
+    shared-file-with-daily-rotation design.
+
+    Microsecond precision alone makes a same-timestamp collision between
+    two independently-started processes astronomically unlikely; the pid
+    suffix is added anyway as a cheap, unconditional guarantee -- two
+    OS processes can never share both a pid and a microsecond-precision
+    start time.
     """
-    cutoff = datetime.now().date() - timedelta(days=retention_days)
-    for candidate in log_path.parent.glob(f"{log_path.name}.*"):
-        date_part = candidate.name[len(log_path.name) + 1:].split(".")[0]
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return log_dir / f"{base_name}_{stamp}_{os.getpid()}.log"
+
+
+def _prune_old_run_logs(log_dir: Path, base_name: str, retention_days: int) -> None:
+    """
+    Delete this package's own past per-run log files
+    ("<base_name>_<timestamp>_<pid>.log") older than retention_days,
+    based on each file's embedded timestamp (not filesystem mtime, which
+    an antivirus scan, backup tool, or file copy can silently bump) --
+    run once at the start of every configure_logging() call, since there
+    is no longer a single handler whose own rollover could ever perform
+    this cleanup (see configure_logging()'s docstring). retention_days=0
+    means "keep forever" -- no automatic deletion at all, same meaning
+    as under the old rotation scheme. Never raises: a file that can't be
+    parsed (not one of ours) is left alone; one that can't be deleted
+    (permissions, in use) is left in place rather than failing logging
+    setup over disk cleanup.
+    """
+    if not retention_days:
+        return
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    prefix = f"{base_name}_"
+    for candidate in log_dir.glob(f"{prefix}*.log"):
+        stem = candidate.name[len(prefix): -len(".log")]
+        # stem is "<YYYYMMDD_HHMMSS_ffffff>_<pid>" -- take just the
+        # timestamp portion (first three underscore-separated parts).
+        parts = stem.split("_")
+        if len(parts) < 3:
+            continue   # not one of our own timestamped run logs -- leave it alone
         try:
-            file_date = datetime.strptime(date_part, "%Y-%m-%d").date()
+            file_time = datetime.strptime("_".join(parts[:3]), "%Y%m%d_%H%M%S_%f")
         except ValueError:
             continue
-        if file_date < cutoff:
+        if file_time < cutoff:
             try:
                 candidate.unlink()
             except OSError:
@@ -141,10 +160,9 @@ def configure_logging(level=None) -> None:
     row COUNTS only -- never fetched row data or bind parameter values.
     At INFO: which Teradata/Postgres host/db a connection actually points
     at (db/connection_factory.py), and a "run_sampling starting" line per
-    attempt (sampling/sampling.py) -- both aimed squarely at catching a
-    run pointed at the wrong environment, which otherwise surfaces as a
-    confusing "column not present" error against a schema that looks
-    identical by name.
+    attempt -- both aimed squarely at catching a run pointed at the wrong
+    environment, which otherwise surfaces as a confusing "column not
+    present" error against a schema that looks identical by name.
 
     Parameters
     ----------
@@ -155,27 +173,26 @@ def configure_logging(level=None) -> None:
             it down to just the connection/run-starting lines.
 
     Writes to a FILE, not the console -- GRE_LOG_DIR (default "logs" at
-    the repo root, created if missing) / GRE_LOG_FILE (default
-    "sampling.log"). Never overwrites on a fresh run -- every handler
-    below opens in APPEND mode, so restarting the CLI/process only adds
-    new lines to whatever's already there; nothing is ever truncated or
-    replaced just because a new run started.
-
-    Rotates at MIDNIGHT (local time), not by file size -- one file per
-    CALENDAR DAY. Today's activity always lives at the same unchanging
-    path (GRE_LOG_FILE itself, e.g. "sampling.log"), so a caller tailing
-    the log doesn't need to know today's date; at midnight the
-    just-finished day's file is renamed with a date suffix (e.g.
-    "sampling.log.2026-08-27") and a fresh "sampling.log" starts for the
-    new day, so a busy day's history is never partially overwritten or
-    cut off mid-day the way a fixed SIZE-based rotation could (the old
-    10MB/5-backup scheme could drop same-day history the moment a heavy
-    run pushed past the 5th backup). GRE_LOG_RETENTION_DAYS (default 30)
-    caps how many PAST days are kept before the oldest dated file is
-    deleted -- set it to "0" to keep every day's log forever (no
-    automatic deletion at all) -- so a long-running or
-    frequently-scheduled process still can't silently fill the disk
-    without a deliberate opt-in to unlimited retention.
+    the repo root, created if missing). **Every run (every call to
+    configure_logging() -- this package is normally invoked fresh per
+    run, a short-lived CLI process, not a long-running daemon) gets its
+    OWN, uniquely-named log file** -- "<base>_<YYYYMMDD_HHMMSS_ffffff>_<pid>.log",
+    where <base> is GRE_LOG_FILE (default "sampling", a ".log" suffix in an
+    old-style GRE_LOG_FILE value is stripped automatically -- see
+    _base_log_name()). This replaced an earlier shared-file-with-
+    daily-rotation design: multiple runs on the same day used to
+    interleave into one "sampling.log" file, which meant grepping
+    one run's activity out of a busy day meant filtering by timestamp or
+    run_id after the fact. Now every invocation's log is already its own
+    file from the start -- nothing to filter, nothing shared, nothing
+    ever appended to by a different process. GRE_LOG_RETENTION_DAYS
+    (default 30) still caps how many PAST DAYS of these per-run files are
+    kept -- _prune_old_run_logs() deletes any whose own embedded
+    timestamp is older than the cutoff, every time configure_logging()
+    runs -- set it to "0" to keep every run's log forever (no automatic
+    deletion at all), so a long-running or frequently-scheduled process
+    still can't silently fill the disk without a deliberate opt-in to
+    unlimited retention.
 
     This sets the level on sampling's own logger namespace plus
     db.connection_factory's (the one intentionally-shared dependency --
@@ -183,32 +200,33 @@ def configure_logging(level=None) -> None:
     logging.basicConfig() ONLY if the root logger has no handlers yet, so
     it won't clobber a caller's existing logging setup (file, console, or
     otherwise) if one is already in place -- including a caller that has
-    already called rules_engine.config.configure_logging() first in the
-    same process, so the two packages' calls compose rather than one
-    silently overriding the other's handler.
+    already called rules_engine.config.configure_logging() first in the same
+    process, so the two packages' calls compose rather than one silently
+    overriding the other's handler.
     """
     resolved = level or os.getenv("GRE_LOG_LEVEL", "DEBUG")
     if not logging.getLogger().handlers:
         log_dir = Path(os.getenv("GRE_LOG_DIR") or (Path(__file__).resolve().parent.parent / "logs"))
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / os.getenv("GRE_LOG_FILE", "sampling.log")
+        base_name = _base_log_name("sampling")
         try:
             retention_days = int(os.getenv("GRE_LOG_RETENTION_DAYS", "30"))
         except ValueError:
             retention_days = 30
-        _rotate_stale_log_at_startup(log_path, retention_days)
-        handler = TimedRotatingFileHandler(
-            log_path, when="midnight", backupCount=retention_days, encoding="utf-8",
-        )
-        handler.suffix = "%Y-%m-%d"
+        # Clean up past runs' log files BEFORE creating this run's own --
+        # no handler-driven rollover exists anymore to do this from
+        # inside doRollover() (there's no shared file being rolled over
+        # at all now), so it's done explicitly, once, at the top of every
+        # configure_logging() call. See _prune_old_run_logs()'s docstring.
+        _prune_old_run_logs(log_dir, base_name, retention_days)
+        log_path = _build_run_log_path(log_dir, base_name)
+        handler = logging.FileHandler(log_path, encoding="utf-8")
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         logging.basicConfig(level=resolved, handlers=[handler])
         logging.getLogger(__name__).info(
-            "sampling logging to %s (level=%s, rotating daily at midnight, retention=%s).",
+            "sampling logging to %s (level=%s, one file per run, retention=%s).",
             log_path, resolved, f"{retention_days} day(s)" if retention_days else "unlimited",
         )
-    logging.getLogger("sampling").setLevel(resolved)
-    logging.getLogger("db.connection_factory").setLevel(resolved)
 
 
 def _load_env_file() -> None:

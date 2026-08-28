@@ -447,29 +447,43 @@ value`, `element_name`, etc.) ARE real source/business data copied off a
 violating record, not metadata-store bookkeeping, so those bulk writers
 keep their existing "row counts only, never values" logging unconditionally.
 
-### Log file rotation for a short-lived CLI process
+### One log file per run
 
-`TimedRotatingFileHandler` (below) computes its NEXT midnight rollover
-from "now" at construction -- fine for a long-running daemon, but this
-package's normal usage is `run_by_process.py` invoked fresh each time
-(start, run, exit), so a process starting today always computes a
-rollover time later today, which its own brief run never lives long
-enough to reach. Left alone, that means the rollover NEVER fires on its
-own, no matter how many separate days the script gets invoked on --
-everything just keeps appending into the same undated log file forever.
+Every call to `configure_logging()` -- i.e. every invocation of this
+normally short-lived, invoked-fresh-per-run CLI package -- writes to its
+own, uniquely-named log file:
+`<base>_<YYYYMMDD_HHMMSS_ffffff>_<pid>.log` under `GRE_LOG_DIR`. No two
+runs ever share or append into the same file, so a single run's
+activity is never interleaved with any other run's the way a shared,
+daily-rotated file used to require timestamp-filtering to untangle --
+the file for a specific run is simply the one whose name matches that
+run's start time.
 
-`configure_logging()` closes this gap with a startup catch-up,
-`_rotate_stale_log_at_startup()`: before attaching the handler, it checks
-the existing log file's own last-modified date, and if it isn't today,
-renames it with that date's suffix right then -- exactly the rename a
-live midnight rollover would have performed, just applied retroactively
-at the next process start instead of in real time. A `GRE_LOG_RETENTION_
-DAYS` sweep (`_prune_old_dated_logs()`) runs right after, since the
-manual rename bypasses the handler's own `backupCount` cleanup (that
-only fires from inside its own `doRollover()`). A long-running process
-that DOES stay alive past midnight still gets the handler's normal live
-rollover exactly as before -- this only fills the gap for the
-short-lived-invocation case that mechanism can't reach.
+`<base>` defaults to `rules_engine` (`sampling` for `sampling/config.py`)
+and is overridable via `GRE_LOG_FILE` -- now used as a filename PREFIX,
+not a literal filename. `_base_log_name()` strips a trailing `.log`
+automatically, so an old-style `GRE_LOG_FILE=rules_engine.log` setting
+(the exact literal filename the previous shared-file design used) still
+produces a clean `rules_engine_<timestamp>_<pid>.log` name rather than a
+confusing double extension.
+
+`GRE_LOG_RETENTION_DAYS` (default `30`) still caps how many PAST DAYS of
+these per-run files are kept: `_prune_old_run_logs()` runs at the top of
+every `configure_logging()` call, deleting any of this package's own
+past run-log files whose OWN embedded timestamp (not filesystem mtime,
+which a backup/AV scan can bump) is older than the cutoff, before this
+run's fresh file is created. Set it to `0` to keep every run's log
+forever -- no automatic deletion at all. This replaced the earlier
+`TimedRotatingFileHandler`-based daily-rotation design, which required a
+startup catch-up (`_rotate_stale_log_at_startup()`) to work around
+`TimedRotatingFileHandler` computing its next rollover from "now" at
+construction time -- a fresh, short-lived process starting today always
+computed a rollover later that same day, which its own brief run never
+lived long enough to reach, so the rollover never actually fired for
+this package's normal usage pattern. Giving every run its own file from
+the start removes the need for any of that: there is no shared file to
+roll over, and no live-rollover-vs-startup-catch-up distinction to
+reason about.
 
 ## Selecting which rules run: `rule_variant`
 

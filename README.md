@@ -348,23 +348,20 @@ violating record's own key/detail VALUES are real source data, not
 engine bookkeeping, so those bulk writers keep logging counts only,
 unconditionally.
 
-**Log rotation**: each package's log file (`rules_engine.log` /
-`sampling.log`, under `GRE_LOG_DIR`) rotates at MIDNIGHT, not by file
-size -- one file per calendar day, named with a date suffix (e.g.
-`rules_engine.log.2026-08-27`) once that day is over; today's activity
-always lives at the plain, unchanging `GRE_LOG_FILE` path. Restarting the
-process never truncates or overwrites what's already there -- every
-handler opens in append mode. `GRE_LOG_RETENTION_DAYS` (default `30`)
-caps how many past days are kept before the oldest dated file is deleted;
-set it to `0` to keep every day's log forever. Because this package's
-normal usage is a short-lived CLI invocation rather than a long-running
-daemon, `configure_logging()` performs that day-boundary rename itself
-at startup if the existing log file's last-modified date isn't today --
-Python's `TimedRotatingFileHandler` alone only rotates while a single
-process instance stays alive across midnight, which a fresh
-invocation-per-run process never does. See
-[`rules_engine/README.md`](rules_engine/README.md)'s "Log file rotation
-for a short-lived CLI process" section.
+**One log file per run**: each package writes to its own uniquely-named
+log file EVERY run -- `<base>_<YYYYMMDD_HHMMSS_ffffff>_<pid>.log` under
+`GRE_LOG_DIR`, where `<base>` defaults to `rules_engine`/`sampling`
+(override via `GRE_LOG_FILE`, used as a filename PREFIX now, not a
+literal filename -- a `.log` suffix in an old-style value is stripped
+automatically). No two runs ever share or append into the same file, so
+a single run's activity is never interleaved with another's the way a
+shared, daily-rotated file used to require filtering by timestamp to
+untangle. `GRE_LOG_RETENTION_DAYS` (default `30`) still caps how many
+PAST DAYS of these per-run files are kept -- every `configure_logging()`
+call deletes any of its own past run-logs older than the cutoff before
+creating this run's file; set it to `0` to keep every run's log forever.
+See [`rules_engine/README.md`](rules_engine/README.md)'s "One log file
+per run" section.
 
 ## Running the tests
 
