@@ -1057,21 +1057,35 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     # marker to. Two cases:
     #   1. Marker present -- spliced in at the marker's exact position,
     #      same as before (the precise, author-controlled placement).
-    #   2. No marker -- appended at the very END of rule_syntax instead,
-    #      as "<rule_syntax> AND col1 = 'v1' AND ...". This is the least
-    #      invasive insertion point: for the single-WHERE-clause shape
-    #      virtually every rule_syntax in this package uses (nothing
-    #      after WHERE), it's exactly equivalent to a marker at the end
-    #      of the WHERE clause. For a rule_syntax with GROUP BY/HAVING/
-    #      ORDER BY/QUALIFY after its WHERE (or no WHERE at all), this
-    #      insertion point is WRONG and the source database raises a
-    #      syntax error -- caught below and logged as an ordinary
-    #      SQL_RUNTIME/SCOPE_QUERY_FAILURE error for THAT rule, same as
-    #      any other broken rule_syntax, rather than silently producing
-    #      a wrong result or silently skipping the rule. This trade-off
-    #      (apply everywhere, let a structurally incompatible rule fail
-    #      loudly) is intentional -- see rules_engine/README.md's
-    #      "Ad-hoc runtime filters" section for the full rationale.
+    #   2. No marker -- rule_syntax is wrapped as a DERIVED TABLE and the
+    #      filter applied on the OUTER query instead of textually
+    #      appended to the end of rule_syntax's own WHERE clause:
+    #          SELECT * FROM (<rule_syntax>) gre_extra_filters_wrap
+    #          WHERE col1 = 'v1' AND col2 = 'v2' ...
+    #      An earlier version of this appended "AND col = 'val'" directly
+    #      onto rule_syntax's own text instead -- that is WRONG the
+    #      moment rule_syntax's WHERE clause has a top-level OR: SQL's
+    #      "AND binds tighter than OR" precedence means an appended AND
+    #      only attaches to the LAST OR operand, silently narrowing just
+    #      one branch of the rule's own logic while leaving every other
+    #      branch completely unfiltered -- a real production case with
+    #      "(...) AND x OR (...) AND y" confirmed this produces WRONG
+    #      results, not just a broken query, which is strictly worse than
+    #      a loud failure. Wrapping as a derived table sidesteps operator
+    #      precedence entirely -- the outer WHERE always applies to
+    #      rule_syntax's FULL result set, regardless of how many
+    #      top-level AND/OR branches its own WHERE clause has, or whether
+    #      it has a WHERE clause at all. The one remaining failure mode
+    #      is a rule_syntax whose own SELECT list doesn't project the
+    #      extra_filters column(s) at all (e.g. an explicit column list
+    #      that omits it) -- the source database then raises an ordinary
+    #      "column not found" error, caught below and logged as
+    #      SQL_RUNTIME/SCOPE_QUERY_FAILURE for THAT rule, same as any
+    #      other broken rule_syntax. This trade-off (apply everywhere,
+    #      let a rule whose SELECT list genuinely can't see the filtered
+    #      column fail loudly) is intentional -- see rules_engine/
+    #      README.md's "Ad-hoc runtime filters" section for the full
+    #      rationale.
     # extra_filters_sql is precomputed ONCE per run by
     # rules_engine/runner.py::run_rule_group() (validated/built up front,
     # right after rules are loaded, instead of redundantly once per rule
@@ -1098,14 +1112,23 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
         templated = rule["rule_syntax"].replace("{extra_filters}", extra_filters_sql).replace(
             "$extra_filters", extra_filters_sql)
     elif extra_filters:
-        templated = f"{rule['rule_syntax']} {extra_filters_sql}"
+        # extra_filters_sql always starts with "AND " (build_extra_filters_clause()'s
+        # contract) -- strip it here since the outer WHERE below is not
+        # appending onto an existing condition, it's the sole predicate
+        # of a brand-new outer query.
+        outer_where = extra_filters_sql[4:] if extra_filters_sql.startswith("AND ") else extra_filters_sql
+        inner_sql = rule["rule_syntax"].strip().rstrip(";")
+        templated = (
+            f"SELECT * FROM (\n{inner_sql}\n) gre_extra_filters_wrap WHERE {outer_where}"
+        )
         logger.debug(
-            "Rule %s: extra_filters=%s applied by DEFAULT-APPEND (no {extra_filters}/$extra_filters "
-            "marker in rule_syntax) -- appended after the rule's own WHERE clause. If this rule's "
-            "rule_syntax has anything after its WHERE clause (GROUP BY/HAVING/ORDER BY/...), or no "
-            "WHERE clause at all, this placement is wrong and the scan/total-count query below will "
-            "fail with a SQL error -- add the marker to gre_rules.rule_syntax at the correct position "
-            "for this rule if that happens.",
+            "Rule %s: extra_filters=%s applied via DERIVED-TABLE WRAP (no {extra_filters}/"
+            "$extra_filters marker in rule_syntax) -- rule_syntax's full result set is "
+            "filtered from the OUTSIDE, so this is correct regardless of how many top-level "
+            "AND/OR branches rule_syntax's own WHERE clause has, or whether it has one at "
+            "all. Fails loudly instead if rule_syntax's own SELECT list doesn't project the "
+            "filtered column(s) at all -- add the {extra_filters}/$extra_filters marker "
+            "directly into gre_rules.rule_syntax if that happens.",
             rule.get("rule_id"), extra_filters,
         )
     else:

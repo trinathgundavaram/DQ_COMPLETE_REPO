@@ -435,13 +435,16 @@ def build_extra_filters_clause(extra_filters: dict) -> str:
     filtering an already-authored rule by "run_ty='MNT'" without having
     to add a {run_ty} token to every rule that might ever need it.
 
-    A rule opts into this by embedding the literal marker "{extra_filters}"
-    (or "$extra_filters") anywhere in its rule_syntax -- typically right
-    before the end of the WHERE clause, before any GROUP BY/ORDER BY. See
-    rules_engine/executor.py::execute_rule()'s extra_filters parameter for
-    where this gets spliced in. A rule that doesn't embed the marker
-    simply never has extra_filters applied to it -- same "extra values are
-    silently unused" philosophy as run_params' own unused keys.
+    Applied to EVERY rule by default now (see rules_engine/executor.py::
+    execute_rule()'s STEP 0b) -- a rule_syntax embedding the literal
+    marker "{extra_filters}" (or "$extra_filters") gets this clause
+    spliced at that exact position; a rule_syntax without the marker gets
+    its FULL result set wrapped as a derived table and this clause
+    applied on the outer query instead
+    ("SELECT * FROM (<rule_syntax>) w WHERE <this clause without its
+    leading AND>"), which is correct regardless of how rule_syntax's own
+    WHERE clause is structured (top-level OR, no WHERE at all, ...). See
+    execute_rule()'s extra_filters parameter for the full mechanics.
 
     Returns "" (empty string, so the marker disappears cleanly with no
     dangling "AND") when extra_filters is empty/None. Every key is

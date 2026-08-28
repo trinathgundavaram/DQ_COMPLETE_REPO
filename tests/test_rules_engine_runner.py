@@ -848,11 +848,17 @@ def test_run_rule_group_valid_extra_filters_applies_to_every_rule_by_default():
     # through run_rule_group() -> the sequential loop -> execute_rule()
     # produces the identical end result as passing extra_filters directly
     # to execute_rule().
+    # SELECT * (rather than _MISSING_REASON_SQL's narrow claim_id-only
+    # projection) so run_ty is visible to the derived-table wrap's outer
+    # WHERE -- see executor.py's extra_filters STEP 0b docstring for why
+    # a no-marker rule now needs the filtered column in its own SELECT
+    # list.
     conn = _conn()
     conn.execute("ALTER TABLE claims ADD COLUMN run_ty VARCHAR")
     conn.execute("UPDATE claims SET run_ty = 'MNT' WHERE batch_id = 'B1'")
     cf = _FakeConnectionFactory(conn)
-    _insert_rule(conn, 1, _MISSING_REASON_SQL, seq_no=10)
+    _insert_rule(conn, 1, "SELECT * FROM claims WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
+                 seq_no=10)
 
     summary = _run("claims_dq", "B1", cf, meta_conn=conn, meta_db=META_DB,
                    extra_filters={"run_ty": "MNT"})

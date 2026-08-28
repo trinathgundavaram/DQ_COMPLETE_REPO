@@ -1439,22 +1439,21 @@ def test_execute_rule_extra_filters_multiple_filters_all_applied():
     assert "run_ty = 'MNT'" in executed
 
 
-def test_execute_rule_extra_filters_no_marker_default_appended(caplog):
+def test_execute_rule_extra_filters_no_marker_derived_table_wrap(caplog):
     # A rule that never embeds "{extra_filters}"/"$extra_filters" now gets
-    # extra_filters DEFAULT-APPENDED to the end of its rule_syntax instead
-    # of being silently ignored -- extra_filters applies to EVERY rule in
-    # a run by default now (see execute_rule()'s STEP 0b). This rule's
-    # rule_syntax is a plain single-WHERE-clause shape (nothing after the
-    # WHERE), so default-append is exactly equivalent to a marker placed
-    # at the end of the WHERE clause -- run_ty='MNT' narrows both the scan
-    # and the total-count denominator, and a DEBUG line names the rule and
-    # explains the placement.
+    # rule_syntax wrapped as a derived table and the filter applied on
+    # the OUTER query, instead of being silently ignored -- extra_filters
+    # applies to EVERY rule in a run by default now (see execute_rule()'s
+    # STEP 0b). SELECT * projects every column (including run_ty), so the
+    # outer WHERE can see it -- run_ty='MNT' narrows both the scan and
+    # the total-count denominator, and a DEBUG line names the rule and
+    # explains the wrap.
     conn = _conn()
     conn.execute("ALTER TABLE claims ADD COLUMN run_ty VARCHAR")
     conn.execute("UPDATE claims SET run_ty = 'MNT' WHERE batch_id = 'B1'")
     conn.execute("UPDATE claims SET run_ty = 'ADHOC' WHERE batch_id = 'B2'")
     rule = _rule(
-        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+        rule_syntax="SELECT * FROM claims "
                     "WHERE denial_reason IS NULL AND batch_id = '{batch_id}'",
         threshold_pct=100,
     )
@@ -1466,25 +1465,71 @@ def test_execute_rule_extra_filters_no_marker_default_appended(caplog):
     results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
     executed = results[0]["executed_sql"]
     assert "run_ty = 'MNT'" in executed
+    assert "FROM (" in executed   # derived-table wrap, not a bare textual append
     assert results[0]["total_records"] == 4
     assert results[0]["failed_records"] == 2
 
     debugs = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
-    assert any("DEFAULT-APPEND" in msg and "Rule 1" in msg for msg in debugs)
+    assert any("DERIVED-TABLE WRAP" in msg and "Rule 1" in msg for msg in debugs)
 
 
-def test_execute_rule_extra_filters_no_marker_group_by_fails_loudly():
-    # A rule whose rule_syntax has content AFTER its WHERE clause (a GROUP
-    # BY here) is structurally incompatible with blind default-append --
-    # appending "AND col = 'val'" after a GROUP BY produces invalid SQL.
-    # Per the user's explicit instruction ("Donot worry about rule
-    # breaking. if it breaks its expected to log that error"), this must
-    # fail LOUDLY (ERROR/SQL_RUNTIME on this one rule) rather than
-    # silently skip extra_filters or silently produce a wrong result.
+def test_execute_rule_extra_filters_no_marker_top_level_or_applies_to_every_branch():
+    # THE bug this wrap fixes, reproducing a real production report: a
+    # rule_syntax with a top-level OR in its WHERE clause (two independent
+    # qualifying conditions) used to have extra_filters silently attach
+    # to ONLY the last OR branch when naively text-appended as
+    # "<rule_syntax> AND col = 'val'" -- SQL's "AND binds tighter than
+    # OR" precedence means "... WHERE A OR B AND run_ty='MNT'" parses as
+    # "... WHERE A OR (B AND run_ty='MNT')", leaving every row matching
+    # branch A completely unfiltered by run_ty. The derived-table wrap
+    # sidesteps this: the filter applies to the WHOLE result set of
+    # "(A OR B)", regardless of how many top-level branches it has.
+    #
+    # claims: C1 (denial_reason NULL, batch_id B1), C2 ('Not medically
+    # necessary', B1), C3 (NULL, B1), C4 ('X', B1), C5 (NULL, B2).
+    # Branch A: denial_reason IS NULL -- matches C1, C3, C5.
+    # Branch B: batch_id = 'B2' -- matches C5.
+    # Union (no filter): C1, C3, C5. C5 is set to run_ty='ADHOC' below,
+    # everything else 'MNT' -- a correct run_ty='MNT' filter must exclude
+    # C5 via BOTH branches, leaving only C1, C3.
+    conn = _conn()
+    conn.execute("ALTER TABLE claims ADD COLUMN run_ty VARCHAR")
+    conn.execute("UPDATE claims SET run_ty = 'MNT'")
+    conn.execute("UPDATE claims SET run_ty = 'ADHOC' WHERE claim_id = 'C5'")
+    rule = _rule(
+        # Top-level OR: branch A (denial_reason IS NULL) OR branch B (batch_id='B2').
+        rule_syntax="SELECT * FROM claims "
+                    "WHERE denial_reason IS NULL OR batch_id = 'B2'",
+        threshold_pct=100,
+    )
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "ALL", {}, META_DB,
+                          extra_filters={"run_ty": "MNT"})
+    assert status == "SUCCESS"
+
+    # C5 matches branch A (denial_reason IS NULL) but has run_ty='ADHOC' --
+    # a correct filter excludes it from the violation set entirely. The
+    # old naive-append bug would have left C5 in (branch A was never
+    # filtered by run_ty at all), reporting a false violation.
+    exceptions = execute_query(
+        conn, "SELECT src_key_value FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'ALL'"
+    )
+    keys = {row["src_key_value"] for row in exceptions}
+    assert keys == {"claim_id=C1", "claim_id=C3"}
+
+
+def test_execute_rule_extra_filters_no_marker_missing_column_fails_loudly():
+    # The one real limitation of the derived-table wrap: if rule_syntax's
+    # own SELECT list doesn't project the filtered column at all, the
+    # outer query can't see it -- an ordinary "column not found" error,
+    # caught and logged the same as any other broken rule_syntax. Per the
+    # user's explicit instruction ("Donot worry about rule breaking. if
+    # it breaks its expected to log that error"), this is expected: add
+    # the {extra_filters}/$extra_filters marker (or widen the SELECT
+    # list) to fix a rule that hits this.
     conn = _conn()
     rule = _rule(
-        rule_syntax="SELECT batch_id, COUNT(*) AS cnt FROM claims "
-                    "WHERE denial_reason IS NULL GROUP BY batch_id",
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+                    "WHERE denial_reason IS NULL",
         threshold_pct=100,
     )
     status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {}, META_DB,
@@ -1494,7 +1539,28 @@ def test_execute_rule_extra_filters_no_marker_group_by_fails_loudly():
     results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
     assert len(results) == 1
     assert results[0]["status"] == "ERROR"
-    assert "run_ty" in results[0]["executed_sql"]   # the (invalid) spliced SQL, for diagnosis
+    assert "run_ty" in results[0]["executed_sql"]   # the (invalid) wrapped SQL, for diagnosis
+
+
+def test_execute_rule_extra_filters_no_marker_group_by_still_works_when_column_projected():
+    # A rule_syntax with GROUP BY (content after its WHERE clause) is no
+    # longer inherently incompatible with a no-marker extra_filters --
+    # the derived-table wrap doesn't care what's between WHERE and the
+    # end of rule_syntax, only whether the filtered column ends up in the
+    # projected result. Here run_ty is part of the GROUP BY/SELECT list,
+    # so the wrap succeeds cleanly (this used to be an unconditional
+    # SQL-syntax failure under the old textual-append design).
+    conn = _conn()
+    conn.execute("ALTER TABLE claims ADD COLUMN run_ty VARCHAR")
+    conn.execute("UPDATE claims SET run_ty = 'MNT'")
+    rule = _rule(
+        rule_syntax="SELECT run_ty, COUNT(*) AS cnt FROM claims "
+                    "WHERE denial_reason IS NULL GROUP BY run_ty",
+        threshold_pct=100,
+    )
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {}, META_DB,
+                          extra_filters={"run_ty": "MNT"})
+    assert status == "SUCCESS"
 
 
 def test_execute_rule_extra_filters_with_marker_still_spliced_precisely():

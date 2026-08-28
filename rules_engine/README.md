@@ -237,22 +237,34 @@ on whether a rule's `rule_syntax` happens to embed the literal marker
    WHERE denial_reason IS NULL AND claim_year = {year} AND claim_month = {month} {extra_filters}
    ```
 
-2. **No marker** -- the filter clause is **default-appended** to the
-   very end of `rule_syntax` instead: `"<rule_syntax> AND col1 = 'v1'
-   AND col2 = 'v2' ..."`. For the single-`WHERE`-clause shape virtually
-   every rule in this package uses (nothing after `WHERE`), this is
-   exactly equivalent to a marker placed at the end of the `WHERE`
-   clause. **For a `rule_syntax` with `GROUP BY`/`HAVING`/`ORDER BY`/
-   `QUALIFY` after its `WHERE` (or no `WHERE` at all), this placement is
-   wrong and the source database raises a SQL syntax error** -- caught
-   and logged as an ordinary error (`SQL_RUNTIME`/`SCOPE_QUERY_FAILURE`)
-   for *that* rule, exactly like any other broken `rule_syntax`, rather
-   than silently producing a wrong result or silently skipping the
-   filter. **This is intentional: if applying `extra_filters` breaks a
-   structurally incompatible rule, that failure is expected and gets
-   logged, not prevented.** Fix a rule that breaks this way by adding
-   the `{extra_filters}`/`$extra_filters` marker at the correct position
-   in its `rule_syntax`.
+2. **No marker** -- `rule_syntax` is wrapped as a **derived table** and
+   the filter applied on the OUTER query instead:
+   `"SELECT * FROM (<rule_syntax>) w WHERE col1 = 'v1' AND col2 = 'v2' ..."`.
+   An earlier version of this textually appended `"AND col = 'val'"`
+   directly onto the end of `rule_syntax` -- that is WRONG the moment
+   `rule_syntax`'s `WHERE` clause has a top-level `OR`: SQL's "`AND`
+   binds tighter than `OR`" precedence means an appended `AND` only
+   attaches to the LAST `OR` branch, silently leaving every other branch
+   completely unfiltered (confirmed in production: a rule with
+   `"... WHERE A OR B"` combined with a no-marker filter left every row
+   matching branch `A` unfiltered by the extra_filters column). The
+   derived-table wrap sidesteps operator precedence entirely: the outer
+   `WHERE` always applies to `rule_syntax`'s FULL result set, regardless
+   of how many top-level `AND`/`OR` branches it has, or whether it has a
+   `WHERE` clause (or `GROUP BY`/`HAVING`/`ORDER BY`) at all.
+
+   **The one remaining failure mode**: if `rule_syntax`'s own `SELECT`
+   list doesn't project the filtered column at all (an explicit column
+   list that omits it), the outer query can't see it, and the source
+   database raises an ordinary "column not found" error -- caught and
+   logged the same as any other broken `rule_syntax`
+   (`SQL_RUNTIME`/`SCOPE_QUERY_FAILURE`). **This is intentional: if
+   applying `extra_filters` breaks a rule whose `SELECT` list genuinely
+   can't see the filtered column, that failure is expected and gets
+   logged, not prevented.** Fix a rule that breaks this way by either
+   widening its `SELECT` list to include the column, or adding the
+   `{extra_filters}`/`$extra_filters` marker at the correct position in
+   its `rule_syntax` for precise, author-controlled placement instead.
 
 A caller passes one or more filters as a plain dict:
 
