@@ -293,6 +293,48 @@ def test_execute_rule_writes_exceptions_and_result():
     assert results[0]["process_name"] == "UNIVERSE_VALIDATION"
 
 
+def test_execute_rule_stamps_etl_load_and_last_updt_dt():
+    # etl_load_dt/etl_last_updt_dt (the legacy-vocabulary siblings of
+    # load_datetime/last_updated_datetime) must actually get populated at
+    # INSERT, not stay NULL forever -- see _write_exceptions()'s docstring.
+    conn = _conn()
+    rule = _rule(threshold_pct=25)
+
+    execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+
+    exceptions = execute_query(conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1'")
+    assert len(exceptions) == 2
+    assert all(r["etl_load_dt"] is not None for r in exceptions)
+    assert all(r["etl_last_updt_dt"] is not None for r in exceptions)
+
+
+def test_execute_rule_updates_etl_last_updt_dt_on_reactivate_and_deactivate():
+    conn = _conn()
+    rule = _rule(threshold_pct=25)
+
+    execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB)
+
+    # C1 fixed upstream -- rerun deactivates it.
+    conn.execute("UPDATE claims SET denial_reason = 'Fixed' WHERE claim_id = 'C1'")
+    execute_rule(rule, _Adapter(conn), conn, "RUN2", "B1", {"batch_id": "B1"}, META_DB)
+    deactivated = execute_query(
+        conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1' "
+              "AND src_key_value = 'claim_id=C1'",
+    )[0]
+    assert deactivated["etl_is_curr_ind"] == "N"
+    assert deactivated["etl_last_updt_dt"] is not None
+
+    # C1 breaks again -- rerun reactivates it.
+    conn.execute("UPDATE claims SET denial_reason = NULL WHERE claim_id = 'C1'")
+    execute_rule(rule, _Adapter(conn), conn, "RUN3", "B1", {"batch_id": "B1"}, META_DB)
+    reactivated = execute_query(
+        conn, "SELECT * FROM gre_exceptions WHERE rule_id = 1 AND run_key = 'B1' "
+              "AND src_key_value = 'claim_id=C1'",
+    )[0]
+    assert reactivated["etl_is_curr_ind"] == "Y"
+    assert reactivated["etl_last_updt_dt"] is not None
+
+
 # ── build_source_tieback_sql: generated (never executed) join SQL ────────
 
 def test_build_source_tieback_sql_teradata_single_column_key():

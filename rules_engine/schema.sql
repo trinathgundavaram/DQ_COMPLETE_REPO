@@ -286,7 +286,12 @@ CREATE MULTISET TABLE {{META_DB}}.gre_exceptions (
     -- ── Compliance disposition columns below.
     exception_flag        VARCHAR(20) DEFAULT 'OPEN',   -- compliance disposition
     exception_approver     VARCHAR(100),
-    -- ── ETL/legacy flag columns below.
+    -- ── ETL/legacy flag columns below -- the legacy-vocabulary siblings of
+    -- load_datetime/last_updated_datetime (see the "Column naming" note
+    -- at the top of this file); stamped by rules_engine/executor.py::
+    -- _write_exceptions() from the database's own clock (CURRENT_DATE/
+    -- CURRENT_TIMESTAMP), same as load_datetime's DEFAULT below: etl_load_dt
+    -- once, at INSERT; etl_last_updt_dt on every INSERT/reactivate/deactivate.
     etl_is_curr_ind       CHAR(1) DEFAULT 'Y',
     etl_load_dt           DATE,
     etl_last_updt_dt      TIMESTAMP,

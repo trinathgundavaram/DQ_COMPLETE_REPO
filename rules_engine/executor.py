@@ -69,7 +69,7 @@ import time
 from datetime import datetime
 
 from rules_engine.db_ops import (
-    execute_dml, execute_query, bulk_insert_or_skip, bulk_execute, _is_duplicate_key_error,
+    execute_dml, execute_query, bulk_insert_or_skip, bulk_execute,
     _substitute_params, _run_source_query, _escape_sql_literal,
     build_extra_filters_clause, log_error, EXCEPTION_CHUNK,
 )
@@ -617,6 +617,15 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
     already filters on etl_is_curr_ind='Y', so nothing on the read side
     needs to change for deactivated rows to stop showing as open.
 
+    etl_load_dt/etl_last_updt_dt (the legacy-vocabulary siblings of
+    load_datetime/last_updated_datetime -- see schema.sql's "ETL/legacy
+    flag columns") are set here from the database's own clock (literal
+    CURRENT_DATE/CURRENT_TIMESTAMP in the SQL text, not a Python-side
+    datetime.now()), same source-of-truth as load_datetime's own
+    DEFAULT CURRENT_TIMESTAMP: etl_load_dt is stamped once, at INSERT;
+    etl_last_updt_dt is stamped on every INSERT/reactivate/deactivate,
+    mirroring last_updated_datetime.
+
     `rows` is always this attempt's COMPLETE violation set -- there is no
     detail-capture cap on _scan_violations() any more (see that function's
     docstring), so deactivation below always runs unconditionally: an
@@ -772,14 +781,16 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
         INSERT INTO {meta_db}.gre_exceptions (
             run_id, rule_id, database_name, src_tbl_nm, project_name, process_name,
             rule_group, rule_variant, element_name, source_name, run_key,
-            src_key_value, rule_nm, dgr_nbr, universe_version, run_type, batch_schedule
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            src_key_value, rule_nm, dgr_nbr, universe_version, run_type, batch_schedule,
+            etl_load_dt, etl_last_updt_dt
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_DATE, CURRENT_TIMESTAMP)
     """
     inserted = bulk_insert_or_skip(meta_conn, insert_sql, to_insert) if to_insert else 0
 
     reactivate_sql = f"""
         UPDATE {meta_db}.gre_exceptions
-        SET etl_is_curr_ind = 'Y', run_id = ?, last_updated_by = 'SYSTEM', last_updated_datetime = CURRENT_TIMESTAMP
+        SET etl_is_curr_ind = 'Y', run_id = ?, last_updated_by = 'SYSTEM',
+            last_updated_datetime = CURRENT_TIMESTAMP, etl_last_updt_dt = CURRENT_TIMESTAMP
         WHERE run_key = ? AND record_id = ?
     """
     reactivated = bulk_execute(meta_conn, reactivate_sql, to_reactivate) if to_reactivate else 0
@@ -797,7 +808,8 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
     if to_deactivate:
         deactivate_sql = f"""
             UPDATE {meta_db}.gre_exceptions
-            SET etl_is_curr_ind = 'N', last_updated_by = 'SYSTEM', last_updated_datetime = CURRENT_TIMESTAMP
+            SET etl_is_curr_ind = 'N', last_updated_by = 'SYSTEM',
+                last_updated_datetime = CURRENT_TIMESTAMP, etl_last_updt_dt = CURRENT_TIMESTAMP
             WHERE record_id = ?
         """
         deactivated = bulk_execute(meta_conn, deactivate_sql, to_deactivate)

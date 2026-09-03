@@ -293,13 +293,16 @@ deterministic SQL text). It is also merged into the auto-generated
 total-record (denominator) count UNCONDITIONALLY now (no marker-presence
 gate), since it structurally applies to every rule's scan by default --
 `failure_pct` always reflects the same narrowed scope the scan itself
-used. Note that `gre_results.source_tieback_sql` (the generated re-join
-back to the live source table) never applies `run_params`/
-`extra_filters` at all, by design -- it joins directly on the natural
-key (`src_key_cols`) to the exact rows already captured in
-`gre_exceptions` for this `rule_id`/`run_key`, which were already
-correctly scoped when they were captured; re-applying the original
-filter there would be redundant, not a bug.
+used. `gre_results.source_tieback_sql` (the generated re-join back to the
+live source table) reuses that SAME resolved `run_params`/`extra_filters`
+scope as extra `AND s.col = 'val'` conditions, on top of its natural-key
+(`src_key_cols`) join -- not the natural key alone. Without this, a
+`src_key_cols` value that's only unique WITHIN one run's scope (e.g. a
+`claim_id` that repeats across `batch_id` values, unique only per batch)
+could tie back to the WRONG row once other batches/scopes exist in the
+live source table; reproducing the same scope guarantees the generated
+SQL pulls exactly the input rows the rule evaluated. See
+`executor.py::build_source_tieback_sql()`'s `scope_params` parameter.
 
 Unlike `run_params`' values (always escaped as literal data),
 `extra_filters`' KEYS become literal column names spliced directly into
@@ -699,7 +702,7 @@ in `rules_engine/` imports from `sampling/`, or vice versa.
 | `parallel.py` | `ConnectionPool`/`build_pools()`/`close_pools()` -- the bounded per-connection connection pooling the parallel path uses instead of the single shared `cf.get()` connection. |
 | `reporting.py` | `get_breaches()` / `get_records_for_result()` -- thin read-only queries against `gre_results`/`gre_exceptions`. `get_source_records_for_rule()` -- ties `gre_exceptions` back to the live source record (see "Tying exceptions back to source records" below). |
 | `schema.sql` | `gre_rules` (incl. `project_name`/`process_name`), `gre_exceptions`, `gre_results` (one row per rule per execution attempt), `gre_rule_audit`, `gre_rule_errors`. `gre_exceptions`/`gre_results`/`gre_rule_errors` each also carry `rule_group`/`rule_variant`, copied from the rule that produced the row (see "Project/process scoping" above). Fully standalone -- no other package's `schema.sql` needs to run first. |
-| `schema_drop.sql` | Drops the 6 tables above, for the drop-and-recreate redeploy policy (see the repo root README). |
+| `schema_drop.sql` | Drops the 5 tables above, for the drop-and-recreate redeploy policy (see the repo root README). |
 
 ## Parallel rule execution (opt-in)
 
