@@ -78,7 +78,7 @@ def _conn():
     conn.execute("""
         CREATE TABLE gre_exceptions (
             record_id BIGINT, run_id VARCHAR, rule_id INTEGER, database_name VARCHAR, src_tbl_nm VARCHAR,
-            element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
+            element_name VARCHAR, source_name VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
             run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
             etl_load_dt DATE, etl_last_updt_dt TIMESTAMP,
@@ -105,18 +105,18 @@ _record_id_seq = [0]
 
 
 def _insert_exception(conn, rule_id, src_key_value, database_name="main", src_tbl_nm="claims",
-                      source_name="duckdb_test", run_key="B1", issue_desc=None,
+                      source_name="duckdb_test", run_key="B1",
                       exception_flag="OPEN", etl_is_curr_ind="Y",
                       rule_nm=None, process_name=None, project_name=None):
     _record_id_seq[0] += 1
     execute_dml(conn, """
         INSERT INTO gre_exceptions (
             record_id, run_id, rule_id, database_name, src_tbl_nm, source_name,
-            issue_desc, exception_flag, run_key, etl_is_curr_ind, src_key_value,
+            exception_flag, run_key, etl_is_curr_ind, src_key_value,
             rule_nm, process_name, project_name
-        ) VALUES (?, 'RUN1', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, 'RUN1', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [_record_id_seq[0], rule_id, database_name, src_tbl_nm, source_name,
-          issue_desc or f"rule {rule_id} violated", exception_flag, run_key, etl_is_curr_ind, src_key_value,
+          exception_flag, run_key, etl_is_curr_ind, src_key_value,
           rule_nm or f"RULE{rule_id}", process_name, project_name])
 
 
@@ -155,8 +155,8 @@ def test_get_records_for_result_filters_current_version_only():
 
 def test_get_source_records_pulls_matching_rows_with_finding_context():
     conn = _conn()
-    _insert_exception(conn, 1, "claim_id=C1", issue_desc="missing denial_reason")
-    _insert_exception(conn, 1, "claim_id=C2", issue_desc="missing denial_reason")
+    _insert_exception(conn, 1, "claim_id=C1")
+    _insert_exception(conn, 1, "claim_id=C2")
     cf = _FakeConnectionFactory(conn)
 
     records = get_source_records_for_rule(cf, conn, META_DB, 1, "B1")
@@ -166,7 +166,6 @@ def test_get_source_records_pulls_matching_rows_with_finding_context():
     assert by_id["C1"]["region"] == "EAST"            # the actual source columns are there
     assert by_id["C1"]["_rule_id"] == 1
     assert by_id["C1"]["_src_key_value"] == "claim_id=C1"
-    assert by_id["C1"]["_issue_desc"] == "missing denial_reason"
     assert by_id["C1"]["_exception_flag"] == "OPEN"
     assert by_id["C1"]["_record_id"] is not None
 
@@ -218,8 +217,8 @@ def test_one_row_failing_two_rules_is_not_duplicated_and_ties_back_independently
     # and each rule's tie-back independently resolves back to the SAME
     # single source record, not a duplicated copy.
     conn = _conn()
-    _insert_exception(conn, 1, "claim_id=C1", issue_desc="rule 1 violated")
-    _insert_exception(conn, 2, "claim_id=C1", issue_desc="rule 2 violated")
+    _insert_exception(conn, 1, "claim_id=C1")
+    _insert_exception(conn, 2, "claim_id=C1")
     cf = _FakeConnectionFactory(conn)
 
     rule1_records = get_source_records_for_rule(cf, conn, META_DB, 1, "B1")
@@ -227,8 +226,8 @@ def test_one_row_failing_two_rules_is_not_duplicated_and_ties_back_independently
 
     assert len(rule1_records) == 1 and len(rule2_records) == 1
     assert rule1_records[0]["claim_id"] == rule2_records[0]["claim_id"] == "C1"
-    assert rule1_records[0]["_issue_desc"] == "rule 1 violated"
-    assert rule2_records[0]["_issue_desc"] == "rule 2 violated"
+    assert rule1_records[0]["_rule_id"] == 1
+    assert rule2_records[0]["_rule_id"] == 2
 
 
 # ── get_source_records_for_process: per-rule fan-out, one process/run_key ──
@@ -236,12 +235,12 @@ def test_one_row_failing_two_rules_is_not_duplicated_and_ties_back_independently
 def test_get_source_records_for_process_ties_back_each_rule_independently():
     # Two rules under the SAME process both failed on the SAME source
     # record (C1) this run -- the per-rule tie-back must surface it TWICE,
-    # once per rule, each tagged with its own rule_id/rule_nm/issue_desc,
-    # never merged into one row.
+    # once per rule, each tagged with its own rule_id/rule_nm, never
+    # merged into one row.
     conn = _conn()
-    _insert_exception(conn, 1, "claim_id=C1", issue_desc="rule 1 violated",
+    _insert_exception(conn, 1, "claim_id=C1",
                       rule_nm="ODAG3V22R16", process_name="ODAG3", project_name="HS_UM")
-    _insert_exception(conn, 2, "claim_id=C1", issue_desc="rule 2 violated",
+    _insert_exception(conn, 2, "claim_id=C1",
                       rule_nm="ODAG3V22R33", process_name="ODAG3", project_name="HS_UM")
     cf = _FakeConnectionFactory(conn)
 
@@ -250,8 +249,8 @@ def test_get_source_records_for_process_ties_back_each_rule_independently():
     assert len(records) == 2   # one row per rule, not deduped/merged across rules
     by_rule = {r["_rule_id"]: r for r in records}
     assert by_rule[1]["claim_id"] == by_rule[2]["claim_id"] == "C1"   # same source record
-    assert by_rule[1]["_rule_nm"] == "ODAG3V22R16" and by_rule[1]["_issue_desc"] == "rule 1 violated"
-    assert by_rule[2]["_rule_nm"] == "ODAG3V22R33" and by_rule[2]["_issue_desc"] == "rule 2 violated"
+    assert by_rule[1]["_rule_nm"] == "ODAG3V22R16"
+    assert by_rule[2]["_rule_nm"] == "ODAG3V22R33"
     assert by_rule[1]["_process_name"] == by_rule[2]["_process_name"] == "ODAG3"
 
 

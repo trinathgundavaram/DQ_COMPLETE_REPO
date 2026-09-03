@@ -67,7 +67,6 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.gre_exceptions (
     process_name          VARCHAR(200),
     element_name          VARCHAR(200),
     source_name           VARCHAR(100),
-    issue_desc            VARCHAR(2000),
     src_key_value         VARCHAR(1000) NOT NULL,
     dgr_nbr               VARCHAR(50),
     universe_version      VARCHAR(50),

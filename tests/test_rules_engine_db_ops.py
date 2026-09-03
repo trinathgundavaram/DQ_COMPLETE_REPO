@@ -32,7 +32,7 @@ def _conn():
     conn.execute("""
         CREATE TABLE gre_exceptions (
             record_id BIGINT, run_id VARCHAR, rule_id INTEGER, src_tbl_nm VARCHAR,
-            element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
+            element_name VARCHAR, source_name VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
             run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
             etl_load_dt DATE, etl_last_updt_dt TIMESTAMP,
@@ -273,12 +273,12 @@ def test_count_prior_attempts_increments_per_rule_group_run_key_pair():
 
 def test_bulk_insert_batches_across_multiple_chunks():
     conn = _conn()
-    rows = [["RUN", i, "t", "e", "s", f"issue {i}", "B1", f"claim_id=C{i}"] for i in range(7)]
+    rows = [["RUN", i, "t", "e", "s", "B1", f"claim_id=C{i}"] for i in range(7)]
     sql = """
         INSERT INTO gre_exceptions (
             run_id, rule_id, src_tbl_nm, element_name, source_name,
-            issue_desc, run_key, src_key_value
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            run_key, src_key_value
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
     """
     bulk_insert(conn, sql, rows, chunk_size=2)   # 7 rows, chunk_size=2 -> 4 chunks
     written = execute_query(conn, "SELECT COUNT(*) AS cnt FROM gre_exceptions")[0]["cnt"]
@@ -290,11 +290,11 @@ def test_bulk_insert_or_skip_chunk_falls_back_on_duplicate():
     sql = """
         INSERT INTO gre_exceptions (
             run_id, rule_id, src_tbl_nm, element_name, source_name,
-            issue_desc, run_key, src_key_value
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            run_key, src_key_value
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
     """
-    first = [["RUN1", 1, "t", "e", "s", "d", "B1", "claim_id=C1"],
-             ["RUN1", 1, "t", "e", "s", "d", "B1", "claim_id=C2"]]
+    first = [["RUN1", 1, "t", "e", "s", "B1", "claim_id=C1"],
+             ["RUN1", 1, "t", "e", "s", "B1", "claim_id=C2"]]
     inserted1 = bulk_insert_or_skip(conn, sql, first, chunk_size=10)
     assert inserted1 == 2
 
@@ -305,8 +305,8 @@ def test_bulk_insert_or_skip_chunk_falls_back_on_duplicate():
     # own count of "newly inserted" can undercount here -- see
     # bulk_insert_or_skip()'s docstring; what must hold is the DATA: no
     # duplicate row, no dropped row, and no exception escaping.)
-    second = [["RUN2", 1, "t", "e", "s", "d", "B1", "claim_id=C3"],
-              ["RUN2", 1, "t", "e", "s", "d", "B1", "claim_id=C1"]]
+    second = [["RUN2", 1, "t", "e", "s", "B1", "claim_id=C3"],
+              ["RUN2", 1, "t", "e", "s", "B1", "claim_id=C1"]]
     bulk_insert_or_skip(conn, sql, second, chunk_size=10)
 
     total = execute_query(conn, "SELECT COUNT(*) AS cnt FROM gre_exceptions")[0]["cnt"]

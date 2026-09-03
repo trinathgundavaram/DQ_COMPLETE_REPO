@@ -33,7 +33,7 @@ def _conn():
     conn.execute("""
         CREATE TABLE gre_exceptions (
             record_id BIGINT, run_id VARCHAR, rule_id INTEGER, src_tbl_nm VARCHAR,
-            element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
+            element_name VARCHAR, source_name VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
             run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
             etl_load_dt DATE, etl_last_updt_dt TIMESTAMP,
@@ -228,12 +228,12 @@ def test_count_prior_attempts_keys_sampling_runs_by_config_id():
 
 def test_bulk_insert_batches_across_multiple_chunks():
     conn = _conn()
-    rows = [["RUN", i, "t", "e", "s", f"issue {i}", "B1", f"claim_id=C{i}"] for i in range(7)]
+    rows = [["RUN", i, "t", "e", "s", "B1", f"claim_id=C{i}"] for i in range(7)]
     sql = """
         INSERT INTO gre_exceptions (
             run_id, rule_id, src_tbl_nm, element_name, source_name,
-            issue_desc, run_key, src_key_value
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            run_key, src_key_value
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
     """
     bulk_insert(conn, sql, rows, chunk_size=2)   # 7 rows, chunk_size=2 -> 4 chunks
     written = execute_query(conn, "SELECT COUNT(*) AS cnt FROM gre_exceptions")[0]["cnt"]

@@ -33,7 +33,7 @@ Usage
 
 Every output row carries the source table's own columns PLUS this
 finding's context under underscore-prefixed keys (_rule_id, _rule_nm,
-_process_name, _project_name, _record_id, _src_key_value, _issue_desc,
+_process_name, _project_name, _record_id, _src_key_value,
 _exception_flag) -- see rules_engine/reporting.py::
 get_source_records_for_rule()'s docstring for the full contract,
 including the "reflects the source table's CURRENT state, not the state
@@ -63,7 +63,7 @@ def _write_csv(records: list, output_path: str = None) -> None:
     # than an alphabetical dict-key dump that would bury _rule_id/_rule_nm
     # at the end.
     context_cols = ["_rule_id", "_rule_nm", "_process_name", "_project_name",
-                    "_record_id", "_src_key_value", "_issue_desc", "_exception_flag"]
+                    "_record_id", "_src_key_value", "_exception_flag"]
     source_cols = [c for c in records[0].keys() if c not in context_cols]
     fieldnames = context_cols + source_cols
 

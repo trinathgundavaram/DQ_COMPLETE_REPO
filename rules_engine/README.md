@@ -786,8 +786,7 @@ becomes `col IN (...)`, a composite key becomes an `OR` of per-record
 `AND`s (no portable cross-dialect multi-column `IN`). Each returned dict
 is the source row's own columns, plus this finding's context under
 underscore-prefixed keys that can't collide with a real source column:
-`_record_id`, `_rule_id`, `_src_key_value`, `_issue_desc`,
-`_exception_flag`.
+`_record_id`, `_rule_id`, `_src_key_value`, `_exception_flag`.
 
 This is a **live** re-join, not a point-in-time snapshot: it reflects the
 source table's current state, so a record corrected or deleted upstream

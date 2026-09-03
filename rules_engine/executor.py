@@ -327,7 +327,41 @@ def _tieback_split_expr(dialect: str, src_key_value_expr: str, token_index: int,
     return f"split_part({token}, '=', 2)"
 
 
-def build_source_tieback_sql(rule: dict, run_key: str, meta_db: str) -> str:
+def _tieback_scope_clause(scope_params: dict, alias: str) -> str:
+    """
+    "AND {alias}.col1 = 'v1' AND {alias}.col2 = 'v2' ..." from scope_params
+    -- the same run_params/extra_filters merge _compute_total() uses to
+    scope its total-record denominator (see execute_rule()'s STEP 2),
+    reproduced here so build_source_tieback_sql()'s WHERE clause pulls
+    exactly the same scoped input rows the rule actually evaluated, not
+    just any live row that happens to share a src_key_value. Without this,
+    a src_key_cols value that isn't a true table-wide unique key (only
+    unique WITHIN one run's run_params/extra_filters scope -- e.g. a
+    claim_id that repeats across batch_id values) can silently tie back to
+    the WRONG row once other batches/scopes exist in the source table.
+
+    Column names are qualified with "{alias}." so a scope_params key that
+    happens to also name a gre_exceptions column (unlikely, but the join
+    already has two tables in scope here) is never ambiguous.
+
+    No identifier validation here (unlike build_extra_filters_clause()'s
+    extra_filters-only check): every key in scope_params already reached
+    the source database successfully as a literal column name via
+    _build_total_query()'s identical unquoted interpolation -- STEP 2 in
+    execute_rule() always runs, and fails the whole rule, before this
+    function is ever called, so a key that ISN'T a real column never
+    survives to reach here.
+    """
+    if not scope_params:
+        return ""
+    clauses = [
+        f"{alias}.{key} = '{_escape_sql_literal(value)}'"
+        for key, value in sorted(scope_params.items())
+    ]
+    return "AND " + " AND ".join(clauses)
+
+
+def build_source_tieback_sql(rule: dict, run_key: str, meta_db: str, scope_params: dict = None) -> str:
     """
     Build (never execute) the SQL TEXT that joins this rule's source table
     directly to its gre_exceptions rows for `run_key`, parsing
@@ -344,6 +378,19 @@ def build_source_tieback_sql(rule: dict, run_key: str, meta_db: str) -> str:
     pull it straight out of gre_results and paste it into Toad/whatever
     SQL client, without having to re-derive src_key_cols/database_name/
     src_tbl_nm/rule_id by hand every time.
+
+    scope_params : the SAME run_params/extra_filters merge that scoped
+        this attempt's total-record count (execute_rule()'s STEP 2's
+        total_params/fallback_params) -- applied here as additional
+        "s.col = 'val'" AND conditions (see _tieback_scope_clause()) so
+        the generated SQL reproduces the EXACT input scope the rule
+        evaluated, not merely "any live row with this src_key_value."
+        This matters whenever src_key_cols is only unique WITHIN one
+        run's scope (e.g. claim_id unique per batch_id, but not across
+        batches) -- the src-key join alone can otherwise match a
+        same-keyed row from a different batch/scope entirely. Optional;
+        omitted/empty means the join is scoped by src_key_value alone,
+        same as before.
 
     Only meaningful for a rule whose source table is itself a durable
     object an analyst can query LATER, independent of this Python
@@ -404,11 +451,12 @@ def build_source_tieback_sql(rule: dict, run_key: str, meta_db: str) -> str:
             f"OR ({value_expr} <> 'NULL' AND s.{col} = {value_expr}))"
         )
     where_join = "\n  AND ".join(conditions)
+    scope_clause = _tieback_scope_clause(scope_params, "s")
 
     return (
         f"SELECT s.*, e.record_id AS _record_id, e.rule_id AS _rule_id, e.rule_nm AS _rule_nm,\n"
         f"       e.process_name AS _process_name, e.project_name AS _project_name,\n"
-        f"       e.src_key_value AS _src_key_value, e.issue_desc AS _issue_desc,\n"
+        f"       e.src_key_value AS _src_key_value,\n"
         f"       e.exception_flag AS _exception_flag\n"
         f"FROM {src_table} s\n"
         f"JOIN {meta_db}.gre_exceptions e\n"
@@ -416,6 +464,7 @@ def build_source_tieback_sql(rule: dict, run_key: str, meta_db: str) -> str:
         f"WHERE e.rule_id = {rule_id}\n"
         f"  AND e.run_key = '{_escape_sql_literal(run_key)}'\n"
         f"  AND e.etl_is_curr_ind = 'Y'"
+        + (f"\n  {scope_clause}" if scope_clause else "")
     )
 
 
@@ -690,7 +739,6 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
     for nk, row in new_rows_by_key.items():
         existing_row = existing_by_key.get(nk)
         if existing_row is None:
-            issue_desc = f"Rule '{rule.get('rule_nm')}' violated (src_key={nk})"
             to_insert.append([
                 run_id,
                 rule_id,
@@ -702,7 +750,6 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
                 rule.get("rule_variant"),
                 rule.get("element_name"),
                 rule.get("sql_dialect"),
-                issue_desc,
                 run_key,
                 nk,
                 rule.get("rule_nm"),
@@ -724,9 +771,9 @@ def _write_exceptions(meta_conn, meta_db: str, rule: dict, run_id: str, run_key:
     insert_sql = f"""
         INSERT INTO {meta_db}.gre_exceptions (
             run_id, rule_id, database_name, src_tbl_nm, project_name, process_name,
-            rule_group, rule_variant, element_name, source_name, issue_desc, run_key,
+            rule_group, rule_variant, element_name, source_name, run_key,
             src_key_value, rule_nm, dgr_nbr, universe_version, run_type, batch_schedule
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     inserted = bulk_insert_or_skip(meta_conn, insert_sql, to_insert) if to_insert else 0
 
@@ -1211,6 +1258,12 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     # successfully, so this query is expected to succeed too.
     total_params = {**run_params, **(extra_filters or {})}
     extra_filters_only = extra_filters or None
+    # Tracks whichever params set actually succeeded against the source
+    # DB below (total_params, or the run_params-dropped fallback) -- see
+    # build_source_tieback_sql()'s scope_params for why the tie-back SQL
+    # must reuse this exact, already-validated scope rather than blindly
+    # re-merging run_params/extra_filters itself.
+    tieback_scope_params = total_params
     try:
         total = _compute_total(db_conn, rule, total_params, total_cache=total_cache)
     except Exception as exc:
@@ -1229,6 +1282,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
         fallback_params = extra_filters_only or {}
         try:
             total = _compute_total(db_conn, rule, fallback_params, total_cache=total_cache)
+            tieback_scope_params = fallback_params
             logger.warning(
                 "Rule %s: total-record count failed when scoped by run_params %s (%s) -- "
                 "retried WITHOUT run_params (extra_filters only: %s) and got total=%s. "
@@ -1289,7 +1343,8 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     source_tieback_sql = None
     if failed > 0:
         try:
-            source_tieback_sql = build_source_tieback_sql(rule, run_key, meta_db)
+            source_tieback_sql = build_source_tieback_sql(rule, run_key, meta_db,
+                                                            scope_params=tieback_scope_params)
         except Exception as exc:
             logger.warning(
                 "Rule %s: source_tieback_sql generation failed (non-fatal): %s",

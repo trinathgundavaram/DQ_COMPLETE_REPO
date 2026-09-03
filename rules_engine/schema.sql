@@ -227,15 +227,20 @@ ON {{META_DB}}.gre_rules;
 
 
 -- ── 2. gre_exceptions -- data findings, engine-populated only ─────────────
--- Column shape is the legacy INSERT list verbatim (record_id, rule_id,
--- src_tbl_nm, element_name, source_name, issue_desc, exception_flag,
--- exception_approver, run_key, etl_is_curr_ind, etl_load_dt,
--- etl_last_updt_dt) plus run_id, database_name, and src_key_value, which
--- the legacy shape didn't need but this engine's idempotency and source
--- tie-back do. rule_nm/dgr_nbr/universe_version/run_type/batch_schedule/
--- last_updated_by/last_updated_datetime below extend this further to
--- match a project's own rule-catalog/audit vocabulary (see gre_rules'
--- design notes) -- purely descriptive, never read by engine logic.
+-- Column shape is the legacy INSERT list (record_id, rule_id, src_tbl_nm,
+-- element_name, source_name, exception_flag, exception_approver, run_key,
+-- etl_is_curr_ind, etl_load_dt, etl_last_updt_dt) minus issue_desc --
+-- deliberately dropped, not carried forward: a per-finding text
+-- description duplicated this engine's own rule catalog (gre_rules) with
+-- nothing keeping the two in sync, and every consumer of "what does this
+-- exception mean" can join back to gre_rules.rule_nm/business_rule/
+-- rule_description instead -- plus run_id, database_name, and
+-- src_key_value, which the legacy shape didn't need but this engine's
+-- idempotency and source tie-back do. rule_nm/dgr_nbr/universe_version/
+-- run_type/batch_schedule/last_updated_by/last_updated_datetime below
+-- extend this further to match a project's own rule-catalog/audit
+-- vocabulary (see gre_rules' design notes) -- purely descriptive, never
+-- read by engine logic.
 --
 -- Deliberately does NOT store the violating row's own data -- only enough
 -- to re-identify it (database_name/src_tbl_nm/source_name +
@@ -272,7 +277,6 @@ CREATE MULTISET TABLE {{META_DB}}.gre_exceptions (
     element_name          VARCHAR(200),
     -- ── Finding detail columns below -- what was found and how to re-find it.
     source_name           VARCHAR(100),
-    issue_desc            VARCHAR(2000),
     src_key_value         VARCHAR(1000) NOT NULL,       -- built from rule.src_key_cols
     -- ── Rule-catalog descriptive columns below -- see comment above.
     dgr_nbr               VARCHAR(50),                  -- copied from gre_rules.dgr_nbr

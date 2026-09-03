@@ -119,7 +119,7 @@ def _conn():
         CREATE TABLE gre_exceptions (
             record_id BIGINT, run_id VARCHAR, rule_id INTEGER, database_name VARCHAR, src_tbl_nm VARCHAR,
             project_name VARCHAR, process_name VARCHAR, rule_group VARCHAR, rule_variant VARCHAR,
-            element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
+            element_name VARCHAR, source_name VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
             run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
             etl_load_dt DATE, etl_last_updt_dt TIMESTAMP,

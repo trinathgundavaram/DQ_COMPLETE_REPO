@@ -101,7 +101,7 @@ def _conn():
             record_id BIGINT DEFAULT nextval('gre_exceptions_seq'),
             run_id VARCHAR, rule_id INTEGER, database_name VARCHAR, src_tbl_nm VARCHAR,
             project_name VARCHAR, process_name VARCHAR, rule_group VARCHAR, rule_variant VARCHAR,
-            element_name VARCHAR, source_name VARCHAR, issue_desc VARCHAR,
+            element_name VARCHAR, source_name VARCHAR,
             exception_flag VARCHAR DEFAULT 'OPEN', exception_approver VARCHAR,
             run_key VARCHAR, etl_is_curr_ind VARCHAR DEFAULT 'Y',
             etl_load_dt DATE, etl_last_updt_dt TIMESTAMP,
@@ -360,6 +360,33 @@ def test_build_source_tieback_sql_escapes_run_key():
     assert "run_key = 'O''BRIEN'" in sql   # single quote doubled, not left unescaped
 
 
+def test_build_source_tieback_sql_applies_scope_params():
+    # scope_params reproduces the run_params/extra_filters scope that
+    # actually bounded this attempt (execute_rule()'s STEP 2 total_params)
+    # -- without this, the src-key join alone could tie back to a
+    # DIFFERENT row sharing the same src_key_value outside that scope
+    # (e.g. the same claim_id in a different batch_id).
+    rule = _rule(database_name="db", src_tbl_nm="claims", src_key_cols="claim_id", sql_dialect="teradata")
+    sql = build_source_tieback_sql(rule, "B1", "META_DB",
+                                    scope_params={"batch_id": "B1", "run_ty": "MNT"})
+    assert "s.batch_id = 'B1'" in sql
+    assert "s.run_ty = 'MNT'" in sql
+
+
+def test_build_source_tieback_sql_scope_params_escaped_and_optional():
+    rule = _rule(database_name="db", src_tbl_nm="claims", src_key_cols="claim_id", sql_dialect="teradata")
+
+    sql_escaped = build_source_tieback_sql(rule, "B1", "META_DB", scope_params={"region": "O'BRIEN"})
+    assert "s.region = 'O''BRIEN'" in sql_escaped
+
+    # No scope_params (or empty) -- behavior unchanged from before this
+    # parameter existed: src-key join only, no extra AND conditions.
+    sql_none = build_source_tieback_sql(rule, "B1", "META_DB")
+    sql_empty = build_source_tieback_sql(rule, "B1", "META_DB", scope_params={})
+    assert sql_none == sql_empty
+    assert "s.claim_id = STRTOK" in sql_none
+
+
 def test_execute_rule_writes_source_tieback_sql_onto_gre_results():
     conn = _conn()
     rule = _rule(threshold_pct=25)   # 2/4 = 50% > 25% -> FAIL, write_result=True
@@ -373,6 +400,38 @@ def test_execute_rule_writes_source_tieback_sql_onto_gre_results():
     assert "e.rule_id = 1" in sql
     assert "e.run_key = 'B1'" in sql
     assert "s.claim_id = STRTOK(e.src_key_value, '=', 2)" in sql
+    # run_params (batch_id) is a real column and scopes this attempt's
+    # total-record count -- the tie-back SQL must reproduce that same
+    # scope, not just the bare src-key join, so an analyst re-running it
+    # gets exactly the rows this rule actually evaluated.
+    assert "s.batch_id = 'B1'" in sql
+
+
+def test_execute_rule_source_tieback_sql_includes_extra_filters_scope():
+    # Same scenario as test_execute_rule_extra_filters_brace_marker_narrows_results
+    # (claims has no run_ty column of its own -- proves the marker-splice
+    # path works), but asserting on source_tieback_sql instead of
+    # executed_sql: the generated tie-back SQL must carry the SAME
+    # run_ty='MNT' scope the scan itself was narrowed by, or re-running it
+    # later could match a since-added row outside that scope.
+    conn = _conn()
+    conn.execute("ALTER TABLE claims ADD COLUMN run_ty VARCHAR")
+    conn.execute("UPDATE claims SET run_ty = 'MNT' WHERE batch_id = 'B1'")
+
+    rule = _rule(
+        rule_syntax="SELECT claim_id, denial_reason FROM claims "
+                    "WHERE denial_reason IS NULL AND batch_id = '{batch_id}' {extra_filters}",
+        threshold_pct=25,
+    )
+    status = execute_rule(rule, _Adapter(conn), conn, "RUN1", "B1", {"batch_id": "B1"}, META_DB,
+                          extra_filters={"run_ty": "MNT"})
+    assert status == "SUCCESS"
+
+    results = execute_query(conn, "SELECT * FROM gre_results WHERE rule_id = 1 AND run_key = 'B1'")
+    sql = results[0]["source_tieback_sql"]
+    assert sql is not None
+    assert "s.batch_id = 'B1'" in sql
+    assert "s.run_ty = 'MNT'" in sql
 
 
 def test_execute_rule_keeps_attempt_history_on_rerun():

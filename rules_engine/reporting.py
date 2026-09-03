@@ -55,8 +55,9 @@ def get_records_for_result(meta_conn, meta_db: str, rule_id, run_key: str) -> li
     (rule_id, run_key), filtered to the current record version.
 
     This returns gre_exceptions' OWN columns only (src_key_value,
-    issue_desc, ...) -- not the source record itself. For the full source
-    row behind each of these, see get_source_records_for_rule() below.
+    exception_flag, ...) -- not the source record itself. For the full
+    source row behind each of these, see get_source_records_for_rule()
+    below.
     """
     return execute_query(
         meta_conn,
@@ -141,7 +142,6 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, run_key: s
         _record_id           gre_exceptions.record_id, to cite back to it
         _rule_id              the rule_id passed in
         _src_key_value        the same key gre_exceptions stored
-        _issue_desc            gre_exceptions.issue_desc
         _exception_flag         gre_exceptions.exception_flag (compliance
                                  disposition -- 'OPEN' etc.)
 
@@ -160,7 +160,7 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, run_key: s
         meta_conn,
         f"""
         SELECT record_id, src_key_value, database_name, src_tbl_nm, source_name,
-               issue_desc, exception_flag, rule_nm, process_name, project_name
+               exception_flag, rule_nm, process_name, project_name
         FROM {meta_db}.gre_exceptions
         WHERE rule_id = ? AND run_key = ? AND etl_is_curr_ind = 'Y'
         """,
@@ -228,7 +228,6 @@ def get_source_records_for_rule(cf, meta_conn, meta_db: str, rule_id, run_key: s
                 merged["_process_name"] = exc.get("process_name") if exc else None
                 merged["_project_name"] = exc.get("project_name") if exc else None
                 merged["_src_key_value"] = nk
-                merged["_issue_desc"] = exc.get("issue_desc") if exc else None
                 merged["_exception_flag"] = exc.get("exception_flag") if exc else None
                 records.append(merged)
 
@@ -266,8 +265,8 @@ def get_source_records_for_process(cf, meta_conn, meta_db: str, process_name: st
 
     Returns the concatenation of get_source_records_for_rule()'s own
     per-rule lists (each row already carries _rule_id/_rule_nm/
-    _process_name/_project_name/_src_key_value/_issue_desc/
-    _exception_flag -- see that function's docstring) -- one row per
+    _process_name/_project_name/_src_key_value/_exception_flag -- see
+    that function's docstring) -- one row per
     source record per rule it failed, so a record failing 3 rules this
     run appears 3 times, once per rule, each tagged with which one.
     """

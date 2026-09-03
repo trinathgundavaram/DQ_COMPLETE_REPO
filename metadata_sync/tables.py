@@ -56,7 +56,7 @@ GRE_EXCEPTIONS = {
     "columns": [
         "record_id", "run_id", "run_key", "rule_id", "rule_nm", "rule_group",
         "rule_variant", "database_name", "src_tbl_nm", "project_name", "process_name",
-        "element_name", "source_name", "issue_desc", "src_key_value", "dgr_nbr",
+        "element_name", "source_name", "src_key_value", "dgr_nbr",
         "universe_version", "run_type", "batch_schedule", "exception_flag",
         "exception_approver", "etl_is_curr_ind", "etl_load_dt", "etl_last_updt_dt",
         "load_datetime", "last_updated_by", "last_updated_datetime",
