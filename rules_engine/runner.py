@@ -59,6 +59,34 @@ from rules_engine.parallel import build_pools, close_pools
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Shared entry-point guards -- run_rule_group()/run_all_active_groups()/
+# run_by_process_name()/run_by_scope() each open with the same two checks
+# (default an unpassed run_key, fail loudly on an unavailable meta_conn).
+# Factored out so the four copies can't silently drift apart; neither
+# helper hardcodes ITS caller's own wording -- each call site still passes
+# its own name/message, so what a caller sees is byte-for-byte unchanged
+# from before this was factored out (run_rule_group()'s meta_conn message
+# is deliberately shorter than the other three's -- see those call sites).
+# ---------------------------------------------------------------------------
+
+def _resolve_run_key(run_key: str, caller: str) -> str:
+    """run_key if given; else today's date (db_ops.py::default_run_key()),
+    logged at INFO under `caller`'s own name."""
+    if run_key:
+        return run_key
+    run_key = _default_run_key()
+    logger.info("%s: no run_key passed -- defaulting to today's date, run_key=%s.", caller, run_key)
+    return run_key
+
+
+def _require_meta_conn(meta_conn, message: str):
+    """meta_conn unchanged if not None; else raise RuntimeError(message)."""
+    if meta_conn is None:
+        raise RuntimeError(message)
+    return meta_conn
+
+
 def generate_run_id(rule_group: str, run_key: str) -> str:
     """
     Plain 2-part run_id -- delegates to rules_engine/db_ops.py::generate_run_id()
@@ -552,16 +580,13 @@ def run_rule_group(
     if cf is None:
         raise RuntimeError("run_rule_group() needs a loaded ConnectionFactory (cf=...).")
 
-    if not run_key:
-        run_key = _default_run_key()
-        logger.info("run_rule_group: no run_key passed -- defaulting to today's date, run_key=%s.", run_key)
+    run_key = _resolve_run_key(run_key, "run_rule_group")
 
     meta_db = meta_db or gre_config.get_meta_db()
     meta_conn = meta_conn or cf.get(gre_config.get_meta_connection_name())
-    if meta_conn is None:
-        raise RuntimeError(
-            f"Metadata connection '{gre_config.get_meta_connection_name()}' unavailable."
-        )
+    meta_conn = _require_meta_conn(
+        meta_conn, f"Metadata connection '{gre_config.get_meta_connection_name()}' unavailable."
+    )
 
     # Logged at INFO (not DEBUG) precisely because it's exactly what's
     # needed to catch a run silently pointed at the wrong Teradata
@@ -832,21 +857,19 @@ def run_all_active_groups(
     so a caller can inspect or aggregate per-group outcomes; a group that
     errors doesn't stop the remaining groups from running.
     """
-    if not run_key:
-        run_key = _default_run_key()
-        logger.info("run_all_active_groups: no run_key passed -- defaulting to today's date, run_key=%s.", run_key)
+    run_key = _resolve_run_key(run_key, "run_all_active_groups")
 
     # Same guard as run_by_process_name()/run_by_scope() -- this function
     # takes meta_conn as a plain positional argument rather than resolving
     # it itself, so a caller passing through a None they got from
     # cf.get() (e.g. a failed metadata connection) hits the same
     # confusing AttributeError deep inside db_ops.py without this check.
-    if meta_conn is None:
-        raise RuntimeError(
-            f"Metadata connection '{gre_config.get_meta_connection_name()}' unavailable -- "
-            "check its credentials/env vars (see the log above for the specific connection "
-            "error) before retrying."
-        )
+    meta_conn = _require_meta_conn(
+        meta_conn,
+        f"Metadata connection '{gre_config.get_meta_connection_name()}' unavailable -- "
+        "check its credentials/env vars (see the log above for the specific connection "
+        "error) before retrying.",
+    )
 
     rule_groups = discover_rule_groups(meta_conn, meta_db, project_name=project_name,
                                         process_name=process_name)
@@ -941,9 +964,7 @@ def run_by_process_name(
     if cf is None:
         raise RuntimeError("run_by_process_name() needs a loaded ConnectionFactory (cf=...).")
 
-    if not run_key:
-        run_key = _default_run_key()
-        logger.info("run_by_process_name: no run_key passed -- defaulting to today's date, run_key=%s.", run_key)
+    run_key = _resolve_run_key(run_key, "run_by_process_name")
 
     meta_conn = meta_conn or cf.get(gre_config.get_meta_connection_name())
     meta_db = meta_db or gre_config.get_meta_db()
@@ -958,12 +979,12 @@ def run_by_process_name(
     # connection itself never came up. run_rule_group() already guards
     # this identically -- mirrored here since this function resolves
     # meta_conn itself, before ever reaching that guard.
-    if meta_conn is None:
-        raise RuntimeError(
-            f"Metadata connection '{gre_config.get_meta_connection_name()}' unavailable -- "
-            "check its credentials/env vars (see the log above for the specific connection "
-            "error) before retrying."
-        )
+    meta_conn = _require_meta_conn(
+        meta_conn,
+        f"Metadata connection '{gre_config.get_meta_connection_name()}' unavailable -- "
+        "check its credentials/env vars (see the log above for the specific connection "
+        "error) before retrying.",
+    )
 
     rule_groups = discover_rule_groups(meta_conn, meta_db, project_name=project_name,
                                         process_name=process_name)
@@ -1054,9 +1075,7 @@ def run_by_scope(
             "run is actually intended."
         )
 
-    if not run_key:
-        run_key = _default_run_key()
-        logger.info("run_by_scope: no run_key passed -- defaulting to today's date, run_key=%s.", run_key)
+    run_key = _resolve_run_key(run_key, "run_by_scope")
 
     meta_conn = meta_conn or cf.get(gre_config.get_meta_connection_name())
     meta_db = meta_db or gre_config.get_meta_db()
@@ -1068,12 +1087,12 @@ def run_by_scope(
     # run_rule_group(), itself already guarded) and the discovery path
     # fail with the same clear message instead of an AttributeError deep
     # inside db_ops.py.
-    if meta_conn is None:
-        raise RuntimeError(
-            f"Metadata connection '{gre_config.get_meta_connection_name()}' unavailable -- "
-            "check its credentials/env vars (see the log above for the specific connection "
-            "error) before retrying."
-        )
+    meta_conn = _require_meta_conn(
+        meta_conn,
+        f"Metadata connection '{gre_config.get_meta_connection_name()}' unavailable -- "
+        "check its credentials/env vars (see the log above for the specific connection "
+        "error) before retrying.",
+    )
 
     if rule_group:
         logger.info(
