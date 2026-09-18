@@ -1,0 +1,28 @@
+# Python >= 3.8 required
+#
+# Trimmed to exactly what THIS folder needs: rules_engine/ + db/
+# (connection_factory.py) with ONLY Teradata + Postgres connectivity.
+# File/S3 source support (duckdb, pandas, openpyxl, pyarrow, boto3) has
+# been removed from this package -- see db/connection_factory.py's
+# module docstring. No sampling/, metadata_sync/, or
+# report_source_records.py dependencies are pulled in here either --
+# this folder packages the rules framework only (see README.md).
+#
+# In Airflow, these install into the Airflow worker's environment
+# (worker image / requirements, or a venv the DAG's tasks run in) --
+# not into Airflow's own core dependency set.
+
+# ── Teradata (metadata store + Teradata-sourced rules) ────────────────────────
+teradatasql>=17.20.0.0
+
+# ── PostgreSQL / AWS RDS & Aurora (PostgreSQL-compatible) sources ────────────
+psycopg2-binary>=2.9.0
+
+# ── Resilience ─────────────────────────────────────────────────────────────
+tenacity>=8.2.0            # exponential-backoff retry for transient source-DB errors
+
+# ── Local/manual dev use of run_rules.py's CLI outside Airflow (optional) ───
+# Not needed for the Airflow DAG path (gre_airflow/gre_rules_task.py sets
+# env vars from Airflow Connections/Variables, never from a .env file) --
+# keep this only if you also run run_rules.py by hand from this folder.
+python-dotenv>=1.0.0
