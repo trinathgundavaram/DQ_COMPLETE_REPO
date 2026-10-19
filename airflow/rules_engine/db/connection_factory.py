@@ -13,17 +13,14 @@ A rule (or sampling config) selects its source by type
 ConnectionFactory hands back that type's single adapter -- unchanged
 from the original design, just with fewer types registered.
 
-FileAdapter/S3Adapter below are intentionally left as disabled stub
-classes rather than deleted outright: rules_engine/parallel.py (an
-unmodified copy of the original rules_engine/, per this package's "no
-changes inside rules_engine/" rule) imports FileAdapter and S3Adapter by
-name and does `isinstance(adapter, (FileAdapter, S3Adapter))` checks.
-Deleting the classes would break that import and force a change inside
-rules_engine/ itself. The stubs satisfy that import/isinstance contract
-but can never be built or produce a working connection here -- neither
-is registered in _TYPE_MAP, and calling .build() on either raises
-NotImplementedError immediately, so a rule pointed at a file/s3 source
-fails loudly and immediately rather than silently doing nothing.
+FileAdapter (source_type 'file') is supported: CSV/TSV/Excel/Parquet read
+in memory (DuckDB if installed, else built-in sqlite3), from local disk or downloaded from a NAS (SMB share, see
+db/nas_store.py). A rule uses it by setting sql_dialect='file',
+database_name=<folder> and src_tbl_nm=<filename>.
+
+S3Adapter below is still a disabled stub (never registered in _TYPE_MAP;
+.build() raises NotImplementedError), kept only because
+rules_engine/parallel.py imports it by name for isinstance() checks.
 
 Adapter interface (SourceAdapter ABC)
 --------------------------------------
@@ -55,9 +52,17 @@ Usage
 
 import logging
 import os
+import csv
+import re
+import shutil
+import sqlite3
+import tempfile
 import threading
+from pathlib import Path
 from abc import ABC, abstractmethod
 from typing import Dict, Optional
+
+from db import nas_store
 
 logger = logging.getLogger(__name__)
 
@@ -221,43 +226,194 @@ class PostgresAdapter(SourceAdapter):
 
 
 # =============================================================================
-# Disabled stubs -- file/S3 connectivity removed from this Airflow package.
+# Flat files (CSV/TSV/Excel/Parquet) -- DuckDB + pandas. The file is either on
+# local/mounted disk or on a NAS (SMB share), in which case it is downloaded
+# to a temp folder first (see db/nas_store.py).
 #
-# Kept ONLY so rules_engine/parallel.py's unmodified
-# `from db.connection_factory import FileAdapter, S3Adapter` and its
-# isinstance() checks keep working without touching rules_engine/ itself.
-# Neither type is registered in _TYPE_MAP below, so ConnectionFactory
-# never builds one on its own; .build() also raises immediately, so a
-# rule that's still configured for a 'file'/'s3' source_type fails loudly
-# instead of silently doing nothing.
+# S3Adapter below is still a disabled stub (kept only for parallel.py's import
+# and isinstance checks).
 # =============================================================================
 
+# Engine that runs rule SQL against the in-memory file data. DuckDB if it is
+# installed, else Python's built-in sqlite3 (no install needed). Force one with
+# GRE_FILE_ENGINE=duckdb|sqlite. pandas is optional: only .xlsx/.xls/.parquet
+# need it (CSV/TSV are read with the csv module).
+try:
+    import duckdb
+except ImportError:
+    duckdb = None
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
+
+def _file_engine() -> str:
+    want = (os.getenv("GRE_FILE_ENGINE") or "").lower()
+    if want == "duckdb" and (duckdb is None or pd is None):
+        raise ImportError("GRE_FILE_ENGINE=duckdb needs duckdb and pandas installed.")
+    if want in ("duckdb", "sqlite"):
+        return want
+    return "duckdb" if duckdb is not None and pd is not None else "sqlite"
+
+
+_MAX_FILE_SIZE_MB = int(os.getenv("GRE_MAX_FILE_SIZE_MB", "500"))
+_FILE_ENCODING = os.getenv("GRE_FILE_ENCODING", "utf-8")
+
+
+def _view_name(src_tbl_nm: str) -> str:
+    """Safe SQL identifier for a file's DuckDB view ("claims.csv" -> "claims"); rule_syntax references this name."""
+    suffix = Path(src_tbl_nm).suffix
+    base = src_tbl_nm[: -len(suffix)] if suffix else src_tbl_nm
+    cleaned = re.sub(r"[^0-9a-zA-Z_]", "_", base) or "t"
+    return f"t_{cleaned}" if cleaned[0].isdigit() else cleaned
+
+
+def _convert(values: list):
+    """int/float column if every non-empty value parses, else text; '' -> None."""
+    vals = [v if v != "" else None for v in values]
+    for cast in (int, float):
+        try:
+            return [None if v is None else cast(v) for v in vals]
+        except ValueError:
+            continue
+    return vals
+
+
+def _read_file(full_path: str):
+    """Read one file. Returns (columns, column_lists) with lower-cased column names."""
+    ext = Path(full_path).suffix.lower()
+    if _MAX_FILE_SIZE_MB > 0:
+        size_mb = Path(full_path).stat().st_size / (1024 * 1024)
+        if size_mb > _MAX_FILE_SIZE_MB:
+            raise ValueError(f"File '{full_path}' is {size_mb:.1f} MB, exceeds GRE_MAX_FILE_SIZE_MB={_MAX_FILE_SIZE_MB}.")
+    if ext in (".csv", ".tsv"):
+        with open(full_path, newline="", encoding=_FILE_ENCODING) as fh:
+            reader = csv.reader(fh, delimiter="\t" if ext == ".tsv" else ",")
+            header = [h.strip().lower() for h in next(reader)]
+            data = [r + [""] * (len(header) - len(r)) for r in reader]
+        return header, [_convert([r[i] for r in data]) for i in range(len(header))]
+    if ext in (".xlsx", ".xls", ".parquet"):
+        if pd is None:
+            raise ImportError(f"pandas is required to read {ext} files (CSV/TSV need nothing extra).")
+        df = pd.read_parquet(full_path) if ext == ".parquet" else pd.read_excel(full_path)
+        df = df.astype(object).where(df.notna(), None)
+        return [str(c).lower() for c in df.columns], [df[c].tolist() for c in df.columns]
+    raise ValueError(f"Unsupported file extension '{ext}'. Supported: .csv, .tsv, .xlsx, .xls, .parquet")
+
+
 class FileAdapter(SourceAdapter):
-    """Disabled in this package -- Teradata + Postgres connectivity only."""
+    """
+    A rule with sql_dialect='file' drives its own path from gre_rules:
+        database_name -> the folder the file is in: a local/mounted directory
+                          (absolute, or relative to FILE_BASE_PATH), or a NAS
+                          folder -- //server/share/folder, \\\\server\\share\\folder,
+                          smb://server/share/folder or nas://share/folder
+        src_tbl_nm    -> the filename (e.g. "claims.csv")
+    prepare(rule) loads the file once into a shared DataFrame registry, then
+    registers it as a DuckDB view named _view_name(src_tbl_nm) in each
+    thread's own connection. rule_syntax references that view name.
+    """
 
     source_type = "file"
 
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError(
-            "File source connectivity is not included in this Airflow package "
-            "(Teradata + Postgres only)."
-        )
+    def __init__(self, base_path: str = ""):
+        self._engine = _file_engine()
+        self._base_path = base_path.rstrip("/") if base_path else ""
+        self._df_registry: dict = {}
+        self._registry_lock = threading.Lock()
+        self._local = threading.local()
+        self._tmp_dir = None
 
     def cursor(self):
-        raise NotImplementedError
+        return self._get_thread_conn().cursor()
 
     def commit(self):
-        raise NotImplementedError
+        pass   # read-only
 
     def close(self):
-        raise NotImplementedError
+        if hasattr(self._local, "conn"):
+            try:
+                self._local.conn.close()
+            except Exception:
+                pass
+            del self._local.conn
+        if self._tmp_dir:
+            shutil.rmtree(self._tmp_dir, ignore_errors=True)
+            self._tmp_dir = None
+
+    def ping(self) -> bool:
+        try:
+            self._get_thread_conn().execute("SELECT 1")
+            return True
+        except Exception:
+            return False
+
+    def prepare(self, rule: dict) -> None:
+        src_tbl_nm = (rule.get("src_tbl_nm") or "").strip()
+        if not src_tbl_nm:
+            raise ValueError("src_tbl_nm is empty -- cannot prepare file source.")
+        view_name = _view_name(src_tbl_nm)
+
+        if view_name not in self._df_registry:
+            with self._registry_lock:
+                if view_name not in self._df_registry:
+                    full_path = self._fetch(src_tbl_nm, (rule.get("database_name") or "").strip())
+                    cols, data = _read_file(full_path)
+                    self._df_registry[view_name] = (cols, data)
+                    logger.info("File loaded: %s -> view '%s' (%d rows, engine=%s)", full_path, view_name,
+                                len(data[0]) if data else 0, self._engine)
+
+        self._materialize(view_name)
+
+    def qualified_name(self, rule: dict) -> str:
+        return _view_name((rule.get("src_tbl_nm") or "").strip())
 
     @classmethod
     def build(cls) -> "FileAdapter":
-        raise NotImplementedError(
-            "File source connectivity is not included in this Airflow package "
-            "(Teradata + Postgres only)."
-        )
+        return cls(base_path=os.getenv("FILE_BASE_PATH", ""))
+
+    def _get_thread_conn(self):
+        if not hasattr(self._local, "conn"):
+            conn = duckdb.connect(":memory:") if self._engine == "duckdb" else sqlite3.connect(":memory:")
+            self._local.conn = conn
+            self._local.registered = set()
+            for vname in self._df_registry:
+                self._materialize(vname)
+        return self._local.conn
+
+    def _materialize(self, view_name: str) -> None:
+        """
+        Make the file's data a table in this thread's in-memory database. A table
+        (not DuckDB's conn.register()) because cursor() hands out a duplicate
+        connection, which cannot see another connection's registered DataFrames.
+        """
+        conn = self._get_thread_conn()
+        if view_name in self._local.registered:
+            return
+        cols, data = self._df_registry[view_name]
+        if self._engine == "duckdb":
+            df = pd.DataFrame(dict(zip(cols, data)))   # noqa: F841 -- read by DuckDB's replacement scan
+            conn.execute(f'CREATE OR REPLACE TABLE "{view_name}" AS SELECT * FROM df')
+        else:
+            conn.execute(f'DROP TABLE IF EXISTS "{view_name}"')
+            conn.execute(f'CREATE TABLE "{view_name}" ({", ".join(chr(34) + c + chr(34) for c in cols)})')
+            conn.executemany(f'INSERT INTO "{view_name}" VALUES ({",".join("?" * len(cols))})', zip(*data))
+        self._local.registered.add(view_name)
+
+    def _fetch(self, src_tbl_nm: str, database_name: str) -> str:
+        """Local path of the file; a NAS file is downloaded into a temp folder first."""
+        if nas_store.is_nas_uri(database_name):
+            if self._tmp_dir is None:
+                self._tmp_dir = tempfile.mkdtemp(prefix="gre_nas_")
+            dest = os.path.join(self._tmp_dir, os.path.basename(src_tbl_nm))
+            nas_store.download(database_name, src_tbl_nm, dest)
+            logger.info("Downloaded from NAS: %s/%s", database_name, src_tbl_nm)
+            return dest
+        if os.path.isabs(src_tbl_nm):
+            return src_tbl_nm
+        base = database_name or self._base_path
+        return f"{base.rstrip('/')}/{src_tbl_nm}" if base else src_tbl_nm
 
 
 class S3Adapter(SourceAdapter):
@@ -293,6 +449,7 @@ class S3Adapter(SourceAdapter):
 # =============================================================================
 
 _TYPE_MAP = {
+    "file": FileAdapter,
     "teradata": TeradataAdapter,
     "postgres": PostgresAdapter,
 }

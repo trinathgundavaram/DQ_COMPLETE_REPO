@@ -18,6 +18,15 @@ teradatasql>=17.20.0.0
 # ── PostgreSQL / AWS RDS & Aurora (PostgreSQL-compatible) sources ────────────
 psycopg2-binary>=2.9.0
 
+# ── File rules (sql_dialect='file'): CSV/TSV/Excel/Parquet via DuckDB, NAS over SMB ──
+smbprotocol>=1.10          # NAS (SMB) download -- the only package CSV/TSV file rules need
+# Optional: duckdb + pandas -> DuckDB engine (richer SQL); pandas + openpyxl/pyarrow -> .xlsx/.parquet files.
+# Without duckdb the file engine falls back to Python's built-in sqlite3.
+# duckdb>=0.9.0
+# pandas>=1.5.0
+# openpyxl>=3.0.0
+# pyarrow>=10.0.0
+
 # ── Resilience ─────────────────────────────────────────────────────────────
 tenacity>=8.2.0            # exponential-backoff retry for transient source-DB errors
 

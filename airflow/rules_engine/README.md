@@ -918,3 +918,19 @@ print(summary["status"], summary["succeeded"], summary["errored"])
 ```
 
 See the repo root README for environment setup (`dev.env`, one connection per source_type, etc.), and its "Running the engines end to end" section for a full worked example wiring up `ConnectionFactory` and calling into both packages.
+
+## Running rules on a file (local or NAS)
+
+Clone the table's rules into a new `rule_group` and set, on each clone:
+
+| column | value |
+|---|---|
+| `sql_dialect` | `file` |
+| `database_name` | the folder: `//server/share/folder`, `smb://server/share/folder`, `nas://share/folder`, or a local directory |
+| `src_tbl_nm` | the file name, e.g. `claims.csv` (`.csv .tsv .xlsx .xls .parquet`) |
+| `rule_syntax` | the same SQL, with `FROM claims` (the file name without extension) in place of `db.table` |
+
+For a NAS folder, add `"nas_connection_id": "gre_nas"` to the Airflow Variable, and create that Airflow
+Connection with the NAS host, login, password and port (default 445). The file is downloaded over SMB
+(same logic as the compliance framework's NAS store), read into memory, and the rules run on it (DuckDB if installed, otherwise Python's built-in sqlite3; set `GRE_FILE_ENGINE=duckdb|sqlite` to force one). Nothing is loaded into Teradata/Postgres. With sqlite, write rule SQL in the common subset (no `QUALIFY`, limited window/date/regex functions); `.xlsx`/`.parquet` need pandas, CSV/TSV need nothing extra.
+Column names are lower-cased. Results go to the usual `gre_results` / `gre_exceptions` tables.

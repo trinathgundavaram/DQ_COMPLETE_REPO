@@ -187,6 +187,24 @@ def _load_postgres_connection(conn_id: str) -> None:
     )
 
 
+def _load_nas_connection(conn_id: str) -> None:
+    """
+    Populate NAS_HOST / NAS_USER / NAS_PASSWORD / NAS_PORT from an Airflow
+    Connection (host/login/password/port) -- read by db/nas_store.py when a
+    rule with sql_dialect='file' points at a NAS folder. Same SMB logic as
+    the compliance framework's NAS connection.
+    """
+    from airflow.hooks.base import BaseHook
+
+    conn = BaseHook.get_connection(conn_id)
+    _set_env("NAS_HOST", conn.host)
+    _set_env("NAS_USER", conn.login)
+    _set_env("NAS_PASSWORD", conn.password)
+    _set_env("NAS_PORT", conn.port)
+    logger.info("Loaded NAS connection '%s': host=%s user=%s (password not logged)",
+                conn_id, conn.host, conn.login)
+
+
 _CONNECTION_LOADERS = {
     "teradata": _load_teradata_connection,
     "postgres": _load_postgres_connection,
@@ -233,6 +251,10 @@ def _load_runtime_variable(variable_key: str) -> dict:
                                                 to "gre_teradata" or
                                                 "gre_postgres" (matching
                                                 connection_type) if omitted.
+
+          "nas_connection_id": "gre_nas",   -> optional -- Airflow Connection (host/login/
+                                                password/port) of the NAS (SMB) holding the
+                                                files for rules with sql_dialect='file'
 
           "environment": "PROD",            -> GRE_ENVIRONMENT
           "meta_db": "GRE_META_PROD",       -> GRE_META_DB
@@ -294,7 +316,7 @@ _ENV_KEYS = {
 
 # Config keys consumed directly by run_gre_rules() -- never forwarded to
 # run_rules() and never treated as a GRE_* env var.
-_CONNECTION_KEYS = ("connection_type", "connection_id")
+_CONNECTION_KEYS = ("connection_type", "connection_id", "nas_connection_id")
 
 _RUN_RULES_KEYS = (
     "project_name", "process_name", "rule_group", "rule_variant",
@@ -387,6 +409,13 @@ def run_gre_rules(
         or _DEFAULT_CONN_ID_BY_TYPE.get(resolved_connection_type)
     )
     _load_source_connection(resolved_connection_type, resolved_connection_id)
+
+    # 2b) Optional NAS connection, for rules that read a file (sql_dialect='file',
+    #     database_name = NAS folder). Only loaded when the Variable/overrides
+    #     name one via "nas_connection_id".
+    nas_connection_id = config.get("nas_connection_id")
+    if nas_connection_id:
+        _load_nas_connection(nas_connection_id)
 
     # 3) Populate the GRE_* env vars the rules engine/config reads.
     for config_key, env_key in _ENV_KEYS.items():
