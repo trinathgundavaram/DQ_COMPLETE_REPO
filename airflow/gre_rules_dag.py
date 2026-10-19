@@ -55,7 +55,7 @@ with DAG(
     catchup=False,
     params=_DAG_PARAMS,
     tags=["gre", "data-quality", "rules-engine"],
-) as dag:
+) as gre_rules_engine_dag:
 
     run_gre_rules_task = PythonOperator(
         task_id="run_gre_rules",
