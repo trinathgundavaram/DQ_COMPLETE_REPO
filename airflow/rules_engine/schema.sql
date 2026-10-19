@@ -1,4 +1,4 @@
-CREATE MULTISET TABLE {{META_DB}}.gre_rules (
+CREATE MULTISET TABLE HSABC_DEV.gre_rules (
     rule_id              INTEGER NOT NULL,
     rule_nm              VARCHAR(500) NOT NULL,
     act_ind              BYTEINT DEFAULT 1,
@@ -48,12 +48,12 @@ CREATE MULTISET TABLE {{META_DB}}.gre_rules (
 PRIMARY INDEX (rule_id);
 
 CREATE INDEX gre_rules_group_variant_ix (rule_group, act_ind, rule_variant)
-ON {{META_DB}}.gre_rules;
+ON HSABC_DEV.gre_rules;
 
 CREATE INDEX gre_rules_project_process_ix (project_name, process_name, act_ind)
-ON {{META_DB}}.gre_rules;
+ON HSABC_DEV.gre_rules;
 
-CREATE MULTISET TABLE {{META_DB}}.gre_exceptions (
+CREATE MULTISET TABLE HSABC_DEV.gre_exceptions (
     record_id            BIGINT GENERATED ALWAYS AS IDENTITY,
     run_id                VARCHAR(200),
     run_key               VARCHAR(100) NOT NULL,
@@ -91,12 +91,12 @@ CREATE MULTISET TABLE {{META_DB}}.gre_exceptions (
 PRIMARY INDEX (record_id);
 
 CREATE UNIQUE INDEX gre_exceptions_uix (rule_id, run_key, src_key_value)
-ON {{META_DB}}.gre_exceptions;
+ON HSABC_DEV.gre_exceptions;
 
 CREATE INDEX gre_exceptions_rule_run_key_ix (rule_id, run_key)
-ON {{META_DB}}.gre_exceptions;
+ON HSABC_DEV.gre_exceptions;
 
-CREATE MULTISET TABLE {{META_DB}}.gre_results (
+CREATE MULTISET TABLE HSABC_DEV.gre_results (
     result_id                 BIGINT GENERATED ALWAYS AS IDENTITY,
     run_id                     VARCHAR(200) NOT NULL,
     rule_id                    INTEGER NOT NULL,
@@ -134,12 +134,12 @@ CREATE MULTISET TABLE {{META_DB}}.gre_results (
 PRIMARY INDEX (run_id, rule_id);
 
 CREATE INDEX gre_results_rule_run_key_active_ix (rule_id, run_key, active_ind)
-ON {{META_DB}}.gre_results;
+ON HSABC_DEV.gre_results;
 
 CREATE INDEX gre_results_group_run_key_ix (rule_group, run_key, status)
-ON {{META_DB}}.gre_results;
+ON HSABC_DEV.gre_results;
 
-CREATE MULTISET TABLE {{META_DB}}.gre_rule_audit (
+CREATE MULTISET TABLE HSABC_DEV.gre_rule_audit (
     run_id                 VARCHAR(200) NOT NULL,
     rule_group              VARCHAR(100),
     rule_variant               VARCHAR(100),
@@ -162,12 +162,12 @@ CREATE MULTISET TABLE {{META_DB}}.gre_rule_audit (
 PRIMARY INDEX (run_id);
 
 CREATE INDEX gre_rule_audit_group_run_key_ix (rule_group, run_key)
-ON {{META_DB}}.gre_rule_audit;
+ON HSABC_DEV.gre_rule_audit;
 
 CREATE INDEX gre_rule_audit_status_ix (status)
-ON {{META_DB}}.gre_rule_audit;
+ON HSABC_DEV.gre_rule_audit;
 
-CREATE MULTISET TABLE {{META_DB}}.gre_rule_errors (
+CREATE MULTISET TABLE HSABC_DEV.gre_rule_errors (
     error_id         BIGINT GENERATED ALWAYS AS IDENTITY,
     run_id           VARCHAR(200),
     rule_id          INTEGER NOT NULL,
@@ -186,4 +186,4 @@ CREATE MULTISET TABLE {{META_DB}}.gre_rule_errors (
 PRIMARY INDEX (run_id, rule_id);
 
 CREATE INDEX gre_rule_errors_rule_run_key_active_ix (rule_id, run_key, active_ind)
-ON {{META_DB}}.gre_rule_errors;
+ON HSABC_DEV.gre_rule_errors;
