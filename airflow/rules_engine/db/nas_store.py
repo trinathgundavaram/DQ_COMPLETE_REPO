@@ -1,15 +1,3 @@
-"""
-db/nas_store.py
----------------
-Read-only access to files on a NAS (SMB share), for FileAdapter. The path
-parsing and SMB session logic follow the compliance framework's
-NasFileStore (framework repo, feature/framework-package,
-airflow/compliance_framework/adapters.py + db.py), reduced to what a
-rules run needs: download one file to local disk.
-
-NAS_HOST / NAS_USER / NAS_PASSWORD / NAS_PORT are read from the process
-environment -- gre_rules_task.py sets them from an Airflow Connection.
-"""
 import os
 import shutil
 from urllib.parse import urlparse
@@ -22,11 +10,6 @@ def is_nas_uri(location: str) -> bool:
 
 
 def parse_uri(uri: str) -> tuple:
-    """
-    \\\\server\\share\\folder, //server/share/folder or smb://server/share/folder
-        -> ('server/share', 'folder/')
-    nas://share/folder -> ('share', 'folder/') on the server of the NAS connection.
-    """
     text = (uri or "").strip().replace("\\", "/")
     p = urlparse(text)
     if text.startswith("//") or p.scheme == "smb":
@@ -50,7 +33,6 @@ def _require(key: str) -> str:
 
 
 def nas_settings() -> dict:
-    """SMB server and credentials of the NAS connection."""
     return {"server": _require("NAS_HOST").lower(), "username": _require("NAS_USER"),
             "password": _require("NAS_PASSWORD"), "port": int(os.getenv("NAS_PORT") or 445)}
 
@@ -64,7 +46,6 @@ def smb_client():
 
 
 def download(folder_uri: str, filename: str, dest: str) -> str:
-    """Copy <folder_uri>/<filename> from the NAS to the local path `dest`."""
     share, folder = parse_uri(folder_uri)
     settings = nas_settings()
     server, _, share_name = share.rpartition("/")

@@ -1,55 +1,3 @@
-"""
-db/connection_factory.py  (Airflow package -- Teradata + Postgres only)
--------------------------------------------------------------------------
-Source connections for this engine instance: exactly ONE connection per
-source_type. This copy of connection_factory.py, kept specifically in
-the airflow/ folder, supports only 'teradata' and 'postgres' -- the flat
-file (CSV/Excel/TSV/Parquet) and S3 adapters from the original repo's
-db/connection_factory.py have been removed here on request, since this
-Airflow integration only needs Teradata + Postgres connectivity.
-
-A rule (or sampling config) selects its source by type
-(`gre_rules.sql_dialect` / `gre_sampling_config.source_type`), and
-ConnectionFactory hands back that type's single adapter -- unchanged
-from the original design, just with fewer types registered.
-
-FileAdapter (source_type 'file') is supported: CSV/TSV/Excel/Parquet read
-in memory (DuckDB if installed, else built-in sqlite3), from local disk or downloaded from a NAS (SMB share, see
-db/nas_store.py). A rule uses it by setting sql_dialect='file',
-database_name=<folder> and src_tbl_nm=<filename>.
-
-S3Adapter below is still a disabled stub (never registered in _TYPE_MAP;
-.build() raises NotImplementedError), kept only because
-rules_engine/parallel.py imports it by name for isinstance() checks.
-
-Adapter interface (SourceAdapter ABC)
---------------------------------------
-    cursor()              -> DB-API-compatible cursor, for running SELECTs
-    commit()               -> commit the current transaction (no-op for read-only sources)
-    close()                 -> release the underlying connection
-    ping() -> bool           -> lightweight liveness check (default: SELECT 1)
-    prepare(rule)              -> per-rule setup before rule_syntax runs (no-op --
-                                  neither teradata nor postgres needs this)
-    qualified_name(rule) -> str -> the FROM-clause identifier for the
-                                  auto-generated total-record count
-                                  (rules_engine/executor.py::_build_total_query);
-                                  "database_name.src_tbl_nm"
-    source_type: str            -> 'teradata' | 'postgres'
-
-Env vars
---------
-    TERADATA_HOST / TERADATA_USER / TERADATA_PASSWORD / TERADATA_LOGMECH (LDAP)
-    POSTGRES_HOST / POSTGRES_PORT (5432) / POSTGRES_DATABASE / POSTGRES_USER /
-        POSTGRES_PASSWORD / POSTGRES_SSLMODE (prefer)
-
-Usage
------
-    cf = ConnectionFactory()
-    cf.load()                        # build every connection that's configured
-    td = cf.get("teradata")          # cached; ping-checked and reconnected if stale
-    td_fresh = cf.new_connection("teradata")   # independent copy, for parallel workers
-"""
-
 import logging
 import os
 import csv
@@ -74,23 +22,11 @@ def _require(key: str) -> str:
     return val
 
 
-# =============================================================================
-# Base interface
-# =============================================================================
-
 class SourceAdapter(ABC):
-    """Minimal DB-API 2.0-compatible wrapper around a source connection."""
 
     source_type: str = "unknown"
 
-    # Best-effort "where is this actually pointed at" for logging only --
-    # host[:port]/database, NEVER credentials. Set by each adapter's
-    # build(); lets a caller log exactly which environment a connection
-    # resolved to (see rules_engine/runner.py's "run starting" log lines)
-    # -- the kind of detail that catches a run silently pointed at the
-    # wrong Teradata/Postgres system, which otherwise surfaces as a
-    # confusing "column not present" error against a schema that looks
-    # identical by name.
+
     host: str = None
 
     @abstractmethod
@@ -119,16 +55,11 @@ class SourceAdapter(ABC):
             cur.close()
 
     def prepare(self, rule: dict) -> None:
-        """Per-rule setup hook. No-op for teradata/postgres."""
+        pass
 
     def qualified_name(self, rule: dict) -> str:
-        """FROM-clause identifier for rule['database_name']/rule['src_tbl_nm']."""
         return f"{rule['database_name']}.{rule['src_tbl_nm']}"
 
-
-# =============================================================================
-# Teradata -- teradatasql
-# =============================================================================
 
 try:
     import teradatasql
@@ -161,11 +92,8 @@ class TeradataAdapter(SourceAdapter):
         host = _require("TERADATA_HOST")
         user = _require("TERADATA_USER")
         logmech = os.getenv("TERADATA_LOGMECH", "LDAP")
-        # host/user/logmech only -- never the password. This is exactly the
-        # detail needed to catch "app is pointed at the wrong Teradata
-        # system" (dev vs. test vs. prod, or a typo'd host) -- the kind of
-        # mismatch that otherwise surfaces as a confusing "column not
-        # present" error against a schema that looks identical by name.
+
+
         logger.info("Connecting to Teradata: host=%s user=%s logmech=%s", host, user, logmech)
         return cls(teradatasql.connect(
             host=host,
@@ -174,10 +102,6 @@ class TeradataAdapter(SourceAdapter):
             logmech=logmech,
         ), host=host)
 
-
-# =============================================================================
-# PostgreSQL / AWS RDS & Aurora (PostgreSQL-compatible) -- psycopg2
-# =============================================================================
 
 try:
     import psycopg2
@@ -192,7 +116,7 @@ class PostgresAdapter(SourceAdapter):
 
     def __init__(self, conn, host: str = None):
         self._conn = conn
-        self._conn.autocommit = True   # read-only source queries; avoid open txns
+        self._conn.autocommit = True
         self.host = host
 
     def cursor(self):
@@ -212,8 +136,8 @@ class PostgresAdapter(SourceAdapter):
         port = int(os.getenv("POSTGRES_PORT", "5432"))
         dbname = _require("POSTGRES_DATABASE")
         user = _require("POSTGRES_USER")
-        # host/port/dbname/user only -- never the password. Same rationale
-        # as TeradataAdapter.build() above.
+
+
         logger.info("Connecting to Postgres: host=%s port=%d dbname=%s user=%s", host, port, dbname, user)
         return cls(psycopg2.connect(
             host=host,
@@ -225,19 +149,6 @@ class PostgresAdapter(SourceAdapter):
         ), host=f"{host}:{port}/{dbname}")
 
 
-# =============================================================================
-# Flat files (CSV/TSV/Excel/Parquet) -- DuckDB + pandas. The file is either on
-# local/mounted disk or on a NAS (SMB share), in which case it is downloaded
-# to a temp folder first (see db/nas_store.py).
-#
-# S3Adapter below is still a disabled stub (kept only for parallel.py's import
-# and isinstance checks).
-# =============================================================================
-
-# Engine that runs rule SQL against the in-memory file data. DuckDB if it is
-# installed, else Python's built-in sqlite3 (no install needed). Force one with
-# GRE_FILE_ENGINE=duckdb|sqlite. pandas is optional: only .xlsx/.xls/.parquet
-# need it (CSV/TSV are read with the csv module).
 try:
     import duckdb
 except ImportError:
@@ -262,7 +173,6 @@ _FILE_ENCODING = os.getenv("GRE_FILE_ENCODING", "utf-8-sig")
 
 
 def _view_name(src_tbl_nm: str) -> str:
-    """Safe SQL identifier for a file's DuckDB view ("claims.csv" -> "claims"); rule_syntax references this name."""
     suffix = Path(src_tbl_nm).suffix
     base = src_tbl_nm[: -len(suffix)] if suffix else src_tbl_nm
     cleaned = re.sub(r"[^0-9a-zA-Z_]", "_", base) or "t"
@@ -274,8 +184,6 @@ _CANDIDATES = [",", "|", "\t", ";", "^", "~"]
 
 
 def _delimiter(fh, ext: str) -> str:
-    """GRE_FILE_DELIMITER if set (use \\t for tab), else by extension (.tsv tab, .psv pipe), else the
-    most frequent candidate in the header line (, | tab ; ^ ~)."""
     forced = os.getenv("GRE_FILE_DELIMITER")
     if forced:
         return "\t" if forced.lower() in ("\\t", "tab") else forced
@@ -292,7 +200,6 @@ def _delimiter(fh, ext: str) -> str:
 
 
 def _convert(values: list):
-    """int/float column if every non-empty value parses, else text; '' -> None."""
     vals = [v if v != "" else None for v in values]
     for cast in (int, float):
         try:
@@ -303,15 +210,14 @@ def _convert(values: list):
 
 
 def _read_file(full_path: str):
-    """Read one file. Returns (columns, column_lists) with lower-cased column names."""
     ext = Path(full_path).suffix.lower()
     if _MAX_FILE_SIZE_MB > 0:
         size_mb = Path(full_path).stat().st_size / (1024 * 1024)
         if size_mb > _MAX_FILE_SIZE_MB:
             raise ValueError(f"File '{full_path}' is {size_mb:.1f} MB, exceeds GRE_MAX_FILE_SIZE_MB={_MAX_FILE_SIZE_MB}.")
     if ext in _DELIMITED_EXT:
-        # GRE_FILE_ENCODING first if set, else UTF-8 (BOM allowed); then Windows-1252 / Latin-1
-        # (latin-1 accepts every byte, so the last attempt cannot fail).
+
+
         tried = [_FILE_ENCODING] if os.getenv("GRE_FILE_ENCODING") else ["utf-8-sig"]
         for enc in tried + [e for e in ("utf-8-sig", "cp1252", "latin-1") if e not in tried]:
             try:
@@ -334,19 +240,6 @@ def _read_file(full_path: str):
 
 
 class FileAdapter(SourceAdapter):
-    """
-    A rule with sql_dialect='file' drives its own path from gre_rules:
-        database_name -> the folder the file is in: a local/mounted directory
-                          (absolute, or relative to FILE_BASE_PATH), or a NAS
-                          folder -- //server/share/folder, \\\\server\\share\\folder,
-                          smb://server/share/folder or nas://share/folder
-        src_tbl_nm    -> the filename (e.g. "claims.csv"). If the run sets "file_name"
-                          (env GRE_FILE_NAME), that file is read instead and src_tbl_nm
-                          is just the fixed view name rule_syntax uses.
-    prepare(rule) loads the file once into a shared DataFrame registry, then
-    registers it as a DuckDB view named _view_name(src_tbl_nm) in each
-    thread's own connection. rule_syntax references that view name.
-    """
 
     source_type = "file"
 
@@ -362,7 +255,7 @@ class FileAdapter(SourceAdapter):
         return self._get_thread_conn().cursor()
 
     def commit(self):
-        pass   # read-only
+        pass
 
     def close(self):
         if hasattr(self._local, "conn"):
@@ -391,8 +284,8 @@ class FileAdapter(SourceAdapter):
         if view_name not in self._df_registry:
             with self._registry_lock:
                 if view_name not in self._df_registry:
-                    # GRE_FILE_NAME (the run's "file_name") is the real file; src_tbl_nm is then only
-                    # the fixed name rule_syntax reads FROM, so a changing file name needs no rule edit.
+
+
                     actual_name = (os.getenv("GRE_FILE_NAME") or "").strip() or src_tbl_nm
                     full_path = self._fetch(actual_name, (rule.get("database_name") or "").strip())
                     cols, data = _read_file(full_path)
@@ -419,17 +312,12 @@ class FileAdapter(SourceAdapter):
         return self._local.conn
 
     def _materialize(self, view_name: str) -> None:
-        """
-        Make the file's data a table in this thread's in-memory database. A table
-        (not DuckDB's conn.register()) because cursor() hands out a duplicate
-        connection, which cannot see another connection's registered DataFrames.
-        """
         conn = self._get_thread_conn()
         if view_name in self._local.registered:
             return
         cols, data = self._df_registry[view_name]
         if self._engine == "duckdb":
-            df = pd.DataFrame(dict(zip(cols, data)))   # noqa: F841 -- read by DuckDB's replacement scan
+            df = pd.DataFrame(dict(zip(cols, data)))
             conn.execute(f'CREATE OR REPLACE TABLE "{view_name}" AS SELECT * FROM df')
         else:
             conn.execute(f'DROP TABLE IF EXISTS "{view_name}"')
@@ -438,7 +326,6 @@ class FileAdapter(SourceAdapter):
         self._local.registered.add(view_name)
 
     def _fetch(self, src_tbl_nm: str, database_name: str) -> str:
-        """Local path of the file; a NAS file is downloaded into a temp folder first."""
         if nas_store.is_nas_uri(database_name):
             if self._tmp_dir is None:
                 self._tmp_dir = tempfile.mkdtemp(prefix="gre_nas_")
@@ -453,7 +340,6 @@ class FileAdapter(SourceAdapter):
 
 
 class S3Adapter(SourceAdapter):
-    """Disabled in this package -- Teradata + Postgres connectivity only."""
 
     source_type = "s3"
 
@@ -480,10 +366,6 @@ class S3Adapter(SourceAdapter):
         )
 
 
-# =============================================================================
-# ConnectionFactory -- one adapter per source_type
-# =============================================================================
-
 _TYPE_MAP = {
     "file": FileAdapter,
     "teradata": TeradataAdapter,
@@ -492,21 +374,11 @@ _TYPE_MAP = {
 
 
 class ConnectionFactory:
-    """
-    Builds and caches at most one adapter per source_type ('teradata',
-    'postgres' -- the only two registered in this package).
-    """
 
     def __init__(self):
         self._conns: Dict[str, SourceAdapter] = {}
 
     def load(self) -> None:
-        """
-        Build every source_type this environment has credentials for.
-        A type that fails to build (not configured, driver missing, bad
-        credentials) is logged and skipped -- not every deployment needs
-        both.
-        """
         for source_type in _TYPE_MAP:
             try:
                 self._conns[source_type] = self._build(source_type)
@@ -515,14 +387,13 @@ class ConnectionFactory:
                 logger.warning("Connection '%s' not initialised: %s", source_type, exc)
 
     def get(self, source_type: str) -> Optional[SourceAdapter]:
-        """Cached adapter for `source_type`, ping-reconnected if stale. None if unavailable."""
         adapter = self._conns.get(source_type)
         if adapter is None:
             logger.error("Connection '%s' not found in pool.", source_type)
             return None
 
         if isinstance(adapter, (FileAdapter, S3Adapter)):
-            return adapter   # unreachable in practice -- never built by this package
+            return adapter
 
         if not adapter.ping():
             logger.warning("Connection '%s' is stale -- reconnecting.", source_type)
@@ -531,12 +402,8 @@ class ConnectionFactory:
             except Exception as exc:
                 logger.error("Reconnect failed for '%s': %s", source_type, exc, exc_info=True)
                 return None
-            # Build succeeded before we drop the old handle, so a failed
-            # reconnect never leaves this source_type with no adapter at
-            # all. Close the stale connection only now, after the new one
-            # is already in place -- otherwise a dead TCP/session handle
-            # (and, for Teradata/Postgres, its server-side session slot)
-            # would leak on every stale-connection reconnect.
+
+
             try:
                 adapter.close()
             except Exception as exc:
@@ -548,13 +415,9 @@ class ConnectionFactory:
         return adapter
 
     def new_connection(self, source_type: str) -> Optional[SourceAdapter]:
-        """
-        A FRESH, independent adapter for `source_type` (not cached) -- for
-        giving each parallel worker its own session.
-        """
         adapter_cls = _TYPE_MAP.get(source_type)
         if adapter_cls in (FileAdapter, S3Adapter):
-            return self._conns.get(source_type)   # unreachable -- not in _TYPE_MAP
+            return self._conns.get(source_type)
 
         try:
             return self._build(source_type)
@@ -563,7 +426,6 @@ class ConnectionFactory:
             return None
 
     def close_all(self) -> None:
-        """Close every open adapter and clear the pool."""
         for source_type, adapter in list(self._conns.items()):
             try:
                 adapter.close()
@@ -586,11 +448,6 @@ class ConnectionFactory:
 
 
 def build_and_load_connection_factory() -> "ConnectionFactory":
-    """
-    ConnectionFactory() + .load() in one call -- the two-line "bring up
-    every configured source_type" boilerplate run_rules.py needs before
-    it can do anything.
-    """
     cf = ConnectionFactory()
     cf.load()
     return cf

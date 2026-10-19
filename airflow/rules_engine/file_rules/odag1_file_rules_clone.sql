@@ -1,10 +1,3 @@
--- One-time: clone ODAG1 rules into rule group ODAG1_FILE so they run against a file on the NAS.
--- NAS folder is set below. SRC_TBL_NM 'odag1_file.csv' is only the fixed name the rule SQL reads
--- FROM (odag1_file). The real file name changes every run: pass "file_name" in the trigger config.
--- Only the 3 rules below are rewritten and active. Any other ODAG1 rule is cloned INACTIVE (ACT_IND=0)
--- with its Teradata SQL untouched -- rewrite it before turning it on.
--- Run the group with:  rule_group = ODAG1_FILE, text_params = {"RUNTYPE": "MNT"}, file_name = <the file>, Variable nas_connection_id set.
-
 INSERT INTO HSABC_DEV.GRE_RULES
 (RULE_ID, RULE_NM, ACT_IND, RULE_GROUP, RULE_VARIANT, PROJECT_NAME, PROCESS_NAME, SEQ_NO, SEQUENCING_MODE, ON_FAILURE,
  DATABASE_NAME, SRC_TBL_NM, SQL_DIALECT, RULE_SYNTAX, SRC_KEY_COLS, ELEMENT_NAME, THRESHOLD_PCT, THRESHOLD_COUNT,
