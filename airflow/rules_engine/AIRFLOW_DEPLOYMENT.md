@@ -26,7 +26,7 @@ airflow/
 ├── gre_rules_dag.py            # the ONLY file outside rules_engine/ -- example DAG
 └── rules_engine/
     ├── (original files, unchanged: __init__.py, config.py, db_ops.py,
-    │    deploy_schema.py, executor.py, parallel.py, reporting.py,
+    │    executor.py, parallel.py, reporting.py,
     │    rules.py, runner.py, schema.sql, schema_drop.sql, README.md)
     ├── db/                      # trimmed copy of the original db/connection_factory.py --
     │   │                        #   Teradata + Postgres adapters only
@@ -107,8 +107,7 @@ Two different "roots" need to be on `sys.path` because `db/` sits inside
 top-level package:
 
 - `rules_engine/` itself -- so `from db.connection_factory import ...`
-  (in `run_rules.py`, and, unmodified, in `rules_engine/parallel.py`/
-  `rules_engine/deploy_schema.py`) finds `db` as a direct child of it,
+  (in `run_rules.py`, and, unmodified, in `rules_engine/parallel.py`) finds `db` as a direct child of it,
   and so `gre_rules_task.py`'s `from run_rules import run_rules` finds
   its sibling.
 - `rules_engine/`'s PARENT (`airflow/`) -- so `from rules_engine.config
