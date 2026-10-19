@@ -1,12 +1,9 @@
 -- One-time: clone ODAG1 rules into rule group ODAG1_FILE so they run against a file on the NAS.
--- BEFORE RUNNING, set the two values marked <<...>>:
---   NAS folder  : '<<//nas_server/share/folder>>'   (also nas://share/folder or smb://server/share/folder)
---   File name   : '<<odag1_file.csv>>'
--- The SQL inside the rules reads FROM odag1_file (= the file name without ".csv").
--- If your file name is different, replace odag1_file in the three rule texts below with it.
+-- NAS folder is set below. SRC_TBL_NM 'odag1_file.csv' is only the fixed name the rule SQL reads
+-- FROM (odag1_file). The real file name changes every run: pass "file_name" in the trigger config.
 -- Only the 3 rules below are rewritten and active. Any other ODAG1 rule is cloned INACTIVE (ACT_IND=0)
 -- with its Teradata SQL untouched -- rewrite it before turning it on.
--- Run the group with:  rule_group = ODAG1_FILE, text_params = {"RUNTYPE": "MNT"}, Variable nas_connection_id set.
+-- Run the group with:  rule_group = ODAG1_FILE, text_params = {"RUNTYPE": "MNT"}, file_name = <the file>, Variable nas_connection_id set.
 
 INSERT INTO HSABC_DEV.GRE_RULES
 (RULE_ID, RULE_NM, ACT_IND, RULE_GROUP, RULE_VARIANT, PROJECT_NAME, PROCESS_NAME, SEQ_NO, SEQUENCING_MODE, ON_FAILURE,
@@ -18,8 +15,8 @@ SELECT
     RULE_NM || '_FILE',
     CASE WHEN RULE_ID IN (2902, 2937, 2896) THEN ACT_IND ELSE 0 END,
     'ODAG1_FILE', RULE_VARIANT, PROJECT_NAME, PROCESS_NAME, SEQ_NO, SEQUENCING_MODE, ON_FAILURE,
-    '<<//nas_server/share/folder>>',
-    '<<odag1_file.csv>>',
+    '\\iadnasd001_cifs.healthspring.inside\chs_dms\Dev\OSS_Inbound\External\CMSUniverse\RE',
+    'odag1_file.csv',
     'file',
     CASE RULE_ID
         WHEN 2902 THEN 'SELECT * FROM odag1_file WHERE

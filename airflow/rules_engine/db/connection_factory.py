@@ -309,7 +309,9 @@ class FileAdapter(SourceAdapter):
                           (absolute, or relative to FILE_BASE_PATH), or a NAS
                           folder -- //server/share/folder, \\\\server\\share\\folder,
                           smb://server/share/folder or nas://share/folder
-        src_tbl_nm    -> the filename (e.g. "claims.csv")
+        src_tbl_nm    -> the filename (e.g. "claims.csv"). If the run sets "file_name"
+                          (env GRE_FILE_NAME), that file is read instead and src_tbl_nm
+                          is just the fixed view name rule_syntax uses.
     prepare(rule) loads the file once into a shared DataFrame registry, then
     registers it as a DuckDB view named _view_name(src_tbl_nm) in each
     thread's own connection. rule_syntax references that view name.
@@ -358,7 +360,10 @@ class FileAdapter(SourceAdapter):
         if view_name not in self._df_registry:
             with self._registry_lock:
                 if view_name not in self._df_registry:
-                    full_path = self._fetch(src_tbl_nm, (rule.get("database_name") or "").strip())
+                    # GRE_FILE_NAME (the run's "file_name") is the real file; src_tbl_nm is then only
+                    # the fixed name rule_syntax reads FROM, so a changing file name needs no rule edit.
+                    actual_name = (os.getenv("GRE_FILE_NAME") or "").strip() or src_tbl_nm
+                    full_path = self._fetch(actual_name, (rule.get("database_name") or "").strip())
                     cols, data = _read_file(full_path)
                     self._df_registry[view_name] = (cols, data)
                     logger.info("File loaded: %s -> view '%s' (%d rows, engine=%s)", full_path, view_name,

@@ -934,3 +934,7 @@ For a NAS folder, add `"nas_connection_id": "gre_nas"` to the Airflow Variable, 
 Connection with the NAS host, login, password and port (default 445). The file is downloaded over SMB
 (same logic as the compliance framework's NAS store), read into memory, and the rules run on it (DuckDB if installed, otherwise Python's built-in sqlite3; set `GRE_FILE_ENGINE=duckdb|sqlite` to force one). Nothing is loaded into Teradata/Postgres. With sqlite, write rule SQL in the common subset (no `QUALIFY`, limited window/date/regex functions); `.xlsx`/`.parquet` need pandas, CSV/TSV need nothing extra.
 Column names are lower-cased. Results go to the usual `gre_results` / `gre_exceptions` tables.
+
+**File name changes every run:** keep `src_tbl_nm` as a fixed name (e.g. `odag1_file.csv`, the rule SQL reads `FROM odag1_file`)
+and pass the real name per run as `"file_name"` in the Airflow Variable or the trigger config, e.g.
+`{"rule_group": "ODAG1_FILE", "file_name": "UNIV_20260918.csv", "text_params": {"RUNTYPE": "MNT"}}`.

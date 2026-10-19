@@ -252,6 +252,9 @@ def _load_runtime_variable(variable_key: str) -> dict:
                                                 "gre_postgres" (matching
                                                 connection_type) if omitted.
 
+          "file_name": "UNIV_20260918.csv", -> GRE_FILE_NAME -- the file to read for rules with
+                                                sql_dialect='file' (changes per run; set it in
+                                                the trigger config)
           "nas_connection_id": "gre_nas",   -> optional -- Airflow Connection (host/login/
                                                 password/port) of the NAS (SMB) holding the
                                                 files for rules with sql_dialect='file'
@@ -311,6 +314,7 @@ _ENV_KEYS = {
     "meta_connection": "GRE_META_CONNECTION",
     "log_level": "GRE_LOG_LEVEL",
     "log_dir": "GRE_LOG_DIR",
+    "file_name": "GRE_FILE_NAME",
     "max_parallel_rules": "GRE_MAX_PARALLEL_RULES",
 }
 
