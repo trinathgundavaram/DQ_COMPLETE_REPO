@@ -199,6 +199,23 @@ def _delimiter(fh, ext: str) -> str:
     return best if counts[best] else ","
 
 
+_SEL_RE = re.compile(r"\bSEL\b", re.I)
+_TABLE_RE = re.compile(r"\b(FROM|JOIN)(\s+)[\w$]+\.[\w$]+", re.I)
+_ISDATE_RE = re.compile(r"\b\w+\.isdate\s*\(", re.I)
+_CAST_FORMAT_RE = re.compile(r"CAST\(\s*('[^']*'|[\w.]+)\s+AS\s+DATE\s+FORMAT\s+'[^']*'\s*\)", re.I)
+_INTERVAL_RE = re.compile(r"\b([A-Za-z_][\w.]*)\s*\+\s*(INTERVAL\b)", re.I)
+
+
+def _to_file_sql(sql: str, view_name: str, engine: str) -> str:
+    sql = _SEL_RE.sub("SELECT", sql)
+    sql = _TABLE_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{view_name}", sql)
+    if engine == "duckdb":
+        sql = _ISDATE_RE.sub("isdate(", sql)
+        sql = _INTERVAL_RE.sub(lambda m: f"CAST({m.group(1)} AS TIMESTAMP) + {m.group(2)}", sql)
+        sql = _CAST_FORMAT_RE.sub(lambda m: f"CAST(replace({m.group(1)},'/','-') AS DATE)", sql)
+    return sql
+
+
 def _convert(values: list):
     vals = [v if v != "" else None for v in values]
     for cast in (int, float):
@@ -233,7 +250,7 @@ def _read_file(full_path: str):
     if ext in (".xlsx", ".xls", ".parquet"):
         if pd is None:
             raise ImportError(f"pandas is required to read {ext} files (CSV/TSV need nothing extra).")
-        df = pd.read_parquet(full_path) if ext == ".parquet" else pd.read_excel(full_path, sheet_name=os.getenv("GRE_FILE_SHEET") or 0)
+        df = pd.read_parquet(full_path) if ext == ".parquet" else pd.read_excel(full_path, sheet_name=os.getenv("GRE_FILE_SHEET") or 0, keep_default_na=False, na_values=[""])
         df = df.astype(object).where(df.notna(), None)
         return [str(c).lower() for c in df.columns], [df[c].tolist() for c in df.columns]
     raise ValueError(f"Unsupported file extension '{ext}'. Supported: .csv .tsv .txt .dat .psv .xlsx .xls .parquet")
@@ -294,6 +311,8 @@ class FileAdapter(SourceAdapter):
                                 len(data[0]) if data else 0, self._engine)
 
         self._materialize(view_name)
+        if rule.get("rule_syntax"):
+            rule["rule_syntax"] = _to_file_sql(rule["rule_syntax"], view_name, self._engine)
 
     def qualified_name(self, rule: dict) -> str:
         return _view_name((rule.get("src_tbl_nm") or "").strip())
@@ -305,6 +324,8 @@ class FileAdapter(SourceAdapter):
     def _get_thread_conn(self):
         if not hasattr(self._local, "conn"):
             conn = duckdb.connect(":memory:") if self._engine == "duckdb" else sqlite3.connect(":memory:")
+            if self._engine == "duckdb":
+                conn.execute("CREATE OR REPLACE MACRO isdate(s, f, d, a, b) AS TRY_CAST(replace(s, d, '-') AS DATE)")
             self._local.conn = conn
             self._local.registered = set()
             for vname in self._df_registry:
