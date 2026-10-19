@@ -255,6 +255,8 @@ def _load_runtime_variable(variable_key: str) -> dict:
           "file_name": "UNIV_20260918.csv", -> GRE_FILE_NAME -- the file to read for rules with
                                                 sql_dialect='file' (changes per run; set it in
                                                 the trigger config)
+          "file_delimiter": "|",            -> GRE_FILE_DELIMITER (optional; "tab" for tab; default is auto-detected)
+          "file_sheet": "Sheet1",           -> GRE_FILE_SHEET (optional; Excel sheet name, default first sheet)
           "nas_connection_id": "gre_nas",   -> optional -- Airflow Connection (host/login/
                                                 password/port) of the NAS (SMB) holding the
                                                 files for rules with sql_dialect='file'
@@ -315,6 +317,8 @@ _ENV_KEYS = {
     "log_level": "GRE_LOG_LEVEL",
     "log_dir": "GRE_LOG_DIR",
     "file_name": "GRE_FILE_NAME",
+    "file_delimiter": "GRE_FILE_DELIMITER",
+    "file_sheet": "GRE_FILE_SHEET",
     "max_parallel_rules": "GRE_MAX_PARALLEL_RULES",
 }
 

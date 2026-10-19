@@ -269,6 +269,28 @@ def _view_name(src_tbl_nm: str) -> str:
     return f"t_{cleaned}" if cleaned[0].isdigit() else cleaned
 
 
+_DELIMITED_EXT = (".csv", ".tsv", ".txt", ".dat", ".psv")
+_CANDIDATES = [",", "|", "\t", ";", "^", "~"]
+
+
+def _delimiter(fh, ext: str) -> str:
+    """GRE_FILE_DELIMITER if set (use \\t for tab), else by extension (.tsv tab, .psv pipe), else the
+    most frequent candidate in the header line (, | tab ; ^ ~)."""
+    forced = os.getenv("GRE_FILE_DELIMITER")
+    if forced:
+        return "\t" if forced.lower() in ("\\t", "tab") else forced
+    if ext == ".tsv":
+        return "\t"
+    if ext == ".psv":
+        return "|"
+    start = fh.tell()
+    line = fh.readline()
+    fh.seek(start)
+    counts = {d: line.count(d) for d in _CANDIDATES}
+    best = max(counts, key=counts.get)
+    return best if counts[best] else ","
+
+
 def _convert(values: list):
     """int/float column if every non-empty value parses, else text; '' -> None."""
     vals = [v if v != "" else None for v in values]
@@ -287,14 +309,14 @@ def _read_file(full_path: str):
         size_mb = Path(full_path).stat().st_size / (1024 * 1024)
         if size_mb > _MAX_FILE_SIZE_MB:
             raise ValueError(f"File '{full_path}' is {size_mb:.1f} MB, exceeds GRE_MAX_FILE_SIZE_MB={_MAX_FILE_SIZE_MB}.")
-    if ext in (".csv", ".tsv"):
+    if ext in _DELIMITED_EXT:
         # GRE_FILE_ENCODING first if set, else UTF-8 (BOM allowed); then Windows-1252 / Latin-1
         # (latin-1 accepts every byte, so the last attempt cannot fail).
         tried = [_FILE_ENCODING] if os.getenv("GRE_FILE_ENCODING") else ["utf-8-sig"]
         for enc in tried + [e for e in ("utf-8-sig", "cp1252", "latin-1") if e not in tried]:
             try:
                 with open(full_path, newline="", encoding=enc) as fh:
-                    reader = csv.reader(fh, delimiter="\t" if ext == ".tsv" else ",")
+                    reader = csv.reader(fh, delimiter=_delimiter(fh, ext))
                     header = [h.strip().lower() for h in next(reader)]
                     data = [r + [""] * (len(header) - len(r)) for r in reader]
                 break
@@ -305,10 +327,10 @@ def _read_file(full_path: str):
     if ext in (".xlsx", ".xls", ".parquet"):
         if pd is None:
             raise ImportError(f"pandas is required to read {ext} files (CSV/TSV need nothing extra).")
-        df = pd.read_parquet(full_path) if ext == ".parquet" else pd.read_excel(full_path)
+        df = pd.read_parquet(full_path) if ext == ".parquet" else pd.read_excel(full_path, sheet_name=os.getenv("GRE_FILE_SHEET") or 0)
         df = df.astype(object).where(df.notna(), None)
         return [str(c).lower() for c in df.columns], [df[c].tolist() for c in df.columns]
-    raise ValueError(f"Unsupported file extension '{ext}'. Supported: .csv, .tsv, .xlsx, .xls, .parquet")
+    raise ValueError(f"Unsupported file extension '{ext}'. Supported: .csv .tsv .txt .dat .psv .xlsx .xls .parquet")
 
 
 class FileAdapter(SourceAdapter):

@@ -938,3 +938,7 @@ Column names are lower-cased. Results go to the usual `gre_results` / `gre_excep
 **File name changes every run:** keep `src_tbl_nm` as a fixed name (e.g. `odag1_file.csv`, the rule SQL reads `FROM odag1_file`)
 and pass the real name per run as `"file_name"` in the Airflow Variable or the trigger config, e.g.
 `{"rule_group": "ODAG1_FILE", "file_name": "UNIV_20260918.csv", "text_params": {"RUNTYPE": "MNT"}}`.
+
+**File types:** `.csv .tsv .txt .dat .psv .xlsx .xls .parquet`. For text files the delimiter is auto-detected from the
+header line (`, | tab ; ^ ~`); set `"file_delimiter"` (e.g. `"|"`, `"tab"`) in the Variable/trigger config to force one.
+Excel reads the first sheet unless `"file_sheet"` names another. Encoding falls back from UTF-8 to Windows-1252/Latin-1.
