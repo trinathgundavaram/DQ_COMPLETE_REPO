@@ -31,9 +31,9 @@ def _set_env(key: str, value) -> None:
 
 
 def _load_teradata_connection(conn_id: str) -> None:
-    from airflow.hooks.base import BaseHook
+    from airflow.sdk import Connection
 
-    conn = BaseHook.get_connection(conn_id)
+    conn = Connection.get(conn_id)
 
     _set_env("TERADATA_HOST", conn.host)
     _set_env("TERADATA_USER", conn.login)
@@ -52,9 +52,9 @@ def _load_teradata_connection(conn_id: str) -> None:
 
 
 def _load_postgres_connection(conn_id: str) -> None:
-    from airflow.hooks.base import BaseHook
+    from airflow.sdk import Connection
 
-    conn = BaseHook.get_connection(conn_id)
+    conn = Connection.get(conn_id)
 
     _set_env("POSTGRES_HOST", conn.host)
     _set_env("POSTGRES_PORT", conn.port)
@@ -74,9 +74,9 @@ def _load_postgres_connection(conn_id: str) -> None:
 
 
 def _load_nas_connection(conn_id: str) -> None:
-    from airflow.hooks.base import BaseHook
+    from airflow.sdk import Connection
 
-    conn = BaseHook.get_connection(conn_id)
+    conn = Connection.get(conn_id)
     _set_env("NAS_HOST", conn.host)
     _set_env("NAS_USER", conn.login)
     _set_env("NAS_PASSWORD", conn.password)
@@ -102,9 +102,9 @@ def _load_source_connection(connection_type: str, connection_id: str) -> None:
 
 
 def _load_runtime_variable(variable_key: str) -> dict:
-    from airflow.models import Variable
+    from airflow.sdk import Variable
 
-    config = Variable.get(variable_key, deserialize_json=True, default_var={})
+    config = Variable.get(variable_key, default={}, deserialize_json=True)
     if not isinstance(config, dict):
         raise ValueError(
             f"Airflow Variable '{variable_key}' must deserialize to a JSON object, "

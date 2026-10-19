@@ -2,10 +2,8 @@ import os
 import sys
 from datetime import datetime, timedelta
 
-from airflow import DAG
-from airflow.models.param import Param
-from airflow.operators.python import PythonOperator
-from airflow.decorators import dag, task
+from airflow.providers.standard.operators.python import PythonOperator
+from airflow.sdk import DAG, Param, dag, task
 
 
 _RULES_ENGINE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules_engine")
