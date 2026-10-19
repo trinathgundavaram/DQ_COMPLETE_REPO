@@ -50,6 +50,16 @@ def _scan_violations(db_conn, query: str, src_key_cols: list = None) -> tuple:
         cursor.close()
 
 
+def _distinct_failed(rule: dict, rows: list) -> int:
+    keys = set()
+    for row in rows:
+        try:
+            keys.add(build_src_key(rule, row))
+        except Exception:
+            keys.add(tuple(sorted(row.items(), key=lambda kv: kv[0])))
+    return len(keys)
+
+
 def _format_src_key(cols: list, row: dict) -> str:
     def _fmt(c):
         key = c.lower()
@@ -354,22 +364,24 @@ def _write_result(meta_conn, meta_db: str, run_id: str, rule: dict, run_key: str
                    status: str, total_records=None, failed_records: int = 0, failure_pct=None,
                    threshold_pct_used=None, threshold_count_used=None, threshold_operator_used=None,
                    source_tieback_sql: str = None, error_message: str = None,
-                   executed_sql: str = None) -> None:
+                   executed_sql: str = None, distinct_failed_records: int = None,
+                   duplicate_records: int = None) -> None:
     rule_id = rule.get("rule_id")
 
     sql = f"""
         INSERT INTO {meta_db}.gre_results (
             run_id, rule_id, rule_group, rule_variant, project_name, process_name, run_key, seq_no,
-            start_time, end_time, total_records, failed_records, failure_pct,
-            threshold_pct_used, threshold_count_used, threshold_operator_used,
+            start_time, end_time, total_records, failed_records, distinct_failed_records, duplicate_records,
+            failure_pct, threshold_pct_used, threshold_count_used, threshold_operator_used,
             severity, status, error_message, executed_sql, source_tieback_sql, active_ind
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Y')
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Y')
     """
     execute_dml(meta_conn, sql, [
         run_id, rule_id, rule.get("rule_group"), rule.get("rule_variant"),
         rule.get("project_name"), rule.get("process_name"),
         run_key, rule.get("seq_no"), datetime.fromtimestamp(start_time), datetime.now(),
-        total_records, failed_records, failure_pct, threshold_pct_used, threshold_count_used,
+        total_records, failed_records, distinct_failed_records, duplicate_records, failure_pct,
+        threshold_pct_used, threshold_count_used,
         threshold_operator_used, rule.get("severity"), status, error_message, executed_sql,
         source_tieback_sql,
     ], log_params=True)
@@ -529,6 +541,9 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
             return "ERROR"
 
 
+    distinct_failed = _distinct_failed(rule, violating_rows)
+    duplicate_records = failed - distinct_failed
+
     reconcile = {"inserted": 0, "reactivated": 0, "deactivated": 0}
     try:
         reconcile = _write_exceptions(meta_conn, meta_db, rule, run_id, run_key, violating_rows,
@@ -568,6 +583,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
             _write_result(
                 meta_conn, meta_db, run_id, rule, run_key, start, verdict["status"],
                 total_records=total, failed_records=failed, failure_pct=failure_pct,
+                distinct_failed_records=distinct_failed, duplicate_records=duplicate_records,
                 threshold_pct_used=verdict["threshold_pct_used"],
                 threshold_count_used=verdict["threshold_count_used"],
                 threshold_operator_used=verdict["threshold_operator_used"],
@@ -586,13 +602,14 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
         _write_result_safe(
             meta_conn, meta_db, run_id, rule, run_key, start, verdict["status"],
             total_records=total, failed_records=failed, failure_pct=failure_pct,
+            distinct_failed_records=distinct_failed, duplicate_records=duplicate_records,
             source_tieback_sql=source_tieback_sql, executed_sql=query,
         )
 
     logger.info(
-        "rule_id=%s | total=%d failed=%d inserted=%d reactivated=%d deactivated=%d | "
+        "rule_id=%s | total=%d failed=%d distinct=%d duplicates=%d inserted=%d reactivated=%d deactivated=%d | "
         "verdict=%s (write_result=%s) | %.3fs",
-        rule.get("rule_id"), total, failed, reconcile["inserted"], reconcile["reactivated"],
+        rule.get("rule_id"), total, failed, distinct_failed, duplicate_records, reconcile["inserted"], reconcile["reactivated"],
         reconcile["deactivated"], verdict["status"], verdict["write_result"], time.time() - start,
     )
     return "SUCCESS"

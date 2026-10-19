@@ -111,6 +111,8 @@ CREATE MULTISET TABLE {{META_DB}}.gre_results (
     end_time                    TIMESTAMP,
     total_records               BIGINT,
     failed_records              BIGINT,
+    distinct_failed_records     BIGINT,
+    duplicate_records           BIGINT,
 
     failure_pct                 FLOAT,
     threshold_pct_used          FLOAT,
