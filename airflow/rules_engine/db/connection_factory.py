@@ -258,7 +258,7 @@ def _file_engine() -> str:
 
 
 _MAX_FILE_SIZE_MB = int(os.getenv("GRE_MAX_FILE_SIZE_MB", "500"))
-_FILE_ENCODING = os.getenv("GRE_FILE_ENCODING", "utf-8")
+_FILE_ENCODING = os.getenv("GRE_FILE_ENCODING", "utf-8-sig")
 
 
 def _view_name(src_tbl_nm: str) -> str:
@@ -288,10 +288,19 @@ def _read_file(full_path: str):
         if size_mb > _MAX_FILE_SIZE_MB:
             raise ValueError(f"File '{full_path}' is {size_mb:.1f} MB, exceeds GRE_MAX_FILE_SIZE_MB={_MAX_FILE_SIZE_MB}.")
     if ext in (".csv", ".tsv"):
-        with open(full_path, newline="", encoding=_FILE_ENCODING) as fh:
-            reader = csv.reader(fh, delimiter="\t" if ext == ".tsv" else ",")
-            header = [h.strip().lower() for h in next(reader)]
-            data = [r + [""] * (len(header) - len(r)) for r in reader]
+        # GRE_FILE_ENCODING first if set, else UTF-8 (BOM allowed); then Windows-1252 / Latin-1
+        # (latin-1 accepts every byte, so the last attempt cannot fail).
+        tried = [_FILE_ENCODING] if os.getenv("GRE_FILE_ENCODING") else ["utf-8-sig"]
+        for enc in tried + [e for e in ("utf-8-sig", "cp1252", "latin-1") if e not in tried]:
+            try:
+                with open(full_path, newline="", encoding=enc) as fh:
+                    reader = csv.reader(fh, delimiter="\t" if ext == ".tsv" else ",")
+                    header = [h.strip().lower() for h in next(reader)]
+                    data = [r + [""] * (len(header) - len(r)) for r in reader]
+                break
+            except UnicodeDecodeError:
+                logger.warning("File %s is not %s -- trying the next encoding.", full_path, enc)
+        logger.info("File %s read as %s.", full_path, enc)
         return header, [_convert([r[i] for r in data]) for i in range(len(header))]
     if ext in (".xlsx", ".xls", ".parquet"):
         if pd is None:
