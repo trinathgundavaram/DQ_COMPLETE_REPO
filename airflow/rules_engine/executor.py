@@ -499,6 +499,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
         return "ERROR"
 
 
+    logger.info("Rule %s (%s): running SQL: %s", rule.get("rule_id"), rule.get("rule_nm"), " ".join(query.split()))
     try:
         failed, violating_rows = _scan_violations(db_conn, query, src_key_cols=split_src_key_cols(rule))
     except Exception as exc:
@@ -547,7 +548,7 @@ def execute_rule(rule: dict, db_conn, meta_conn, run_id: str, run_key: str, run_
     reconcile = {"inserted": 0, "reactivated": 0, "deactivated": 0}
     try:
         reconcile = _write_exceptions(meta_conn, meta_db, rule, run_id, run_key, violating_rows,
-                                      run_params=run_params)
+                                      run_params={**run_params, **(text_params or {})})
     except Exception as exc:
         logger.warning(
             "Rule %s: exception-row reconciliation failed (failed_records is still accurate): %s",

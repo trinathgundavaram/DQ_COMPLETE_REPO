@@ -3,7 +3,7 @@ import sys
 from datetime import datetime, timedelta
 
 from airflow.providers.standard.operators.python import PythonOperator
-from airflow.sdk import DAG, Param, dag, task
+from airflow.sdk import DAG, Param
 
 
 _RULES_ENGINE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules_engine")
@@ -59,30 +59,3 @@ with DAG(
         task_id="run_gre_rules",
         python_callable=_run_gre_rules_callable,
     )
-
-
-@dag(
-    dag_id="gre_rules_engine_taskflow",
-    description="TaskFlow-style equivalent of gre_rules_engine.",
-    default_args=default_args,
-    schedule="0 6 * * *",
-    start_date=datetime(2026, 1, 1),
-    catchup=False,
-    params=_DAG_PARAMS,
-    tags=["gre", "data-quality", "rules-engine"],
-)
-def gre_rules_engine_taskflow():
-
-    @task
-    def run_gre_rules_taskflow(params=None, dag_run=None):
-        dag_run_conf = dict(dag_run.conf or {}) if dag_run else {}
-        variable_key = dag_run_conf.pop("variable_key", None) or params["variable_key"]
-        return run_gre_rules(
-            variable_key=variable_key,
-            overrides=dag_run_conf,
-        )
-
-    run_gre_rules_taskflow()
-
-
-gre_rules_engine_taskflow()

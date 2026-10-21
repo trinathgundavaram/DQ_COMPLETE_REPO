@@ -92,8 +92,7 @@ this Airflow integration (see "Why no `.env` file here" below).
       bad/empty scope), so the Airflow task fails normally; otherwise
       returns the outcome dict.
 4. **`gre_rules_dag.py`** (one level up, in `airflow/`) -- an example DAG
-   that calls `run_gre_rules()` from a `PythonOperator` (and, as an
-   alternative, a TaskFlow `@task`). The DAG itself hardcodes nothing
+   that calls `run_gre_rules()` from a `PythonOperator`. The DAG itself hardcodes nothing
    about the run -- see "Everything is Variable-driven" below.
 
 No business logic was moved into Airflow -- the DAG and the bridge
@@ -280,3 +279,10 @@ python run_rules.py --process-name UNIVERSE_VALIDATION \
 Same flags/behavior as the original repo's
 `run_by_process.py rules ...` subcommand -- `run_rules.py` is that
 subcommand's logic, copied out on its own.
+
+## Run type and batch on exceptions; rule SQL in the log
+
+`gre_exceptions.run_type` / `batch_schedule` are taken from `text_params` when given there (`{"run_type": "MNT",
+"batch_schedule": "<batch id>"}`), else from `run_params` as before; `text_params` never filter the record count, so
+a caller can fill them without a `run_type` column on the rule's table. Every rule's final SQL (after `$env`,
+`{param}` and `extra_filters`) is written to the log at INFO before it runs.
